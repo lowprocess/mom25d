@@ -1,4 +1,5 @@
-"""Build the optional compiled core mom25d._core:  python src/mom25d/core/build.py   (needs g++ with OpenMP and pybind11).
+"""Build the optional compiled core mom25d._core:  python -m mom25d.core.build   (needs g++ with OpenMP and pybind11;
+also: python src/mom25d/core/build.py in a checkout).
 The solver falls back to NumPy when the module is absent."""
 import os, subprocess, sys, sysconfig
 import pybind11

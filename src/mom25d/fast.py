@@ -22,7 +22,7 @@ from .base import _BAR3, _W3, _BAR6, _W6
 from .multilayer import GreenTableML
 from .sing import offplane_pairs
 
-try:                                    # optional compiled kernels (python core/build.py)
+try:                                    # optional compiled kernels (python -m mom25d.core.build)
     import os as _os
     from . import _core
     if _os.environ.get('MOM25D_NO_CORE'):
@@ -734,7 +734,7 @@ class FastOperator:
     def solve_blr(self, f, E, tol=1e-4, tile=256, eta=1.0, dtype=np.complex64):
         """Block low-rank LU preconditioner + GMRES with the exact matrix-free operator (no stored Z)."""
         from .blr import BLRFactor, cluster_tiles
-        assert self.core is not None, "solver='blr' needs the compiled core (python core/build.py)"
+        assert self.core is not None, "solver='blr' needs the compiled core (python -m mom25d.core.build)"
         sim = self.sim
         Ne, Nv = sim.Ne, sim.Nv
         N = Ne + Nv
