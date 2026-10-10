@@ -2,8 +2,12 @@
 
 A planar (2.5D) full-wave MoM electromagnetic solver in Python (NumPy/SciPy, shapely, triangle),
 aimed at signal-integrity and RF structures on multilayer boards: traces, couplers, via
-transitions, planes, CPWG. Feed it a KiCad board (or Gerbers) with port footprints, get
-Touchstone S-parameters and a diagnostic dashboard out.
+transitions, planes, CPWG. Feed it a KiCad board (or Gerbers) with port footprints, or an
+AppCSXCAD / openEMS geometry file (`.xml`), get Touchstone S-parameters and a diagnostic dashboard out.
+
+mom25d lives inside [kicad2openems](../README.md) (`--mom`: the same converted board solved by openEMS
+and by mom25d) but is its own project: `pip install ./mom25d`, no dependency on kicad2openems; the folder
+can be split out (`git subtree split --prefix=mom25d`) and used as a submodule.
 
 ![Coupler dashboard](docs/coupler_dashboard.png)
 
@@ -57,6 +61,37 @@ Scd21 = S(4,1) for two pairs). Example: `python examples/make_demo_board.py exam
 Each wave port's reference impedance is computed automatically from its cross-section (trace plus
 the metal covering it) and the result is renormalised to `--z0`.
 
+## AppCSXCAD / openEMS geometry (`.xml`)
+
+```bash
+mom25d board.xml --fmin 1 --fmax 6 --port auto        # any CSX file, e.g. <name>.xml of a kicad2openems run
+```
+
+`mom25d.csx.CSXModel` turns CSXCAD's `ContinuousStructure` into a model: dielectric slabs (εr, κ → tan δ),
+planar metal, via cylinders, vertical metal sheets (rows of vias), lumped R/L/C elements and openEMS lumped
+ports (`port_resist_<n>`, the R is the reference impedance). The ground is the `--ground` layer, the hints'
+ground, or the lowest solid plane. A converter can add a `<mom25d>` element (ground, exact tan δ, port names,
+layers and feed directions; see the module docstring) that CSXCAD itself ignores. Ports: de-embedded wave
+ports where the straight feed allows (`--port auto`), else lumped ports to the reference copper.
+
+```python
+from mom25d.csx import CSXModel
+from mom25d.run import solve_band
+m = CSXModel('board.xml')
+sim = m.simulation(dmax=0.3e-3, fmin=1e9, fmax=6e9, wave_down_to=1e9)
+f, S, info = solve_band(sim, 1e9, 6e9, points=401, zref=m.port_z0)
+```
+
+## Meshers
+
+`Simulation(mesher=...)` / `--mesher`: `polygon` (Triangle: constrained Delaunay with inward offset rings at
+the conductor edges; the default, `tensor` for Manhattan layers), `gmsh` / `gmsh-rings` / `gmsh-graded`
+(`pip install gmsh`) and `distmesh` / `distmesh-rings`. A study on a coupled-line filter
+(`benchmarks/mesher_study.py`, [results](benchmarks/results/), plot in `docs/mesher_study.png`): the edge
+resolution (`ncross`) sets the accuracy, anisotropic edge cells (Triangle's rings) beat isotropic meshes
+(gmsh-graded, distmesh) 2-4x in error at a third of the unknowns, and gmsh brings no gain per unknown.
+Details: kicad2openems `docs/mom.md`.
+
 ## GPU acceleration (AMD ROCm or NVIDIA CUDA)
 
 The mixed-precision direct solver can run its LU factorisation and preconditioner solves on a GPU
@@ -96,7 +131,11 @@ The package lives in `src/mom25d/` (`import mom25d.sim`, …); the command line 
 | `blr.py` | Block low-rank LU (tile LU, SVD compression) used as a GMRES preconditioner |
 | `core/mom25d_core.cpp` (`mom25d._core`) | C++/OpenMP kernels via pybind11: matrix fill, near correction, matrix-free matvec |
 | `afs.py` | Adaptive frequency sweep (set-valued AAA rational fitting) |
-| `kicad.py`, `gerber.py` | Board import → `BoardModel` → `Simulation` |
+| `model.py` | `PlanarModel`: stack, metal, vias, port definitions → wave / lumped ports, port characterisation, `Simulation` |
+| `kicad.py`, `gerber.py` | Board import → `BoardModel` (a `PlanarModel`) |
+| `csx.py` | AppCSXCAD / openEMS geometry (`.xml`) → `CSXModel` (a `PlanarModel`) |
+| `run.py` | `solve_band`: adaptive / linear sweep, renormalisation to the output references |
+| `mesh_gmsh.py`, `mesh_distmesh.py` | alternative polygon meshers (gmsh, DistMesh), same contract as `geo.mesh_polygons` |
 | `viz.py` | Dashboard: stackup, 3D view, mesh/ports/vias, currents, S-params, numerical health, kernels, timing |
 | `cli.py` | Command-line runner |
 

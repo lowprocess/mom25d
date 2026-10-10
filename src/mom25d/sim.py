@@ -272,12 +272,21 @@ class Simulation:
                         near = [geoms[j].buffer(3 * abs(stack.z[j] - stack.z[k]) + 2 * dmax)
                                 for j in self.layers if j != k and abs(stack.z[j] - stack.z[k]) < refine]
                         fine = shapely.unary_union(near) if near else None
-                    nd, tr, vids = mesh_polygons(geoms[k], dm, wr, ncross, grade, lines=seg, vias=vpts,
-                                                 fine=fine, dmax_fine=2 * dmax if fine is not None else None)
+                    mesh_fn = mesh_polygons
+                    if mesher.startswith('distmesh'):                # distmesh | distmesh-rings
+                        from functools import partial
+                        from .mesh_distmesh import mesh_polygons_distmesh
+                        mesh_fn = partial(mesh_polygons_distmesh, rings=mesher.endswith('-rings'))
+                    elif mesher.startswith('gmsh'):                  # gmsh | gmsh-rings | gmsh-graded
+                        from functools import partial
+                        from .mesh_gmsh import mesh_polygons_gmsh
+                        mesh_fn = partial(mesh_polygons_gmsh, mode=mesher.split('-')[1] if '-' in mesher else 'layers')
+                    nd, tr, vids = mesh_fn(geoms[k], dm, wr, ncross, grade, lines=seg, vias=vpts,
+                                           fine=fine, dmax_fine=2 * dmax if fine is not None else None)
                 for (i, v), vid in zip(vias_here, vids):
                     assert vid >= 0, f"via {v.name}: not on the M{k} mesh"
                     via_vertex[(i, k)] = vid + off
-                self.mesher_used[k] = 'tensor' if use_tensor else 'polygon'
+                self.mesher_used[k] = 'tensor' if use_tensor else (mesher if mesher.startswith(('gmsh', 'distmesh')) else 'polygon')
                 nodes.append(nd); tris.append(tr + off); tl.append(np.full(len(tr), k)); off += len(nd)
             self.rwg = RWG(np.vstack(nodes), np.vstack(tris))
             self.tri_layer = np.concatenate(tl)
@@ -329,7 +338,10 @@ class Simulation:
         except ImportError:
             has_core = False
         if precision == 'auto':
-            precision = 'mixed' if has_core else 'double'
+            # double whenever it fits comfortably: the complex64 LU preconditioner can stall (fine meshes, low
+            # frequency, many via chains) and the refinement then costs more than a double LU (study in
+            # kicad2openems docs/mom.md); mixed only where it saves the memory that makes the direct solver fit
+            precision = 'double' if (not has_core or 18.0 * n * n + 0.9e9 <= 0.5 * available_memory()) else 'mixed'
         if precision == 'mixed' and not has_core:
             precision = 'double'
         self.precision = precision
@@ -379,7 +391,10 @@ class Simulation:
         if ws:
             return min(ws)
         b = g.bounds
-        return 0.25 * min(b[2] - b[0], b[3] - b[1])
+        cap = 0.25 * min(b[2] - b[0], b[3] - b[1])
+        # no line ports here: the narrowest conductor, 2 A / P per piece (= w for a strip, larger for pads/planes)
+        pieces = [q for q in getattr(g, 'geoms', [g]) if q.geom_type == 'Polygon' and q.length > 0]
+        return min([cap] + [2 * q.area / q.length for q in pieces])
 
     # ---- edges on lines --------------------------------------------------------------------
     def _line_edges(self, lp, s, tol=1e-8):

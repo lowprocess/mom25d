@@ -685,6 +685,14 @@ class FastOperator:
         if gpu is not None:
             gpu.release()
         sim.log.note(f"mixed precision: GMRES iterations per port {self.iters}")
+        # the single-precision LU can be too weak a preconditioner (fine meshes at low frequency: the MPIE
+        # matrix is ill-conditioned); an unconverged refinement returns garbage, so check and redo in double
+        R = dsc[:, None] * E - dsc[:, None] * self.matvec_exact_multi(X, Sx)
+        rel = np.linalg.norm(R, axis=0) / np.maximum(np.linalg.norm(dsc[:, None] * E, axis=0), 1e-300)
+        if (rel > 100 * self.mixed_tol).any():
+            sim.log.note(f"WARNING mixed precision did not converge at {f / 1e9:.4g} GHz (residual {rel.max():.1e}) "
+                         f"- solving in double precision")
+            return self.solve_direct(f, E, block, precision='double')
         return X
 
     def _solve_direct_numpy(self, f, E, block=1024):
