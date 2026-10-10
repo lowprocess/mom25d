@@ -7,12 +7,15 @@ mom25d.cli - KiCad / Gerber board or AppCSXCAD / openEMS geometry (.xml) -> S-pa
   mom25d board.kicad_pcb --config board.mom25d.toml      (same keys as the options)
   mom25d board.xml --fmin 1 --fmax 6        (a CSX file, e.g. from kicad2openems: see mom25d.csx)
 
-Outputs in --out: <name>.s<N>p (Touchstone, reference impedance per port in the header comment),
-<name>_dashboard.png, <name>_summary.json (stack, ports, mesh, timings, diagnostics).
-Frequencies in GHz, lengths in mm (KiCad units). By default the sweep is adaptive (rational fit,
---points samples on the output grid); --linear N solves at N equally spaced frequencies instead.
+A --config file holds any of the options (dashes or underscores; board too); the command line wins over
+it, and its paths (board, pos, out) are relative to the file. Outputs in --out: <name>.s<N>p
+(Touchstone, reference impedance per port in the header comment), <name>_dashboard.png,
+<name>_summary.json (stack, ports, mesh, timings, diagnostics). Frequencies in GHz, lengths in mm (KiCad
+units). By default the sweep is adaptive (rational fit, --points samples on the output grid); --linear N
+solves at N equally spaced frequencies instead. MOM25D_TRACEBACK=1 shows the Python traceback of an error.
 """
 import argparse
+import difflib
 import json
 import os
 import sys
@@ -23,7 +26,12 @@ import numpy as np
 try:
     import tomllib
 except ImportError:                                   # Python < 3.11
-    tomllib = None
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None
+
+PATH_KEYS = ('board', 'pos', 'out')                   # relative to the config file
 
 
 def write_touchstone(path, f, S, zref, comment='', names=None):
@@ -57,7 +65,66 @@ def write_touchstone(path, f, S, zref, comment='', names=None):
 from .run import renorm, out_refs                     # noqa: E402  (kept importable from here)
 
 
+def _config_path(value, base, key):
+    """A path from the config file: relative to its folder; one that only exists relative to the working
+    directory (configs written for the repository root) is used as it is, with a note."""
+    value = os.path.expanduser(str(value))
+    if os.path.isabs(value):
+        return value
+    here = os.path.normpath(os.path.join(base, value))
+    exists = (lambda p: os.path.isdir(os.path.dirname(p) or '.')) if key == 'out' else os.path.exists
+    if not exists(here) and exists(value) and os.path.normpath(value) != here:
+        print(f"config: {key} = {value!r} is not next to the config; using it relative to the working directory "
+              f"(write it relative to the config file)")
+        return value
+    return here
+
+
+def config_defaults(ap, path):
+    """The options of a TOML config as parser defaults (the command line still wins). Unknown keys are an
+    error that names the option they are probably a typo of."""
+    if tomllib is None:
+        ap.error("--config needs Python 3.11+, or: python -m pip install tomli")
+    try:
+        with open(path, 'rb') as fh:
+            cfg = tomllib.load(fh)
+    except OSError as e:
+        ap.error(f"--config {path}: {e.strerror}")
+    except tomllib.TOMLDecodeError as e:
+        ap.error(f"--config {path}: {e}")
+    known = set(vars(ap.parse_args([]))) - {'config', 'gpu_info'}
+    base = os.path.dirname(os.path.abspath(path))
+    out, unknown = {}, []
+    for k, v in cfg.items():
+        k = k.replace('-', '_')
+        if k not in known:
+            near = difflib.get_close_matches(k, sorted(known), n=1, cutoff=0.8)
+            unknown.append(k + (f" (did you mean {near[0]}?)" if near else ''))
+            continue
+        if isinstance(v, dict):                                     # [dmax_layer] / [wref] tables
+            v = [f"{kk}={vv}" for kk, vv in v.items()]
+        elif isinstance(v, list) and k in ('nets', 'region'):
+            v = ",".join(map(str, v))
+        if k in PATH_KEYS and isinstance(v, str):
+            v = _config_path(v, base, k)
+        out[k] = v
+    if unknown:
+        ap.error(f"--config {path}: unknown key(s) {', '.join(unknown)}")
+    return out
+
+
 def main(argv=None):
+    try:
+        return _main(argv)
+    except (FileNotFoundError, IsADirectoryError, ValueError) as e:  # a file or a setting that cannot be used
+        if os.environ.get('MOM25D_TRACEBACK'):
+            raise
+        msg = f"{e.strerror}: {e.filename}" if isinstance(e, OSError) and e.filename else str(e)
+        print(f"mom25d: error: {msg}", file=sys.stderr)
+        return 2
+
+
+def parser():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1], formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('board', nargs='?', help='.kicad_pcb, .gbrjob (Gerber job file) or .xml (AppCSXCAD / openEMS)')
     ap.add_argument('--config', help='TOML file with any of the options below')
@@ -91,17 +158,21 @@ def main(argv=None):
     ap.add_argument('--z0', type=float, default=50.0, help='output reference impedance')
     ap.add_argument('--sigma', type=float, help='conductor conductivity S/m (enables metal loss)')
     ap.add_argument('--out', default='mom25d_out')
+    return ap
+
+
+def parse(argv=None):
+    """(parser, options): the command line, over a --config file's values, over the defaults."""
+    ap = parser()
     a = ap.parse_args(argv)
-    if a.config:
-        assert tomllib, "TOML config needs Python 3.11+"
-        cfg = tomllib.load(open(a.config, 'rb'))
-        for k, v in cfg.items():
-            k = k.replace('-', '_')
-            if isinstance(v, dict):                     # [dmax_layer] / [wref] tables
-                v = [f"{kk}={vv}" for kk, vv in v.items()]
-            elif isinstance(v, list) and k in ('nets', 'region'):
-                v = ",".join(map(str, v))
-            setattr(a, k, v)
+    if a.config:                                        # the file's values become defaults: typed options win
+        ap.set_defaults(**config_defaults(ap, a.config))
+        a = ap.parse_args(argv)
+    return ap, a
+
+
+def _main(argv=None):
+    ap, a = parse(argv)
 
     if a.gpu_info:
         from . import gpu as mom25d_gpu
@@ -125,7 +196,8 @@ def main(argv=None):
         brd = None
     elif a.board.endswith('.gbrjob'):
         from .gerber import GerberBoard
-        assert a.pos, "Gerber input needs --pos (ports come from the pick-and-place file)"
+        if not a.pos:
+            ap.error("Gerber input needs --pos (the ports come from the pick-and-place file)")
         brd = GerberBoard(a.board)
         model = brd.build(a.pos, ground=a.ground or 'B.Cu', cover=a.cover, region=region, include_mask=not a.no_mask)
     else:
@@ -195,7 +267,8 @@ def main(argv=None):
                    max_passivity=float(np.max(res.passiv)), max_reciprocity_err=float(np.max(res.recip)),
                    stack=model.describe().splitlines(), timings={k: round(v, 2) for k, v in sim.log.totals().items()},
                    notes=sim.log.notes)
-    json.dump(summary, open(os.path.join(a.out, f"{name}_summary.json"), 'w'), indent=1)
+    with open(os.path.join(a.out, f"{name}_summary.json"), 'w') as fh:
+        json.dump(summary, fh, indent=1)
     print(f"wrote {ts}, {dash}  ({nsolve} EM solves, {time.time() - t0:.0f} s)")
     return 0
 
