@@ -1,5 +1,5 @@
 """
-mom25d_afs.py - adaptive frequency sweep with rational (AAA) interpolation
+mom25d.afs - adaptive frequency sweep with rational (AAA) interpolation
 
 The EM solve per frequency is the expensive step; S(f) of a passive structure is a smooth
 rational function between its resonances. Fit one barycentric rational model to all S entries

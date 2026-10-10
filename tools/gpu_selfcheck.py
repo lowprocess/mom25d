@@ -9,9 +9,8 @@ import argparse, os, sys, time
 import numpy as np
 import scipy.linalg as sla
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import mom25d_gpu
-
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
+import mom25d.gpu as mom25d_gpu
 ap = argparse.ArgumentParser()
 ap.add_argument('--backend', default='auto')
 ap.add_argument('--n', type=int, default=8192, help='matrix size for the LU benchmark')
@@ -58,9 +57,9 @@ for n in sorted({min(a.n, nmax), min(a.n // 2, nmax)}):
 # ---- 3. a small simulation, GPU vs CPU -------------------------------------------------------
 if not a.skip_sim:
     from shapely.geometry import box
-    from mom25d_ml import Layer, LayerStack
-    from mom25d_geo import LinePort
-    from mom25d_sim import Simulation
+    from mom25d.multilayer import Layer, LayerStack
+    from mom25d.geo import LinePort
+    from mom25d.sim import Simulation
     st = LayerStack([Layer(0.2e-3, 4.3, 0.02)])
     w, L = 0.35e-3, 30e-3
     shapes = {1: [box(-L / 2, -w / 2, L / 2, w / 2), box(-0.2e-3, -4e-3, 0.2e-3, 0)]}       # line + open stub

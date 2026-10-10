@@ -12,15 +12,15 @@ from scipy.integrate import quad
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.join(HERE, '..')
-sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, 'src'))
 
-from mom25d import C0, MU0, EPS0                                          # noqa: E402
-from mom25d_ml import Layer, LayerStack, line_char_ml                     # noqa: E402
-from mom25d_via import ViaKernels                                         # noqa: E402
-from mom25d_sing import offplane_pairs                                    # noqa: E402
-from mom25d_geo import mesh_polygons, LinePort                            # noqa: E402
-from mom25d_sim import Simulation, SeriesLumped, Via, ViaPort, rlc        # noqa: E402
-from mom25d_afs import aaa                                                # noqa: E402
+from mom25d.base import C0, MU0, EPS0                                          # noqa: E402
+from mom25d.multilayer import Layer, LayerStack, line_char_ml                     # noqa: E402
+from mom25d.via import ViaKernels                                         # noqa: E402
+from mom25d.sing import offplane_pairs                                    # noqa: E402
+from mom25d.geo import mesh_polygons, LinePort                            # noqa: E402
+from mom25d.sim import Simulation, SeriesLumped, Via, ViaPort, rlc        # noqa: E402
+from mom25d.afs import aaa                                                # noqa: E402
 
 
 def test_via_kernels_exact_in_air():
@@ -41,7 +41,7 @@ def test_via_kernels_exact_in_air():
 
 
 def test_offplane_reduces_to_inplane_and_converges():
-    from mom25d import make_mesh, RWG, singular_moments
+    from mom25d.base import make_mesh, RWG, singular_moments
     nodes, tris = make_mesh([(0, 0, 0.3e-3, 0.06e-3)], 0.15e-3, 0.03e-3)
     M0, _, _ = singular_moments(RWG(nodes, tris))
     m0, *_ = offplane_pairs(nodes, tris, [0, 0], [0, 3], 0.0)
@@ -109,7 +109,7 @@ def demo_board(tmp_path_factory):
 
 
 def test_kicad_import(demo_board):
-    from mom25d_kicad import KiCadBoard
+    from mom25d.kicad import KiCadBoard
     b = KiCadBoard(demo_board + '.kicad_pcb')
     m = b.build(nets=['RF', 'GND'], ground='B.Cu', pos_file=demo_board + '-top.pos', include_mask=False)
     assert m.iface == {'In2.Cu': 1, 'In1.Cu': 2, 'F.Cu': 3}
@@ -125,8 +125,8 @@ def test_kicad_import(demo_board):
 
 def test_gerber_roundtrip_matches_native(demo_board, tmp_path):
     from shapely.ops import unary_union
-    from mom25d_kicad import KiCadBoard
-    from mom25d_gerber import GerberBoard
+    from mom25d.kicad import KiCadBoard
+    from mom25d.gerber import GerberBoard
     subprocess.check_call([sys.executable, os.path.join(ROOT, 'examples', 'export_demo_gerbers.py'),
                            demo_board + '.kicad_pcb', str(tmp_path)])
     k = KiCadBoard(demo_board + '.kicad_pcb')
@@ -158,7 +158,7 @@ def test_fast_operators_match_dense():
 
 def test_core_matches_numpy_and_solvers_agree():
     """Compiled core (if built) vs NumPy fallback, and direct/mixed/BLR agreement."""
-    core = pytest.importorskip('mom25d_core')
+    core = pytest.importorskip('mom25d._core')
     from shapely.geometry import box, Point
     st = LayerStack([Layer(0.2e-3, 4.3, 0.02), Layer(0.2e-3, 4.3, 0.02)])
     w, L = 0.35e-3, 8e-3
@@ -183,7 +183,7 @@ def test_core_matches_numpy_and_solvers_agree():
 
 
 def test_coupled_stripline_even_odd_vs_cohn():
-    from mom25d_sim import line_char_pair, coupled_stripline_cohn
+    from mom25d.sim import line_char_pair, coupled_stripline_cohn
     b, er, w, s = 0.4e-3, 4.3, 0.15e-3, 0.15e-3
     st = LayerStack([Layer(b / 2, er), Layer(b / 2, er)], top='pec')
     ge, ze, go, zo = line_char_pair(st, 1, w, s, [5e9])
@@ -194,7 +194,7 @@ def test_coupled_stripline_even_odd_vs_cohn():
 
 
 def test_differential_through_line():
-    from mom25d_sim import DiffPort
+    from mom25d.sim import DiffPort
     st = LayerStack([Layer(0.2e-3, 4.3)])
     w, s, L = 0.25e-3, 0.2e-3, 16e-3
     yc = (w + s) / 2
@@ -217,8 +217,8 @@ def test_differential_through_line():
 def test_kicad_differential_ports(tmp_path):
     base = str(tmp_path / 'diff')
     subprocess.check_call([sys.executable, os.path.join(ROOT, 'examples', 'make_demo_board.py'), base, 'diff'])
-    from mom25d_kicad import KiCadBoard
-    from mom25d_sim import DiffPort
+    from mom25d.kicad import KiCadBoard
+    from mom25d.sim import DiffPort
     m = KiCadBoard(base + '.kicad_pcb').build(nets=['D_P', 'D_N'], ground='B.Cu', pos_file=base + '-top.pos',
                                               include_mask=False)
     ps = m.ports(dmax=0.3e-3)

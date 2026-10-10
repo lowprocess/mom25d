@@ -1,9 +1,9 @@
 """Per-stage time and peak memory on the demo KiCad board (cropped), for optimisation work.
    python benchmarks/bench_board.py [solver] [region]"""
 import os, sys, time, resource, subprocess
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import numpy as np
-from mom25d_kicad import KiCadBoard
+from mom25d.kicad import KiCadBoard
 
 def rss():
     for l in open('/proc/self/status'):

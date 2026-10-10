@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mom25d"
+version = "0.5.0"
+description = "2.5D Method-of-Moments solver for PCB structures (KiCad, Gerber or AppCSXCAD / openEMS XML input)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.24", "scipy>=1.10", "matplotlib>=3.7", "shapely>=2.0", "triangle>=20230923",
+                "tomli>=2; python_version < '3.11'"]
+
+[project.optional-dependencies]
+gmsh = ["gmsh>=4.11"]                # mesher = "gmsh" (see docs/meshing.md)
+core = ["pybind11>=2.10"]            # python src/mom25d/core/build.py: the C++ / OpenMP kernels
+test = ["pytest>=7"]
+
+[project.scripts]
+mom25d = "mom25d.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mom25d = ["core/*.cpp", "core/*.py", "*.so", "*.pyd"]

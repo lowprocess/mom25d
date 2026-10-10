@@ -1,5 +1,5 @@
 """
-mom25d_sing.py - analytic integrals of 1/R over triangles with an out-of-plane offset d
+mom25d.sing - analytic integrals of 1/R over triangles with an out-of-plane offset d
 
 For the near-singular kernel 1/sqrt(rho^2 + d^2) between metal on two closely spaced interfaces
 (thin prepregs, the two sheets of a thick conductor). Inner (source) integral analytic
@@ -8,7 +8,7 @@ in-plane formulas used by mom25d.singular_moments.
 """
 import numpy as np
 
-from mom25d import _BAR6, _W6
+from .base import _BAR6, _W6
 
 
 def offplane_pairs(nodes, tris, p_idx, q_idx, d, chunk=4000):

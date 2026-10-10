@@ -4,7 +4,9 @@ __pycache__/
 *.pkl
 .venv/
 examples/out/
+examples/out_*/
 examples/gerbers/
 *.so
+*.egg-info/
 benchmarks/*.npy
 user/

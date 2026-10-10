@@ -1,5 +1,5 @@
 """
-mom25d_sim.py - the general simulation object (stage 3)
+mom25d.sim - the general simulation object (stage 3)
 
     sim = Simulation(stack, shapes, ports=[...], vias=[...], lumped=[...], dmax=...)
     res = sim.sweep(freqs)
@@ -14,7 +14,7 @@ lumped  : SeriesLumped (element across a strip); Via(..., Z=...) puts an element
 metal   : Metal(sigma, t) -> surface impedance on strips, wall loss on vias (optional)
 
 Unknowns: RWG edges on all metal layers, then one per via chain. Via-related matrix blocks use
-the kernels from mom25d_via (validated against exact image solutions); the via end charges are
+the kernels from mom25d.via (validated against exact image solutions); the via end charges are
 fan-distributed and enter through the same G_q interaction as the strip charges.
 """
 from types import SimpleNamespace
@@ -22,12 +22,12 @@ from types import SimpleNamespace
 import numpy as np
 import shapely
 
-from mom25d import MU0, C0, EPS0, RWG, qform, combine, singular_moments, quad_pts, gram_matrix, \
+from .base import MU0, C0, EPS0, RWG, qform, combine, singular_moments, quad_pts, gram_matrix, \
     _BAR3, _W3, _BAR6, _W6, PlanarMoM
-from mom25d_ml import RunLog, GreenTableML, make_mesh_ml, MLPort
-from mom25d_geo import LinePort, port_from_axis, to_geometry, is_manhattan_rects, mesh_polygons
-from mom25d_via import ViaKernels
-from mom25d_sing import offplane_pairs
+from .multilayer import RunLog, GreenTableML, make_mesh_ml, MLPort
+from .geo import LinePort, port_from_axis, to_geometry, is_manhattan_rects, mesh_polygons
+from .via import ViaKernels
+from .sing import offplane_pairs
 
 
 # =============================================================================
@@ -324,7 +324,7 @@ class Simulation:
                               f"non-reciprocal when ports differ")
         n = r.Ne + self.Nv
         try:
-            import mom25d_core  # noqa: F401
+            from . import _core  # noqa: F401
             has_core = True
         except ImportError:
             has_core = False
@@ -352,7 +352,7 @@ class Simulation:
             self.solver = solver
             self.log.note(f"solver: {solver} (N = {n})")
         if solver in ('aca', 'direct', 'blr'):
-            from mom25d_fast import FastOperator
+            from .fast import FastOperator
             self.fast = FastOperator(self, tol=aca_tol)
             return
 
@@ -693,7 +693,7 @@ def thicken(stack, shapes, thickness, pitch=0.25e-3, radius=None):
     Returns (stack2, shapes2, kmap, side_vias). kmap maps old interface -> new bottom sheet index;
     use sheets(k) for ports / lumped elements that must act on both sheets.
     """
-    from mom25d_ml import Layer, LayerStack
+    from .multilayer import Layer, LayerStack
     layers = [Layer(l.h, l.er, l.tand, l.name) for l in stack.layers]
     top_er = stack.top_er
     shapes2 = {k: list(v) for k, v in shapes.items()}

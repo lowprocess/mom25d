@@ -7,7 +7,7 @@ Demo / validation for mom25d.py (stage 1):
 Run:  python demo_mom25d.py        (~1.5 min)
 """
 import numpy as np
-from mom25d import *
+from mom25d.base import *
 
 w, h, er, tand = 0.35e-3, 0.2e-3, 4.3, 0.02          # 50-ohm line on 0.2 mm FR4-like
 st = Stackup(h, er, tand)

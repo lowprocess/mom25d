@@ -1,5 +1,5 @@
 """
-mom25d_viz.py - structure / mesh / results / debug views for mom25d_ml.MultiLayerMoM
+mom25d.viz - structure / mesh / results / debug views for mom25d.multilayer.MultiLayerMoM
 
   plot_stackup(ax, sim)        dielectric cross-section, metal interfaces, grounds
   plot_3d(ax3d, sim)           exploded 3D view of all metal layers (z exaggerated)
@@ -110,7 +110,7 @@ def plot_3d(ax, sim, zexag=None):
 
 def _pinfo(sim, p):
     """Uniform description of any port type: kind, layers, centre, direction, width (metres)."""
-    from mom25d_geo import LinePort, port_from_axis
+    from .geo import LinePort, port_from_axis
     if hasattr(p, 'axis'):                                   # legacy axis-aligned Port / MLPort
         p = port_from_axis(p)
     if isinstance(p, LinePort):

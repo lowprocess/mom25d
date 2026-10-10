@@ -1,5 +1,5 @@
 """
-mom25d_geo.py - geometry helpers for the multilayer solver
+mom25d.geo - geometry helpers for the multilayer solver
 
   * LinePort      : wave port on a straight feed in any in-plane direction (KiCad traces at 45 deg etc.)
   * mesh_polygons : constrained-Delaunay mesh of arbitrary polygons (holes allowed) with

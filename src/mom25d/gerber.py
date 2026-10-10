@@ -1,5 +1,5 @@
 """
-mom25d_gerber.py - Gerber (RS-274X / X2) + Excellon + KiCad job file -> the same board model as
+mom25d.gerber - Gerber (RS-274X / X2) + Excellon + KiCad job file -> the same board model as
 the native KiCad importer.
 
     brd = GerberBoard('fab/board-job.gbrjob')            # finds copper Gerbers and drill files
@@ -26,7 +26,7 @@ from shapely.geometry import Polygon, LineString, Point, box, MultiPolygon
 from shapely.ops import unary_union
 from shapely import affinity
 
-from mom25d_kicad import _arc_points, read_pos, pos_port_refs, BoardModel, DiffLegs
+from .kicad import _arc_points, read_pos, pos_port_refs, BoardModel, DiffLegs
 
 
 # =============================================================================
@@ -296,7 +296,7 @@ class GerberBoard:
                 self.vias.append(dict(x=x, y=-y, size=0, drill=dia, layers=lys, net=''))
 
     def describe_stackup(self):
-        from mom25d_kicad import KiCadBoard
+        from .kicad import KiCadBoard
         return KiCadBoard.describe_stackup(self)
 
     def port_footprints(self, pos_refs=None):

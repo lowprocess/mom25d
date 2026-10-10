@@ -1,5 +1,5 @@
 """
-mom25d_ml.py - Stage 2 (part 1) of the 2.5D planar MoM solver: multilayer stackups.
+mom25d.multilayer - Stage 2 (part 1) of the 2.5D planar MoM solver: multilayer stackups.
 
   * Arbitrary stack of dielectric layers above a PEC ground, open (air) or PEC top cover
     (microstrip, embedded microstrip, stripline, offset/broadside stripline ...)
@@ -12,7 +12,7 @@ mom25d_ml.py - Stage 2 (part 1) of the 2.5D planar MoM solver: multilayer stacku
     integrated analytically; the remainder is tabulated per frequency.
   * Non-uniform tensor mesh: n cells across narrow strips, dmax along them
   * Layer-aware ports, run log (timings), and diagnostics (wave-fit residual, reciprocity,
-    passivity) for the visualisation module (mom25d_viz.py).
+    passivity) for the visualisation module (mom25d.viz).
 
 Not yet: vias / vertical currents (stage 2, part 2), conductor thickness, lumped components.
 Time convention exp(+j w t).
@@ -25,7 +25,7 @@ import numpy as np
 from scipy.special import jv, ellipk
 from scipy.interpolate import CubicSpline
 
-from mom25d import (MU0, C0, EPS0, RWG, qform, combine, singular_moments, quad_pts,
+from .base import (MU0, C0, EPS0, RWG, qform, combine, singular_moments, quad_pts,
                     _BAR3, _W3, _BAR6, _W6, Port, PlanarMoM, renormalize)
 
 
@@ -236,7 +236,7 @@ class GreenTableML:
             e = 2 * np.pi * np.exp(-kr * self.d) / kr
             GA, Gq = GA - self.cA * e, Gq - self.cq * e
         rho = rho_max * np.linspace(0, 1, nrho) ** 2
-        from mom25d_via import j0_matrix
+        from .via import j0_matrix
         J = j0_matrix(rho, kr)
         dA = J @ (GA * kr * dk) / (2 * np.pi)
         dQ = J @ (Gq * kr * dk) / (2 * np.pi)

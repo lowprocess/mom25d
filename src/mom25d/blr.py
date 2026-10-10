@@ -1,5 +1,5 @@
 """
-mom25d_blr.py - block low-rank (BLR) LU preconditioner for the MoM matrix
+mom25d.blr - block low-rank (BLR) LU preconditioner for the MoM matrix
 
 The impedance matrix is never stored densely. Unknowns are ordered by a geometric cluster tree
 and the matrix is cut into tiles; tiles between well-separated clusters are kept as truncated

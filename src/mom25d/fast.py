@@ -1,5 +1,5 @@
 """
-mom25d_fast.py - large problems: hierarchical (H-matrix / ACA) far field + sparse near field + GMRES
+mom25d.fast - large problems: hierarchical (H-matrix / ACA) far field + sparse near field + GMRES
 
   Z = Z_far + dZ_near
     Z_far   : every interaction with a 1-point (centroid) rule per triangle, never stored densely:
@@ -18,13 +18,13 @@ from scipy import sparse
 from scipy.sparse.linalg import LinearOperator, gmres, splu
 from scipy.spatial import cKDTree
 
-from mom25d import _BAR3, _W3, _BAR6, _W6
-from mom25d_ml import GreenTableML
-from mom25d_sing import offplane_pairs
+from .base import _BAR3, _W3, _BAR6, _W6
+from .multilayer import GreenTableML
+from .sing import offplane_pairs
 
 try:                                    # optional compiled kernels (python core/build.py)
     import os as _os
-    import mom25d_core as _core
+    from . import _core
     if _os.environ.get('MOM25D_NO_CORE'):
         _core = None
 except ImportError:
@@ -170,7 +170,7 @@ class HMatrix:
 # Fast operator for a Simulation
 # =============================================================================
 class FastOperator:
-    """Builds and applies Z for a mom25d_sim.Simulation without forming it densely."""
+    """Builds and applies Z for a mom25d.sim.Simulation without forming it densely."""
 
     def __init__(self, sim, near_fac=None, tol=1e-4, leaf=64, eta=2.0, max_rank=80, atol_rel=1e-8):
         self.sim = sim
@@ -536,7 +536,7 @@ class FastOperator:
             u = sig * sim.rwg.l[idx]
             S[np.ix_(idx, idx)] = S[np.ix_(idx, idx)].toarray() + el.Z(f) * np.outer(u, u)
         if sim.metal is not None:
-            from mom25d import gram_matrix
+            from .base import gram_matrix
             if sim._gram is None:
                 sim._gram = sparse.csr_matrix(gram_matrix(sim.rwg))
             G = sparse.csr_matrix(sim._gram)
@@ -633,7 +633,7 @@ class FastOperator:
         dsc = (1.0 / np.sqrt(np.abs(np.diagonal(Z)).astype(float) + 1e-300))
         gpu = None
         if precision == 'mixed' and getattr(sim, 'gpu', 'off') != 'off':
-            from mom25d_gpu import get_backend
+            from .gpu import get_backend
             gpu = get_backend(sim.gpu)
             if not getattr(self, '_gpu_logged', False):
                 self._gpu_logged = True
@@ -725,7 +725,7 @@ class FastOperator:
 
     def solve_blr(self, f, E, tol=1e-4, tile=256, eta=1.0, dtype=np.complex64):
         """Block low-rank LU preconditioner + GMRES with the exact matrix-free operator (no stored Z)."""
-        from mom25d_blr import BLRFactor, cluster_tiles
+        from .blr import BLRFactor, cluster_tiles
         assert self.core is not None, "solver='blr' needs the compiled core (python core/build.py)"
         sim = self.sim
         Ne, Nv = sim.Ne, sim.Nv
