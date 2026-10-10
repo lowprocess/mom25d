@@ -12,8 +12,8 @@ dependencies = ["numpy>=1.24", "scipy>=1.10", "matplotlib>=3.7", "shapely>=2.0",
                 "tomli>=2; python_version < '3.11'"]
 
 [project.optional-dependencies]
-gmsh = ["gmsh>=4.11"]                # mesher = "gmsh" (see docs/meshing.md)
-core = ["pybind11>=2.10"]            # python src/mom25d/core/build.py: the C++ / OpenMP kernels
+gmsh = ["gmsh>=4.11"]                # mesher = "gmsh" (see the README, Meshers)
+core = ["pybind11>=2.10"]            # python -m mom25d.core.build: the C++ / OpenMP kernels
 test = ["pytest>=7"]
 
 [project.scripts]

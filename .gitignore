@@ -10,3 +10,4 @@ examples/gerbers/
 *.egg-info/
 benchmarks/*.npy
 user/
+build/
