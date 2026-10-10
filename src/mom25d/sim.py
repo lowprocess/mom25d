@@ -332,11 +332,11 @@ class Simulation:
                               f"(line_char / line_char_xs, or BoardModel.characterize) - a wrong zc makes S "
                               f"non-reciprocal when ports differ")
         n = r.Ne + self.Nv
-        try:
-            from . import _core  # noqa: F401
-            has_core = True
-        except ImportError:
-            has_core = False
+        from .fast import _core                        # None without the build, or with MOM25D_NO_CORE set
+        has_core = _core is not None
+        if not has_core:
+            self.log.note("note: no compiled core (python -m mom25d.core.build, or MOM25D_NO_CORE is set): "
+                          "the NumPy kernels are several times slower")
         if precision == 'auto':
             # double whenever it fits comfortably: the complex64 LU preconditioner can stall (fine meshes, low
             # frequency, many via chains) and the refinement then costs more than a double LU (study in
