@@ -90,6 +90,7 @@ the conductor edges; the default, `tensor` for Manhattan layers), `gmsh` / `gmsh
 (`benchmarks/mesher_study.py`, [results](benchmarks/results/), plot in `docs/mesher_study.png`): the edge
 resolution (`ncross`) sets the accuracy, anisotropic edge cells (Triangle's rings) beat isotropic meshes
 (gmsh-graded, distmesh) 2-4x in error at a third of the unknowns, and gmsh brings no gain per unknown.
+`benchmarks/mesher_gallery.py` (`docs/mesher_gallery.png`) shows the meshes, the current and S21 side by side.
 Details: kicad2openems `docs/mom.md`.
 
 ## GPU acceleration (AMD ROCm or NVIDIA CUDA)
