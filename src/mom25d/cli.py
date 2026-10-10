@@ -1,10 +1,11 @@
 """
-mom25d.cli - KiCad / Gerber board -> S-parameters
+mom25d.cli - KiCad / Gerber board or AppCSXCAD / openEMS geometry (.xml) -> S-parameters
 
   mom25d board.kicad_pcb --pos board-top.pos --nets RF,GND --ground B.Cu \\
          --fmin 0.5 --fmax 10 --out results/
   mom25d fab/board-job.gbrjob --pos board-top.pos --ground B.Cu --region 0,0,20,10
   mom25d board.kicad_pcb --config board.mom25d.toml      (same keys as the options)
+  mom25d board.xml --fmin 1 --fmax 6        (a CSX file, e.g. from kicad2openems: see mom25d.csx)
 
 Outputs in --out: <name>.s<N>p (Touchstone, reference impedance per port in the header comment),
 <name>_dashboard.png, <name>_summary.json (stack, ports, mesh, timings, diagnostics).
@@ -53,31 +54,22 @@ def write_touchstone(path, f, S, zref, comment='', names=None):
             fh.write("[End]\n")
 
 
-def renorm(S, zc, zref):
-    """Renormalise S from reference impedances zc to zref (scalars or per-port, real)."""
-    zc = np.asarray(zc, float); n = S.shape[0]
-    zref = np.broadcast_to(np.asarray(zref, float), (n,))
-    if np.allclose(zc, zref):
-        return S
-    I = np.eye(n)
-    Z = np.diag(np.sqrt(zc)) @ (I + S) @ np.linalg.inv(I - S) @ np.diag(np.sqrt(zc))
-    zn = np.diag(1 / np.sqrt(zref)) @ Z @ np.diag(1 / np.sqrt(zref))
-    return (zn - I) @ np.linalg.inv(zn + I)
-
-
-def out_refs(sim, z0):
-    """Output reference per (modal) port: z0 single-ended, 2 z0 differential, z0/2 common."""
-    return np.array([2 * z0 if getattr(p, 'mode', None) == 'd' else (z0 / 2 if getattr(p, 'mode', None) == 'c' else z0)
-                     for p in sim.ports])
+from .run import renorm, out_refs                     # noqa: E402  (kept importable from here)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1], formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('board', nargs='?', help='.kicad_pcb or .gbrjob (Gerber job file)')
+    ap.add_argument('board', nargs='?', help='.kicad_pcb, .gbrjob (Gerber job file) or .xml (AppCSXCAD / openEMS)')
     ap.add_argument('--config', help='TOML file with any of the options below')
     ap.add_argument('--pos', help='pick-and-place file (.pos / .csv) listing the port components')
     ap.add_argument('--nets', help='comma-separated nets to include (KiCad only; default all)')
-    ap.add_argument('--ground', default='B.Cu', help='copper layer used as the infinite ground (z=0)')
+    ap.add_argument('--ground', help='copper layer used as the infinite ground (z=0); default B.Cu (.xml: its hints, '
+                                     'else the lowest solid plane)')
+    ap.add_argument('--port', default='auto', choices=['auto', 'wave', 'via'],
+                    help='.xml ports: wave (de-embedded), via (lumped) or auto (wave where the feed allows)')
+    ap.add_argument('--mesher', default='auto',
+                    choices=['auto', 'polygon', 'tensor', 'gmsh', 'gmsh-rings', 'gmsh-graded', 'distmesh', 'distmesh-rings'],
+                    help='surface mesher (gmsh: pip install gmsh; see the README)')
     ap.add_argument('--cover', help='copper layer used as a PEC cover (stripline-only cross sections)')
     ap.add_argument('--region', help='crop x0,y0,x1,y1 in mm (KiCad coordinates)')
     ap.add_argument('--no-mask', action='store_true', help='ignore the solder mask layer')
@@ -125,23 +117,33 @@ def main(argv=None):
     os.makedirs(a.out, exist_ok=True)
     name = os.path.splitext(os.path.basename(a.board))[0].replace('-job', '')
     region = tuple(float(v) for v in a.region.split(',')) if a.region else None
-    if a.board.endswith('.gbrjob'):
+    z0 = a.z0
+    if a.board.lower().endswith('.xml'):
+        from .csx import CSXModel
+        model = CSXModel(a.board, ground=a.ground, cover=a.cover, port=a.port, f_loss=0.5 * (a.fmin + a.fmax) * 1e9)
+        z0 = model.port_z0 if a.z0 == 50.0 else a.z0                 # the ports' own impedances unless given
+        brd = None
+    elif a.board.endswith('.gbrjob'):
         from .gerber import GerberBoard
         assert a.pos, "Gerber input needs --pos (ports come from the pick-and-place file)"
         brd = GerberBoard(a.board)
-        model = brd.build(a.pos, ground=a.ground, cover=a.cover, region=region, include_mask=not a.no_mask)
+        model = brd.build(a.pos, ground=a.ground or 'B.Cu', cover=a.cover, region=region, include_mask=not a.no_mask)
     else:
         from .kicad import KiCadBoard
         brd = KiCadBoard(a.board)
         nets = [n.strip() for n in a.nets.split(',')] if a.nets else None
-        model = brd.build(nets=nets, ground=a.ground, cover=a.cover, region=region, pos_file=a.pos,
+        model = brd.build(nets=nets, ground=a.ground or 'B.Cu', cover=a.cover, region=region, pos_file=a.pos,
                           include_mask=not a.no_mask)
-    print(brd.describe_stackup()); print(model.describe())
+    if brd is not None:
+        print(brd.describe_stackup())
+    print(model.describe())
     kv = lambda lst: {model.iface[k]: float(v) * 1e-3 for k, v in (s.split('=') for s in lst)}
     sim = model.simulation(dmax=a.dmax * 1e-3, dmax_layer=kv(a.dmax_layer), w_ref=kv(a.wref) or None,
                            ncross=a.ncross, solver=a.solver, verbose=True, fmin=a.fmin * 1e9, fmax=a.fmax * 1e9,
                            near_fac=a.near_fac, precision=a.precision, gpu=a.gpu,
-                           metal=Metal(a.sigma) if a.sigma else None, title=name)
+                           metal=Metal(a.sigma) if a.sigma else (Metal(model.sigma, model.sheet_t or 35e-6)
+                                                                  if getattr(model, 'sigma', None) else None),
+                           mesher=a.mesher, title=name)
     sim.layer_names = {k: n for n, k in model.iface.items()}
     zc = np.array([p.zc for p in sim.ports])
     if a.board.endswith('.gbrjob') is False and any(getattr(p, 'mode', None) for p in sim.ports):
@@ -150,7 +152,7 @@ def main(argv=None):
         f = np.linspace(a.fmin, a.fmax, a.linear) * 1e9
         res = sim.sweep(f, currents_at=0.5 * (f[0] + f[-1]))
         S = np.array([renorm(s, np.array([p.zc_fn(fi) if getattr(p, 'zc_fn', None) else p.zc for p in sim.ports]),
-                             out_refs(sim, a.z0)) for fi, s in zip(f, res.S)])
+                             out_refs(sim, z0)) for fi, s in zip(f, res.S)])
         res.S = S
         nsolve = len(f)
     else:
@@ -158,7 +160,7 @@ def main(argv=None):
         def solve(fr):
             print(f"  solving {fr / 1e9:.4f} GHz", flush=True)
             Sr = sim.sparams(fr)
-            return renorm(Sr, np.array([p.zc for p in sim.ports]), out_refs(sim, a.z0))
+            return renorm(Sr, np.array([p.zc for p in sim.ports]), out_refs(sim, z0))
         f, S, fs, Ss, hist = adaptive_sweep(solve, a.fmin * 1e9, a.fmax * 1e9, tol=a.afs_tol,
                                             ngrid=a.points, log=print)
         nsolve = len(fs)
@@ -171,7 +173,7 @@ def main(argv=None):
                               recip=np.abs(S - S.transpose(0, 2, 1)).max((1, 2)),
                               passiv=np.array([np.linalg.svd(s, compute_uv=False).max() for s in S]))
     ts = os.path.join(a.out, f"{name}.s{S.shape[1]}p")
-    write_touchstone(ts, f, S, out_refs(sim, a.z0), comment=f"{name} ({nsolve} EM solves)",
+    write_touchstone(ts, f, S, out_refs(sim, z0), comment=f"{name} ({nsolve} EM solves)",
                      names=[p.name for p in sim.ports])
     dash = viz.dashboard(sim, res, os.path.join(a.out, f"{name}_dashboard.png"))
     # lowest frequency where every wave port's sample span covers >= 0.4 rad (from the port Zc lines'
