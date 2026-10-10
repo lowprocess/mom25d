@@ -26,8 +26,9 @@ def _poly(prims, pts, z, tag='Polygon', length=None, prio=10):
         ET.SubElement(p, 'Vertex', X1=str(x), X2=str(y))
 
 
-def write_csx(path, hints=False, part=False, via=False, wall=False, line=10.0):
-    """A microstrip line along x (y = 0) on 0.2 mm FR-4 over a B.Cu plane, mm, ports at both ends."""
+def write_csx(path, hints=False, part=False, via=False, wall=False, line=10.0, sheet=False):
+    """A microstrip line along x (y = 0) on 0.2 mm FR-4 over a B.Cu plane, mm, ports at both ends. sheet: the
+    line is a conducting sheet, written as CSXCAD writes one (Conductivity / Thickness on the element)."""
     root = ET.Element('ContinuousStructure', CoordSystem='0')
     ET.SubElement(root, 'RectilinearGrid', DeltaUnit='0.001', CoordSystem='0')
     props = ET.SubElement(root, 'Properties')
@@ -37,7 +38,8 @@ def write_csx(path, hints=False, part=False, via=False, wall=False, line=10.0):
     ET.SubElement(mat, 'Property', Epsilon='4.4,1,1', Kappa=f"{2 * np.pi * 3e9 * 8.8541878128e-12 * 4.4 * 0.02},0,0")
     gnd = ET.SubElement(props, 'Metal', ID='1', Name='cu_B.Cu')
     _poly(ET.SubElement(gnd, 'Primitives'), board, 0.0)
-    top = ET.SubElement(props, 'Metal', ID='2', Name='cu_F.Cu')
+    top = ET.SubElement(props, 'ConductingSheet', ID='2', Name='cu_F.Cu', Conductivity='5.800000e+07',
+                        Thickness='3.500000e-05') if sheet else ET.SubElement(props, 'Metal', ID='2', Name='cu_F.Cu')
     tp = ET.SubElement(top, 'Primitives')
     if part:                                                       # a 1.0 mm gap at the middle, bridged by a part
         _poly(tp, [(0, -W / 2), (line / 2 - 0.5, -W / 2), (line / 2 - 0.5, W / 2), (0, W / 2)], 0.2)
@@ -96,6 +98,19 @@ def test_hints_vias_walls_parts(tmp_path):
     p = CSXModel(write_csx(tmp_path / 'd.xml', part=True), f_loss=3e9, log=lambda *a: None)
     assert len(p.lumped) == 1 and p.lumped[0].Z(1e9) == pytest.approx(50)
     assert p.shapes[1][0].area == pytest.approx(10 * W * 1e-6, rel=1e-6)    # the strip bridges the gap
+
+
+def test_conducting_sheet_is_metal_loss(tmp_path):
+    """A conducting sheet's conductivity (as CSXCAD writes it: attributes of the element) is the conductor loss of
+    the model's simulation, unless the call gives its own."""
+    from mom25d.sim import Metal
+    m = CSXModel(write_csx(tmp_path / 's.xml', hints=True, sheet=True), log=lambda *a: None)
+    assert m.sigma == 5.8e7 and m.sheet_t == pytest.approx(35e-6)
+    sim = m.simulation(dmax=1.5e-3, fmin=2e9, fmax=4e9, verbose=False, characterize=False)
+    assert sim.metal is not None and sim.metal.sigma == 5.8e7 and sim.metal.t == pytest.approx(35e-6)
+    sim = m.simulation(dmax=1.5e-3, fmin=2e9, fmax=4e9, verbose=False, characterize=False, metal=None)
+    assert sim.metal is None
+    assert CSXModel(write_csx(tmp_path / 'p.xml', hints=True), log=lambda *a: None).sigma is None
 
 
 def test_errors(tmp_path):

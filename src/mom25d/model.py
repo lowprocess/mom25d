@@ -268,10 +268,13 @@ class PlanarModel:
     def simulation(self, dmax=0.3e-3, step=None, fmin=1e9, fmax=10e9, characterize=True, wave_down_to=None, **kw):
         """The Simulation of this model. wave_down_to (Hz): 'auto' ports become wave ports only where the feed
         is long enough for the wave fit down to that frequency (else lumped); default: wherever the geometry
-        allows (the fit degrades below ~0.4 rad of sample span, with a warning)."""
-        from .sim import Simulation
+        allows (the fit degrades below ~0.4 rad of sample span, with a warning). metal= (sim.Metal or None)
+        overrides the model's own conductor loss (a CSX file's conducting sheets; default lossless)."""
+        from .sim import Simulation, Metal
         ports = self.ports(step=step, dmax=dmax, fmin=wave_down_to)
         if characterize:
             self.characterize(ports, fmin, fmax)
         kw.setdefault('lumped', list(self.lumped))
+        if getattr(self, 'sigma', None):                    # the model's conductor loss (a CSX conducting sheet)
+            kw.setdefault('metal', Metal(self.sigma, getattr(self, 'sheet_t', None) or 35e-6))
         return Simulation(self.stack, self.shapes, ports, vias=self.vias, dmax=dmax, **kw)
