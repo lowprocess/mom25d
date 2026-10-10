@@ -12,7 +12,8 @@ What is read (CSX drawing units scaled by the grid's DeltaUnit; the mesh itself 
                   laterally uniform for a planar solver: at each height the slab covering the most area
                   wins. Debye materials use Epsilon plus their poles' deltas (static value).
   Metal,          planar copper: Polygon (NormDir 2) and zero-height Box primitives at their height;
-  ConductingSheet the conductivity of a conducting sheet becomes the metal loss (sim.Metal)
+  ConductingSheet the conductivity and thickness of a conducting sheet become the metal loss (sim.Metal,
+                  which model.simulation() uses unless given another)
   Cylinder        vertical cylinders (any metal) are vias between the metal interfaces they cross
   vertical Box    vertical metal sheets (e.g. edge walls) become rows of vias (pitch wall_pitch)
   LumpedElement   'port_resist_<n>' (openEMS lumped ports): port n, its R the reference impedance;
@@ -124,9 +125,9 @@ class CSXModel(PlanarModel):
                     elif p.kind is not None:
                         skipped.add(f"{name} ({p.el.tag})")
             elif tag in ('Metal', 'ConductingSheet'):
-                if tag == 'ConductingSheet':
-                    pe = prop.find('Property')
-                    if pe is not None:
+                if tag == 'ConductingSheet':                    # CSXCAD writes these on the element itself
+                    pe = prop if prop.get('Conductivity') is not None else prop.find('Property')
+                    if pe is not None and _num(pe, 'Conductivity'):
                         self.sigma, self.sheet_t = _num(pe, 'Conductivity'), _num(pe, 'Thickness')
                 for p in prims:
                     if p.kind in ('poly', 'linpoly') and p.normal == 2 and p.poly is not None:
