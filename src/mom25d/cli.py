@@ -1,10 +1,10 @@
 """
-mom25d_cli.py - KiCad / Gerber board -> S-parameters
+mom25d.cli - KiCad / Gerber board -> S-parameters
 
-  python mom25d_cli.py board.kicad_pcb --pos board-top.pos --nets RF,GND --ground B.Cu \\
+  mom25d board.kicad_pcb --pos board-top.pos --nets RF,GND --ground B.Cu \\
          --fmin 0.5 --fmax 10 --out results/
-  python mom25d_cli.py fab/board-job.gbrjob --pos board-top.pos --ground B.Cu --region 0,0,20,10
-  python mom25d_cli.py board.kicad_pcb --config board.mom25d.toml      (same keys as the options)
+  mom25d fab/board-job.gbrjob --pos board-top.pos --ground B.Cu --region 0,0,20,10
+  mom25d board.kicad_pcb --config board.mom25d.toml      (same keys as the options)
 
 Outputs in --out: <name>.s<N>p (Touchstone, reference impedance per port in the header comment),
 <name>_dashboard.png, <name>_summary.json (stack, ports, mesh, timings, diagnostics).
@@ -112,26 +112,26 @@ def main(argv=None):
             setattr(a, k, v)
 
     if a.gpu_info:
-        import mom25d_gpu
+        from . import gpu as mom25d_gpu
         if a.gpu != 'auto':
             os.environ.setdefault('MOM25D_GPU', a.gpu)
         print(mom25d_gpu.describe())
         return 0
     if not a.board:
         ap.error("board file required")
-    from mom25d_sim import Metal
-    import mom25d_viz as viz
+    from .sim import Metal
+    from . import viz as viz
     t0 = time.time()
     os.makedirs(a.out, exist_ok=True)
     name = os.path.splitext(os.path.basename(a.board))[0].replace('-job', '')
     region = tuple(float(v) for v in a.region.split(',')) if a.region else None
     if a.board.endswith('.gbrjob'):
-        from mom25d_gerber import GerberBoard
+        from .gerber import GerberBoard
         assert a.pos, "Gerber input needs --pos (ports come from the pick-and-place file)"
         brd = GerberBoard(a.board)
         model = brd.build(a.pos, ground=a.ground, cover=a.cover, region=region, include_mask=not a.no_mask)
     else:
-        from mom25d_kicad import KiCadBoard
+        from .kicad import KiCadBoard
         brd = KiCadBoard(a.board)
         nets = [n.strip() for n in a.nets.split(',')] if a.nets else None
         model = brd.build(nets=nets, ground=a.ground, cover=a.cover, region=region, pos_file=a.pos,
@@ -154,7 +154,7 @@ def main(argv=None):
         res.S = S
         nsolve = len(f)
     else:
-        from mom25d_afs import adaptive_sweep
+        from .afs import adaptive_sweep
         def solve(fr):
             print(f"  solving {fr / 1e9:.4f} GHz", flush=True)
             Sr = sim.sparams(fr)
@@ -178,7 +178,7 @@ def main(argv=None):
     # phase velocity estimate: eps_eff from the characterised gamma is not stored, use the fitted one)
     valid_from = None
     try:
-        from mom25d_geo import LinePort
+        from .geo import LinePort
         spans = [abs(s[-1] - s[0]) for p, s in zip(sim.ports, sim.samples) if isinstance(p, LinePort)]
         if spans:
             fv = sim.last['f']; gv = np.nanmax(np.abs(sim.last['gamma'].imag) / fv)   # beta/f

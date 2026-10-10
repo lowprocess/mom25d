@@ -1,5 +1,5 @@
 """
-mom25d_gpu.py - GPU dense LU for the mixed-precision direct solver (AMD ROCm or NVIDIA CUDA)
+mom25d.gpu - GPU dense LU for the mixed-precision direct solver (AMD ROCm or NVIDIA CUDA)
 
 The matrix is still filled on the CPU (the C++ core takes ~2 s); the expensive O(N^3) part, the
 complex64 LU factorisation, and the triangular solves used as the GMRES preconditioner run on the

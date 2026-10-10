@@ -8,10 +8,10 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from mom25d import GreenTable, Stackup, line_characterization, C0, MU0, EPS0   # noqa: E402
-from mom25d_ml import (Layer, LayerStack, GreenTableML, line_char_ml,             # noqa: E402
+from mom25d.base import GreenTable, Stackup, line_characterization, C0, MU0, EPS0   # noqa: E402
+from mom25d.multilayer import (Layer, LayerStack, GreenTableML, line_char_ml,             # noqa: E402
                        stripline_z0_cohn)
 
 RHO = np.array([1e-5, 1e-4, 5e-4, 2e-3, 8e-3, 15e-3])

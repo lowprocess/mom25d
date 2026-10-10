@@ -7,12 +7,11 @@ import pytest
 import scipy.linalg as sla
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
-from mom25d_ml import Layer, LayerStack
-from mom25d_sim import Simulation, Via, ViaPort
-import mom25d_gpu
-
-pytest.importorskip('mom25d_core')
+sys.path.insert(0, os.path.join(ROOT, 'src'))
+from mom25d.multilayer import Layer, LayerStack
+from mom25d.sim import Simulation, Via, ViaPort
+import mom25d.gpu as mom25d_gpu
+pytest.importorskip('mom25d._core')
 
 
 # ---- NumPy stand-ins with the semantics of the real libraries ----------------------------------

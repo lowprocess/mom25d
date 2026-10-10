@@ -1,5 +1,5 @@
 """
-mom25d_kicad.py - KiCad board import: .kicad_pcb (native) -> mom25d Simulation
+mom25d.kicad - KiCad board import: .kicad_pcb (native) -> mom25d Simulation
 
     brd = KiCadBoard('board.kicad_pcb')
     model = brd.build(nets=['RF_IN', 'RF_OUT', 'GND'], ground='B.Cu', region=(x0, y0, x1, y1),
@@ -424,7 +424,7 @@ def pos_port_refs(rows, pattern=r'^P\d+[+\-PN]?$', package_hint='PORT'):
 class BoardModel:
     def __init__(self, board, nets, ground, cover, region, pos_file, include_mask, flip,
                  default_er, default_tand):
-        from mom25d_ml import Layer, LayerStack
+        from .multilayer import Layer, LayerStack
         self.board, self.ground, self.cover = board, ground, cover
         self.notes = []
         # ---- stack ----
@@ -472,7 +472,7 @@ class BoardModel:
             self.shapes[k] = [g.simplify(1e-6)]
         self.region = reg
         # ---- vias ----
-        from mom25d_sim import Via
+        from .sim import Via
         self.vias = []
         for v in board.vias:
             if sel is not None and v['net'] not in sel:
@@ -571,8 +571,8 @@ class BoardModel:
         return (g0, s0, s1, max(step, (s1 - s0) / 10)), need          # ~10 intervals: well-conditioned fit
 
     def ports(self, step=None, dmax=0.3e-3):
-        from mom25d_geo import LinePort
-        from mom25d_sim import ViaPort, GapPort, Via, DiffPort
+        from .geo import LinePort
+        from .sim import ViaPort, GapPort, Via, DiffPort
         step = step or dmax
         out = []
         for n, fp in self.port_fps.items():
@@ -671,11 +671,11 @@ class BoardModel:
     def characterize(self, ports, fmin, fmax, n=3, dmax=0.4e-3, log=print):
         """Reference impedance of each wave port's line cross-section (trace + metal on other layers
         covering the port), solved as a short centre-fed line at n frequencies and interpolated."""
-        from mom25d_geo import LinePort
-        from mom25d_sim import line_char_xs
+        from .geo import LinePort
+        from .sim import line_char_xs
         fs = np.linspace(max(fmin, fmax / 3), fmax, n)    # the fit is well conditioned here; Zc ~ flat
         cache = {}
-        from mom25d_sim import DiffPort, line_char_pair
+        from .sim import DiffPort, line_char_pair
         for p in ports:
             if isinstance(p, DiffPort):
                 a, b = p.pos, p.neg
@@ -723,7 +723,7 @@ class BoardModel:
             p.zc = float(zz[len(zz) // 2])
 
     def simulation(self, dmax=0.3e-3, step=None, fmin=1e9, fmax=10e9, characterize=True, **kw):
-        from mom25d_sim import Simulation
+        from .sim import Simulation
         ports = self.ports(step=step, dmax=dmax)
         if characterize:
             self.characterize(ports, fmin, fmax)

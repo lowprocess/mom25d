@@ -507,7 +507,7 @@ int num_threads() {
 #endif
 }
 
-PYBIND11_MODULE(mom25d_core, m) {
+PYBIND11_MODULE(_core, m) {
     m.doc() = "compiled kernels for mom25d";
     m.def("fill_far", &fill_far_t<cd>, "far-field entries into a complex128 Z");
     m.def("fill_far_c64", &fill_far_t<cf>, "far-field entries into a complex64 Z");

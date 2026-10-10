@@ -15,8 +15,8 @@ Outputs: coupler_dashboard.png, coupler.s4p
 Run: python demo_ml.py   (a few minutes)
 """
 import numpy as np
-from mom25d_ml import *
-import mom25d_viz as viz
+from mom25d.multilayer import *
+import mom25d.viz as viz
 
 er, w = 4.3, 0.15e-3
 st = LayerStack([Layer(0.2e-3, er, name='core'), Layer(0.1e-3, er, name='prepreg'),
