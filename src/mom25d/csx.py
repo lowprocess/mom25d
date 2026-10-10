@@ -164,6 +164,7 @@ class CSXModel(PlanarModel):
 
         # ---- ground, interfaces and the layer stack -------------------------------------------------------
         outline = max(slabs, key=lambda s: s['area'])['area']
+        self.outline_area = outline * u * u                     # m^2: the board's area (its largest dielectric)
         zs = sorted({round(z / ztol) * ztol for _, z, _ in sheets})
         per_z = {z: unary_union([g for _, zz, g in sheets if abs(zz - z) <= ztol]) for z in zs}
         names = self._layer_names(sheets, zs, ztol)
