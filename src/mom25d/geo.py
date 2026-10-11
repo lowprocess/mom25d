@@ -11,7 +11,7 @@ mom25d.geo - geometry helpers for the multilayer solver
 """
 import numpy as np
 import shapely
-from shapely.geometry import (Polygon, MultiPolygon, LineString, MultiLineString, Point, box)
+from shapely.geometry import (Polygon, LineString, Point, box)
 from shapely.ops import unary_union
 import triangle as tr
 

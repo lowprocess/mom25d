@@ -273,11 +273,7 @@ class Simulation:
                                 for j in self.layers if j != k and abs(stack.z[j] - stack.z[k]) < refine]
                         fine = shapely.unary_union(near) if near else None
                     mesh_fn = mesh_polygons
-                    if mesher.startswith('distmesh'):                # distmesh | distmesh-rings
-                        from functools import partial
-                        from .mesh_distmesh import mesh_polygons_distmesh
-                        mesh_fn = partial(mesh_polygons_distmesh, rings=mesher.endswith('-rings'))
-                    elif mesher.startswith('gmsh'):                  # gmsh | gmsh-rings | gmsh-graded
+                    if mesher.startswith('gmsh'):                    # gmsh | gmsh-rings | gmsh-graded
                         from functools import partial
                         from .mesh_gmsh import mesh_polygons_gmsh
                         mesh_fn = partial(mesh_polygons_gmsh, mode=mesher.split('-')[1] if '-' in mesher else 'layers')
@@ -286,7 +282,7 @@ class Simulation:
                 for (i, v), vid in zip(vias_here, vids):
                     assert vid >= 0, f"via {v.name}: not on the M{k} mesh"
                     via_vertex[(i, k)] = vid + off
-                self.mesher_used[k] = 'tensor' if use_tensor else (mesher if mesher.startswith(('gmsh', 'distmesh')) else 'polygon')
+                self.mesher_used[k] = 'tensor' if use_tensor else (mesher if mesher.startswith('gmsh') else 'polygon')
                 nodes.append(nd); tris.append(tr + off); tl.append(np.full(len(tr), k)); off += len(nd)
             self.rwg = RWG(np.vstack(nodes), np.vstack(tris))
             self.tri_layer = np.concatenate(tl)
@@ -488,15 +484,13 @@ class Simulation:
     def _via_blocks(self, f, QF):
         """Via rows/columns: B (Ne x Nv) strip-via coupling, C (Nv x Nv) via-via (incl. elements in vias)."""
         w = 2 * np.pi * f
-        r, Ne = self.rwg, 0
-        Z = np.zeros((self.Ne + self.Nv, self.Ne + self.Nv), complex) if False else None
+        r = self.rwg
         B = np.zeros((self.Ne, self.Nv), complex)
         C = np.zeros((self.Nv, self.Nv), complex)
         spans = [(kb, kt) for _, kb, kt in self.chains]
         vk = ViaKernels(f, self.st, spans, self.layers, self.rho_max)
         self.via_kernels = vk
         # fan-distributed end charges (G_q between triangles, same machinery as strips)
-        DF = r.D[self.F] if len(self.F) else None
         if len(self.F):
             T = QF @ self.dF                                   # (Nt, Nv) potential of fan charges
             B += (r.D.T @ T) / (1j * w)

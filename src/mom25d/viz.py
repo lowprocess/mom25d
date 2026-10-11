@@ -124,10 +124,6 @@ def _pinfo(sim, p):
     return dict(kind='gap', layers=lay, c=p.c, d=p.d, w=p.w, lp=p.lp)
 
 
-def _port_centre(p, sim=None):
-    return _pinfo(sim, p)['c']
-
-
 def _seg(lp, s):
     a, b = lp.line(s)
     return np.array([a[0], b[0]]) * 1e3, np.array([a[1], b[1]]) * 1e3
@@ -271,7 +267,7 @@ def info_lines(sim, res=None):
         L.append(f"Sommerfeld  {gt.npts} pts, K={gt.K:.2g} 1/m, ρmax={sim.rho_max * 1e3:.1f} mm")
     if res is not None:
         L += ['', f"sweep       {len(res.f)} pts, {res.f[0] / 1e9:g}–{res.f[-1] / 1e9:g} GHz"]
-        L.append(f"port Zref   " + ", ".join(f"{p.zc:.1f}" for p in sim.ports) + " Ω")
+        L.append("port Zref   " + ", ".join(f"{p.zc:.1f}" for p in sim.ports) + " Ω")
         L.append(f"max |S−Sᵀ|          {res.recip.max():.1e}")
         L.append(f"max singular value  {res.passiv.max():.4f}  (≤1 passive)")
         L.append(f"max wave-fit resid. {res.resid.max():.1e}")

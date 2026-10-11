@@ -22,7 +22,6 @@ Away from the edges the size is dmax (dmax_fine inside `fine`), with gmsh's own 
 transition; corners and narrow necks get fans instead of the offset rings' slivers.
 """
 import numpy as np
-import shapely
 from shapely.geometry import Polygon, LineString, Point
 
 SCALE = 1e3                 # gmsh works in mm here (its tolerances are absolute)

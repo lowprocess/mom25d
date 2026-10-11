@@ -112,7 +112,7 @@ def test_fast_operators_match_dense():
 
 def test_core_matches_numpy_and_solvers_agree():
     """Compiled core (if built) vs NumPy fallback, and direct/mixed/BLR agreement."""
-    core = pytest.importorskip('mom25d._core')
+    pytest.importorskip('mom25d._core')
     from shapely.geometry import box, Point
     st = LayerStack([Layer(0.2e-3, 4.3, 0.02), Layer(0.2e-3, 4.3, 0.02)])
     w, L = 0.35e-3, 8e-3

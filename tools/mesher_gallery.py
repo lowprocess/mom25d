@@ -20,9 +20,7 @@ from mom25d.board import BoardModel                                # noqa: E402
 CASES = [('triangle', 0.1, 10, 'reference: Triangle 0.1 mm, ncross 10'),
          ('triangle', 0.3, 6, 'Triangle (default)'),
          ('gmsh-rings', 0.3, 6, 'gmsh, offset rings'),
-         ('gmsh-graded', 0.3, 6, 'gmsh, isotropic graded'),
-         ('distmesh', 0.3, 6, 'DistMesh, isotropic'),
-         ('distmesh-rings', 0.3, 6, 'DistMesh in offset rings')]
+         ('gmsh-graded', 0.3, 6, 'gmsh, isotropic graded')]
 
 
 def compute(board, f0, band, out):

@@ -32,7 +32,7 @@ class PlanarModel:
             L.append(f"  D{j + 1} {l.name:<14s} h={l.h * 1e3:.3f} mm er={l.er:.2f} tand={l.tand:.4f}"
                      + (f"   -> metal {cu[0]} on interface {j + 1}" if cu else ''))
         L.append(f"  ground: {self.ground} (z=0)" + (f", PEC cover: {self.cover}" if self.cover else ''))
-        L.append(f"metal interfaces: " + ", ".join(f"{n}->M{k}" for n, k in self.iface.items() if k in self.shapes))
+        L.append("metal interfaces: " + ", ".join(f"{n}->M{k}" for n, k in self.iface.items() if k in self.shapes))
         L.append(f"vias: {len(self.vias)}   ports: " + ", ".join(
             sp['name'] + (' (differential)' if 'legs' in sp else '') for sp in self.port_specs))
         return "\n".join(L + self.notes)
@@ -218,7 +218,7 @@ class PlanarModel:
                 log(f"  {p.name}: line on M{p.layer}, w={p.w * 1e3:.3f} mm, reference metal "
                     + (", ".join([f"M{k} ({W * 1e3:.1f} mm)" for k, W in planes.items()]
                                  + [f"coplanar GND, gap {gp * 1e3:.3f} mm" for gp in gaps]) or "ground only")
-                    + f": Zc = " + ", ".join(f"{v:.2f}" for v in z.real) + " ohm")
+                    + ": Zc = " + ", ".join(f"{v:.2f}" for v in z.real) + " ohm")
             zz = cache[key]
             p.zc_fn = (lambda f, fs=fs, zz=zz: np.interp(f, fs, zz))
             p.zc = float(zz[len(zz) // 2])
