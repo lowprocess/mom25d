@@ -1,24 +1,18 @@
 """
 Stage-3 checks (fast): vias, off-plane integrals, mesher robustness, lumped elements, AAA,
-KiCad import, fast operator vs dense.
+fast operator vs dense.
 """
-import os
-import sys
-import subprocess
-
 import numpy as np
 import pytest
 from scipy.integrate import quad
 
-ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'examples', 'mom25d')
-
-from mom25d.base import C0, MU0, EPS0                                          # noqa: E402
-from mom25d.multilayer import Layer, LayerStack, line_char_ml                     # noqa: E402
-from mom25d.via import ViaKernels                                         # noqa: E402
-from mom25d.sing import offplane_pairs                                    # noqa: E402
-from mom25d.geo import mesh_polygons, LinePort                            # noqa: E402
-from mom25d.sim import Simulation, SeriesLumped, Via, ViaPort, rlc        # noqa: E402
-from mom25d.afs import aaa                                                # noqa: E402
+from mom25d.base import C0, MU0, EPS0
+from mom25d.multilayer import Layer, LayerStack, line_char_ml
+from mom25d.via import ViaKernels
+from mom25d.sing import offplane_pairs
+from mom25d.geo import mesh_polygons, LinePort
+from mom25d.sim import Simulation, SeriesLumped, Via, ViaPort
+from mom25d.afs import aaa
 
 
 def test_via_kernels_exact_in_air():
@@ -98,29 +92,6 @@ def test_aaa_interpolates_resonances():
     assert np.max(np.abs(r(fg / 1e9)[:, 0] - np.array([F(f)[0] for f in fg]))) < 1e-6
 
 
-@pytest.fixture(scope='module')
-def demo_board(tmp_path_factory):
-    d = tmp_path_factory.mktemp('board')
-    base = str(d / 'demo')
-    subprocess.check_call([sys.executable, os.path.join(ROOT, 'make_demo_board.py'), base])
-    return base
-
-
-def test_kicad_import(demo_board):
-    from mom25d.kicad import KiCadBoard
-    b = KiCadBoard(demo_board + '.kicad_pcb')
-    m = b.build(nets=['RF', 'GND'], ground='B.Cu', pos_file=demo_board + '-top.pos', include_mask=False)
-    assert m.iface == {'In2.Cu': 1, 'In1.Cu': 2, 'F.Cu': 3}
-    assert [l.h for l in m.stack.layers] == pytest.approx([0.2e-3] * 3)
-    assert sorted(m.port_fps) == [1, 2]
-    ps = m.ports(dmax=0.3e-3)
-    assert [p.layer for p in ps] == [3, 1]
-    assert ps[0].w == pytest.approx(0.35e-3, rel=1e-6) and ps[1].w == pytest.approx(0.15e-3, rel=1e-6)
-    assert len(m.vias) == 23
-    signal = [v for v in m.vias if v.name.startswith('RF')][0]
-    assert (signal.k_bot, signal.k_top) == (1, 3)
-
-
 def test_fast_operators_match_dense():
     """Direct (centroid far field + exact near correction) and ACA/GMRES against the dense reference
     on a two-port line between via ports."""
@@ -195,16 +166,3 @@ def test_differential_through_line():
     assert abs(S[3, 0]) < 1e-3 and abs(S[0, 1]) < 1e-3                    # no mode conversion (symmetric)
     assert np.abs(S - S.T).max() < 1e-8
     assert sim.last['resid'].max() < 1e-2
-
-
-def test_kicad_differential_ports(tmp_path):
-    base = str(tmp_path / 'diff')
-    subprocess.check_call([sys.executable, os.path.join(ROOT, 'make_demo_board.py'), base, 'diff'])
-    from mom25d.kicad import KiCadBoard
-    from mom25d.sim import DiffPort
-    m = KiCadBoard(base + '.kicad_pcb').build(nets=['D_P', 'D_N'], ground='B.Cu', pos_file=base + '-top.pos',
-                                              include_mask=False)
-    ps = m.ports(dmax=0.3e-3)
-    assert [type(p) for p in ps] == [DiffPort, DiffPort]
-    assert ps[0].pos.w == pytest.approx(0.25e-3, rel=1e-6)
-    assert abs((ps[0].pos.c - ps[0].neg.c) @ ps[0].pos.t) == pytest.approx(0.45e-3, rel=1e-3)

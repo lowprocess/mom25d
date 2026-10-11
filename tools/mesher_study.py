@@ -1,8 +1,8 @@
 """
 Mesher study: accuracy per unknown of the polygon meshers (triangle, gmsh boundary layers, gmsh graded) on
-a CSX geometry, against a fine reference mesh.
+a board (a kicad2ems <name>_board.json), against a fine reference mesh.
 
-    python benchmarks/mesher_study.py board.xml [--freqs 2.9,3.1,...] [--out study.json]
+    python tools/mom25d/mesher_study.py out/board_board.json [--freqs 2.9,3.1,...] [--out study.json]
 
 For every (mesher, dmax, ncross) it reports unknowns, mesh / fill+solve time and the error of S against
 the reference: max |dS| (complex) over the frequencies and the error of |S21| in dB where the reference's
@@ -12,12 +12,12 @@ import argparse, json, os, sys, time
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from mom25d.csx import CSXModel                                    # noqa: E402
+from mom25d.board import BoardModel                                # noqa: E402
 from mom25d.run import renorm                                      # noqa: E402
 
 
-def run(xml, mesher, dmax, ncross, freqs):
-    m = CSXModel(xml, port='via', log=lambda *a: None)
+def run(board, mesher, dmax, ncross, freqs):
+    m = BoardModel(json.load(open(board)), port='via', log=lambda *a: None)
     t0 = time.time()
     sim = m.simulation(dmax=dmax, fmin=freqs[0], fmax=freqs[-1], solver='direct', verbose=False, mesher=mesher,
                        ncross=ncross, characterize=False)
@@ -32,7 +32,7 @@ def run(xml, mesher, dmax, ncross, freqs):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('xml')
+    ap.add_argument('board')
     ap.add_argument('--freqs', default='2.0,2.9,3.1,3.2,3.25,3.3,3.4,3.6,5.0')
     ap.add_argument('--ref', default='triangle:0.08:10', help='reference mesher:dmax_mm:ncross')
     ap.add_argument('--cases', default='triangle,gmsh;0.4,0.3,0.2,0.15;6|gmsh-graded;0.6,0.4;4,6')
@@ -50,7 +50,7 @@ def main():
         if (mesher, round(d, 4), n) in done:
             continue
         print(f"{mesher:12s} dmax {d:.3f} mm ncross {n} ...", flush=True)
-        results.append(run(a.xml, mesher, d * 1e-3, n, freqs))
+        results.append(run(a.board, mesher, d * 1e-3, n, freqs))
         json.dump(results, open(a.out, 'w'), indent=0)
     ref = next(r for r in results if (r['mesher'], round(r['dmax_mm'], 4), r['ncross']) == (rm, round(float(rd), 4), int(rn)))
     S0 = np.array([[complex(*v) for v in row] for row in ref['S']])

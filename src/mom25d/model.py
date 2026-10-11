@@ -1,14 +1,14 @@
 """
-mom25d.model - a planar model ready to solve: the stack, metal per interface, vias and port definitions,
-whatever it was read from (KiCad, Gerber, an AppCSXCAD / openEMS XML). The subclasses fill in
+mom25d.model - a planar model ready to solve: the stack, metal per interface, vias, lumped elements and port
+definitions. A subclass fills in (board.BoardModel: from a kicad2ems board)
 
     stack       multilayer.LayerStack (ground at z = 0, interfaces 1..N)
-    iface       {layer name: interface index}
+    iface       {copper layer name: interface index}
     shapes      {interface: [shapely geometry, metres, y up]}
-    vias        [sim.Via]
-    port_fps    {port number: dict(x, y (mm, KiCad orientation: y down), rot (deg, into the circuit),
-                 props {'mom.port', 'mom.z0', 'mom.layer', 'mom.ref', ...}, side 'F' | 'B', ref)} or a
-                 DiffLegs pair; lumped: [sim.SeriesLumped]
+    vias        [sim.Via];  lumped: [sim.SeriesLumped]
+    port_specs  [dict(name, c (m), d (unit vector into the circuit), k (interface), w (m), z0, kind 'auto' |
+                 'wave' | 'via' | 'gap', kref (reference interface of a lumped port), radius (m))] or, for a
+                 differential pair, dict(name, legs={'+': spec, '-': spec}); port_z0 {name: ohms}
     ground, cover, notes
 
 and the methods here turn the port definitions into solver ports (wave ports where a straight feed
@@ -22,12 +22,7 @@ from shapely.ops import unary_union
 MM = 1e-3
 
 
-class DiffLegs(dict):
-    """{'+': footprint, '-': footprint} of a differential port (footprints are dicts themselves)."""
-
-
 class PlanarModel:
-    board = None
     lumped = ()
 
     def describe(self):
@@ -39,11 +34,10 @@ class PlanarModel:
         L.append(f"  ground: {self.ground} (z=0)" + (f", PEC cover: {self.cover}" if self.cover else ''))
         L.append(f"metal interfaces: " + ", ".join(f"{n}->M{k}" for n, k in self.iface.items() if k in self.shapes))
         L.append(f"vias: {len(self.vias)}   ports: " + ", ".join(
-            f"P{n}=" + (f"{fp['+']['ref']}/{fp['-']['ref']} (diff)" if isinstance(fp, DiffLegs) else fp['ref'])
-            for n, fp in self.port_fps.items()))
+            sp['name'] + (' (differential)' if 'legs' in sp else '') for sp in self.port_specs))
         return "\n".join(L + self.notes)
 
-    # ---- ports from footprints -----------------------------------------------------------
+    # ---- ports ----------------------------------------------------------------------------------------
     def _copper_at(self, k):
         return unary_union(self.shapes[k]) if k in self.shapes else None
 
@@ -70,29 +64,14 @@ class PlanarModel:
             s += step
         return w0, s
 
-    def _port_geom(self, name, fp):
-        c = np.array([fp['x'], -fp['y']]) * MM
-        a = np.radians(fp['rot'])
-        d = np.array([np.cos(a), np.sin(a)])
-        props = fp['props']
-        lay = props.get('mom.layer') or ('B.Cu' if fp['side'] == 'B' else 'F.Cu')
-        if lay not in self.iface:
-            raise ValueError(f"{name}: port layer {lay} is not a metal interface of the model")
-        k = self.iface[lay]
+    def _port_geom(self, sp):
+        """(centre, direction, interface, copper there) of a port definition, checked to be on that copper."""
+        c, k = np.asarray(sp['c'], float), sp['k']
         g = self._copper_at(k)
         if g is None or not g.buffer(1e-6).contains(Point(*c)):
-            here = sorted({str(n) for l, n, gg in getattr(self.board, 'items', ())
-                           if l == lay and gg.buffer(1e-6).contains(Point(fp['x'], fp['y']))})
-            side = 'B.Cu' if fp['side'] == 'B' else 'F.Cu'
-            on_side = props.get('mom.layer') and lay != side and any(
-                l == side and gg.buffer(1e-6).contains(Point(fp['x'], fp['y'])) for l, n, gg in getattr(self.board, 'items', ()))
-            hint = (f"; the footprint field mom.layer={lay} points away from the {side} copper under it - "
-                    f"delete the field or set it to {side}" if on_side else
-                    f"; copper of net(s) {here} is there - add it to nets" if here else
-                    "; no copper of any net there - check the footprint position and mom.layer")
-            raise ValueError(f"{name} ({fp['ref']}) at ({fp['x']:.3f}, {fp['y']:.3f}) mm is not on {lay} copper "
-                             f"of the selected nets/region{hint}")
-        return c, d, k, g, props
+            raise ValueError(f"{sp['name']} at ({c[0] / MM:.3f}, {-c[1] / MM:.3f}) mm (KiCad) is not on the copper of "
+                             f"interface M{k}")
+        return c, np.asarray(sp['d'], float), k, g
 
     def _wave_window(self, w, L, step):
         """(gap offset, first and last cut, cut spacing) for a straight feed of width w, length L."""
@@ -109,32 +88,27 @@ class PlanarModel:
         from .sim import ViaPort, GapPort, Via, DiffPort
         step = step or dmax
         out = []
-        for n, fp in self.port_fps.items():
-            name = (getattr(fp, 'name', None) if isinstance(fp, DiffLegs) else fp.get('name')) or f"P{n}"
-            if isinstance(fp, DiffLegs):                                  # differential pair
+        for sp in self.port_specs:
+            name = sp['name']
+            if 'legs' in sp:                                              # differential pair
                 legs = {}
                 for sgn in ('+', '-'):
-                    c, d, k, g, props = self._port_geom(name + sgn, fp[sgn])
+                    c, d, k, g = self._port_geom(sp['legs'][sgn])
                     w, L = self._feed(g, c, d, step)
-                    legs[sgn] = (c, d, k, w, L, props)
-                (cp, dp_, kp, wp, Lp, pp), (cn, dn, kn, wn, Ln, pn) = legs['+'], legs['-']
+                    legs[sgn] = (c, d, k, w, L)
+                (cp, dp_, kp, wp, Lp), (cn, dn, kn, wn, Ln) = legs['+'], legs['-']
                 if kp != kn or not np.allclose(dp_, dn, atol=1e-6):
-                    raise ValueError(f"{name}: + and - footprints must be on the same layer with the same rotation")
+                    raise ValueError(f"{name}: + and - legs must be on the same layer with the same direction")
                 win, need = self._wave_window(max(wp, wn), min(Lp, Ln), step)
                 if win is None:
                     raise ValueError(f"{name}: straight coupled feed too short for a differential wave port "
                                      f"({min(Lp, Ln) * 1e3:.2f} mm, need {need * 1e3:.2f} mm)")
                 g0, s0, s1, pstep = win
-                ref_shift = float(pp.get('mom.ref', 0)) * MM
-                mk = lambda c, w: LinePort(kp, c + dp_ * g0, dp_, w, ref_shift - g0, s0=s0 - g0, s1=s1 - g0,
-                                           step=pstep)
-                out.append(DiffPort(mk(cp, wp), mk(cn, wn), float(pp.get('mom.zdiff', 100)),
-                                    float(pp.get('mom.zcomm', 25)), name=name))
+                mk = lambda c, w: LinePort(kp, c + dp_ * g0, dp_, w, -g0, s0=s0 - g0, s1=s1 - g0, step=pstep)
+                out.append(DiffPort(mk(cp, wp), mk(cn, wn), 100.0, 25.0, name=name))
                 continue
-            c, d, k, g, props = self._port_geom(name, fp)
-            z0 = float(props.get('mom.z0', 50))
-            kind = props.get('mom.port', 'auto')
-            ref_shift = float(props.get('mom.ref', 0)) * MM
+            c, d, k, g = self._port_geom(sp)
+            kind, z0 = sp.get('kind', 'auto'), sp['z0']
             if kind in ('auto', 'wave'):
                 w, L = self._feed(g, c, d, step)
                 win, need = self._wave_window(w, L, step)
@@ -147,23 +121,20 @@ class PlanarModel:
                         win = None
                 if win is not None:
                     g0, s0, s1, pstep = win
-                    out.append(LinePort(k, c + d * g0, d, w, ref_shift - g0, s0=s0 - g0, s1=s1 - g0, step=pstep,
-                                        zc=z0, name=name))
+                    out.append(LinePort(k, c + d * g0, d, w, -g0, s0=s0 - g0, s1=s1 - g0, step=pstep, zc=z0, name=name))
                     continue
                 if kind == 'wave':
                     raise ValueError(f"{name}: straight feed too short for a wave port ({L * 1e3:.2f} mm, need {need * 1e3:.2f} mm)")
-            if kind in ('auto', 'via'):
-                if kind == 'auto':
-                    self.notes.append(f"{name}: no straight feed of {need * 1e3:.1f} mm for a wave port"
-                                      + (f" down to {fmin / 1e9:g} GHz" if fmin else '')
-                                      + f" (found {L * 1e3:.2f} mm) - lumped port")
-                kref = int(props.get('mom.kref', 0))                     # reference: ground or a plane below
-                v = Via(c[0], c[1], kref, k, radius=float(props.get('mom.radius', 0.1)) * MM, name=f"{name}_via")
-                out.append(ViaPort(v, z0=z0, name=name)); continue
-            if kind == 'gap':
-                w = float(props.get('mom.width', 0.3)) * MM
-                out.append(GapPort(k, c, d, w, z0=z0, name=name)); continue
-            raise ValueError(f"{name}: unknown port kind {kind}")
+                self.notes.append(f"{name}: no straight feed of {need * 1e3:.1f} mm for a wave port"
+                                  + (f" down to {fmin / 1e9:g} GHz" if fmin else '') + f" (found {L * 1e3:.2f} mm) - lumped port")
+                kind = 'via'
+            if kind == 'via':
+                v = Via(c[0], c[1], sp.get('kref', 0), k, radius=sp.get('radius', 0.1 * MM), name=f"{name}_via")
+                out.append(ViaPort(v, z0=z0, name=name))
+            elif kind == 'gap':
+                out.append(GapPort(k, c, d, sp.get('width', 0.3 * MM), z0=z0, name=name))
+            else:
+                raise ValueError(f"{name}: unknown port kind {kind}")
         return out
 
     def _planes_at(self, layer, pt, d, w):
@@ -215,10 +186,9 @@ class PlanarModel:
         """Reference impedance of each wave port's line cross-section (trace + metal on other layers
         covering the port), solved as a short centre-fed line at n frequencies and interpolated."""
         from .geo import LinePort
-        from .sim import line_char_xs
+        from .sim import line_char_xs, DiffPort, line_char_pair
         fs = np.linspace(max(fmin, fmax / 3), fmax, n)    # the fit is well conditioned here; Zc ~ flat
         cache = {}
-        from .sim import DiffPort, line_char_pair
         for p in ports:
             if isinstance(p, DiffPort):
                 a, b = p.pos, p.neg
@@ -237,19 +207,7 @@ class PlanarModel:
             if not isinstance(p, LinePort):
                 continue
             pt = Point(*(p.c + p.d * 0.5 * (p.s0 + p.s1)))
-            planes = {}
-            for k, gs in self.shapes.items():
-                if k == p.layer:
-                    continue
-                g = unary_union(gs)
-                if g.buffer(1e-9).contains(pt):
-                    # width of that metal across the line, capped (a plane looks infinite beyond ~30 h)
-                    t = np.array([-p.d[1], p.d[0]])
-                    seg = LineString([np.array(pt.coords[0]) - t * 0.05, np.array(pt.coords[0]) + t * 0.05]).intersection(g)
-                    dz = abs(self.stack.z[p.layer] - self.stack.z[k])
-                    W = min(getattr(seg, 'length', 0.0), max(16 * dz + 2 * p.w, 20 * p.w, 2e-3))
-                    if W > 2 * p.w:
-                        planes[k] = W
+            planes = self._planes_at(p.layer, pt, p.d, p.w)
             cop = self._coplanar_at(p.layer, pt, p.d, p.w)
             key = (p.layer, round(p.w * 1e7), tuple(sorted((k, round(W * 1e5)) for k, W in planes.items())),
                    tuple((round(a * 1e6), round(b * 1e6)) for a, b in cop))
@@ -268,13 +226,11 @@ class PlanarModel:
     def simulation(self, dmax=0.3e-3, step=None, fmin=1e9, fmax=10e9, characterize=True, wave_down_to=None, **kw):
         """The Simulation of this model. wave_down_to (Hz): 'auto' ports become wave ports only where the feed
         is long enough for the wave fit down to that frequency (else lumped); default: wherever the geometry
-        allows (the fit degrades below ~0.4 rad of sample span, with a warning). metal= (sim.Metal or None)
-        overrides the model's own conductor loss (a CSX file's conducting sheets; default lossless)."""
-        from .sim import Simulation, Metal
+        allows (the fit degrades below ~0.4 rad of sample span, with a warning). metal= (sim.Metal): conductor
+        loss (default lossless)."""
+        from .sim import Simulation
         ports = self.ports(step=step, dmax=dmax, fmin=wave_down_to)
         if characterize:
             self.characterize(ports, fmin, fmax)
         kw.setdefault('lumped', list(self.lumped))
-        if getattr(self, 'sigma', None):                    # the model's conductor loss (a CSX conducting sheet)
-            kw.setdefault('metal', Metal(self.sigma, getattr(self, 'sheet_t', None) or 35e-6))
         return Simulation(self.stack, self.shapes, ports, vias=self.vias, dmax=dmax, **kw)

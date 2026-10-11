@@ -41,24 +41,26 @@ def _zc(sim, f):
 
 
 def solve_band(sim, fmin, fmax, points=401, zref=50.0, linear=None, afs_tol=2e-3, max_solves=40, log=print,
-               keep_mid=False):
+               keep_mid=False, progress=None):
     """S-parameters of sim over fmin..fmax (Hz): returns (f, S (nf, n, n), info dict with solves, seconds,
-    zref and the solved frequencies). max_solves: cap of the adaptive sweep. keep_mid: one extra solve at mid-band keeping the currents (sim.last)."""
+    zref and the solved frequencies). max_solves: cap of the adaptive sweep. keep_mid: one extra solve at
+    mid-band keeping the currents (sim.last). progress(solves, at most, f): after each EM solve."""
     t0 = time.time()
     zr = out_refs(sim, zref)
+    done = []
+
+    def solve(fr):
+        log(f"  solving {fr / 1e9:.4f} GHz")
+        S = renorm(sim.sparams(fr), _zc(sim, fr), zr)
+        done.append(fr)
+        if progress:
+            progress(len(done), int(linear) if linear else max_solves, fr)
+        return S
     if linear:
-        f = np.linspace(fmin, fmax, int(linear))
-        S = []
-        for fi in f:
-            log(f"  solving {fi / 1e9:.4f} GHz")
-            S.append(renorm(sim.sparams(fi), _zc(sim, fi), zr))
-        S, fs = np.array(S), f
+        fs = f = np.linspace(fmin, fmax, int(linear))
+        S = np.array([solve(fi) for fi in f])
     else:
         from .afs import adaptive_sweep
-
-        def solve(fr):
-            log(f"  solving {fr / 1e9:.4f} GHz")
-            return renorm(sim.sparams(fr), _zc(sim, fr), zr)
         f, S, fs, _, _ = adaptive_sweep(solve, fmin, fmax, tol=afs_tol, ngrid=points, max_points=max_solves, log=log)
     if keep_mid:
         sim.sparams(fs[len(fs) // 2], keep=True)

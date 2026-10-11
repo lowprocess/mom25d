@@ -1,7 +1,0 @@
-### Footprint positions ###
-## Unit = mm, Angle = deg.
-# Ref Val Package PosX PosY Rot Side
-TP1 P1+ RF_Port 2.0000 -5.7750 0.0000 top
-TP2 P1- RF_Port 2.0000 -6.2250 0.0000 top
-TP3 P2+ RF_Port 22.0000 -3.7750 180.0000 top
-TP4 P2- RF_Port 22.0000 -4.2250 180.0000 top

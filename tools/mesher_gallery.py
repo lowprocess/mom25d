@@ -1,8 +1,9 @@
 """
-Mesher gallery: what the meshers physically produce on one CSX geometry, and what that does to the solution.
+Mesher gallery: what the meshers physically produce on one board (a kicad2ems <name>_board.json), and what
+that does to the solution.
 
-    python benchmarks/mesher_gallery.py board.xml [--f0 3.25] [--band 2.5,4.0] [--out gallery.npz]
-    python benchmarks/mesher_gallery.py board.xml --plot [--zoom x0,x1,y0,y1] [--cut x_mm] [--png docs/...]
+    python tools/mom25d/mesher_gallery.py out/board_board.json [--f0 3.25] [--band 2.5,4.0] [--out gallery.npz]
+    python tools/mom25d/mesher_gallery.py out/board_board.json --plot [--zoom x0,x1,y0,y1] [--cut x_mm] [--png docs/...]
 
 The first form meshes the board with every mesher (dmax 0.3 mm, ncross 6, the study's default point, plus the
 fine Triangle reference), solves the surface current at f0 (port 1 driven) and an adaptive S sweep over the
@@ -10,11 +11,11 @@ band, one case after the other (no overlap, so the timings are comparable), and 
 The second plots from the cache: the mesh and |J| in a zoom window, |J| along a horizontal cut across the traces (the edge singularity),
 triangle quality and S21 against the reference.
 """
-import argparse, os, sys, time
+import argparse, json, os, sys, time
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from mom25d.csx import CSXModel                                    # noqa: E402
+from mom25d.board import BoardModel                                # noqa: E402
 
 CASES = [('triangle', 0.1, 10, 'reference: Triangle 0.1 mm, ncross 10'),
          ('triangle', 0.3, 6, 'Triangle (default)'),
@@ -24,14 +25,14 @@ CASES = [('triangle', 0.1, 10, 'reference: Triangle 0.1 mm, ncross 10'),
          ('distmesh-rings', 0.3, 6, 'DistMesh in offset rings')]
 
 
-def compute(xml, f0, band, out):
+def compute(board, f0, band, out):
     from mom25d.run import solve_band
     data = dict(np.load(out, allow_pickle=True)) if os.path.exists(out) else {}
     for i, (mesher, d, n, label) in enumerate(CASES):
         if f'c{i}_nodes' in data:
             continue
         print(f"{label} ...", flush=True)
-        m = CSXModel(xml, port='via', log=lambda *a: None)
+        m = BoardModel(json.load(open(board)), port='via', log=lambda *a: None)
         t0 = time.time()
         sim = m.simulation(dmax=d * 1e-3, fmin=band[0], fmax=band[1], solver='direct', verbose=False,
                            mesher=mesher, ncross=n, characterize=False)
@@ -145,7 +146,7 @@ def plot(npz, zoom, cut, png, f0, close, band):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('xml')
+    ap.add_argument('board')
     ap.add_argument('--f0', type=float, default=3.25)
     ap.add_argument('--band', default='2.5,4.0')
     ap.add_argument('--out', default='mesher_gallery.npz')
@@ -162,7 +163,7 @@ def main():
         fb = [float(v) for v in (a.fplot or a.band).split(',')]
         plot(a.out, z, a.cut if a.cut is not None else 0.5 * (z[2] + z[3]), a.png, a.f0 * 1e9, c, fb)
     else:
-        compute(a.xml, a.f0 * 1e9, [float(v) * 1e9 for v in a.band.split(',')], a.out)
+        compute(a.board, a.f0 * 1e9, [float(v) * 1e9 for v in a.band.split(',')], a.out)
 
 
 if __name__ == '__main__':
