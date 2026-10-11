@@ -340,7 +340,7 @@ class Simulation:
         if precision == 'auto':
             # double whenever it fits comfortably: the complex64 LU preconditioner can stall (fine meshes, low
             # frequency, many via chains) and the refinement then costs more than a double LU (study in
-            # kicad2openems docs/mom.md); mixed only where it saves the memory that makes the direct solver fit
+            # kicad2ems docs/mom.md); mixed only where it saves the memory that makes the direct solver fit
             precision = 'double' if (not has_core or 18.0 * n * n + 0.9e9 <= 0.5 * available_memory()) else 'mixed'
         if precision == 'mixed' and not has_core:
             precision = 'double'

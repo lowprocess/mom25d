@@ -1,6 +1,6 @@
 """
 mom25d.api - one call for a program that hands mom25d a geometry file and wants S-parameters back, without
-reaching into the Simulation's internals (kicad2openems's MoM solver is the first user of this seam).
+reaching into the Simulation's internals (kicad2ems's MoM solver is the first user of this seam).
 
     from mom25d.api import solve_csx
     res = solve_csx('board.xml', np.linspace(1e9, 6e9, 401), dmax=0.3e-3)

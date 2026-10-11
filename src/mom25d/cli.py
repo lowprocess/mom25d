@@ -5,7 +5,7 @@ mom25d.cli - KiCad / Gerber board or AppCSXCAD / openEMS geometry (.xml) -> S-pa
          --fmin 0.5 --fmax 10 --out results/
   mom25d fab/board-job.gbrjob --pos board-top.pos --ground B.Cu --region 0,0,20,10
   mom25d board.kicad_pcb --config board.mom25d.toml      (same keys as the options)
-  mom25d board.xml --fmin 1 --fmax 6        (a CSX file, e.g. from kicad2openems: see mom25d.csx)
+  mom25d board.xml --fmin 1 --fmax 6        (a CSX file, e.g. from kicad2ems: see mom25d.csx)
 
 A --config file holds any of the options (dashes or underscores; board too); the command line wins over
 it, and its paths (board, pos, out) are relative to the file. Outputs in --out: <name>.s<N>p

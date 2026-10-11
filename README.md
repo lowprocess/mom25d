@@ -5,8 +5,8 @@ aimed at signal-integrity and RF structures on multilayer boards: traces, couple
 transitions, planes, CPWG. Feed it a KiCad board (or Gerbers) with port footprints, or an
 AppCSXCAD / openEMS geometry file (`.xml`), get Touchstone S-parameters and a diagnostic dashboard out.
 
-mom25d is its own project with no dependency on kicad2openems. [kicad2openems](https://github.com/lowprocess/kicad2openems)
-uses it as a git submodule: `kicad2openems board.toml --solvers mom` converts a KiCad board once and solves
+mom25d is its own project with no dependency on kicad2ems. [kicad2ems](https://github.com/lowprocess/kicad2openems)
+uses it as a git submodule: `kicad2ems board.toml --solvers mom` converts a KiCad board once and solves
 it with mom25d (and, if wanted, with openEMS and a transmission-line model to compare); it needs no openEMS.
 
 ![Coupler dashboard](img/coupler_dashboard.png)
@@ -69,7 +69,7 @@ the metal covering it) and the result is renormalised to `--z0`.
 ## AppCSXCAD / openEMS geometry (`.xml`)
 
 ```bash
-mom25d board.xml --fmin 1 --fmax 6 --port auto        # any CSX file, e.g. <name>.xml of a kicad2openems run
+mom25d board.xml --fmin 1 --fmax 6 --port auto        # any CSX file, e.g. <name>.xml of a kicad2ems run
 ```
 
 `mom25d.csx.CSXModel` turns CSXCAD's `ContinuousStructure` into a model: dielectric slabs (εr, κ → tan δ),
@@ -151,7 +151,7 @@ The package lives in `src/mom25d/` (`import mom25d.sim`, …); the command line 
 | `kicad.py`, `gerber.py` | Board import → `BoardModel` (a `PlanarModel`) |
 | `csx.py` | AppCSXCAD / openEMS geometry (`.xml`) → `CSXModel` (a `PlanarModel`) |
 | `run.py` | `solve_band`: adaptive / linear sweep, renormalisation to the output references |
-| `api.py` | `solve_csx(path, freq)`: a geometry file in, a `Result` out (S, port names and kinds, unknowns, notes) - the call for programs that use mom25d (kicad2openems) |
+| `api.py` | `solve_csx(path, freq)`: a geometry file in, a `Result` out (S, port names and kinds, unknowns, notes) - the call for programs that use mom25d (kicad2ems) |
 | `mesh_gmsh.py`, `mesh_distmesh.py` | alternative polygon meshers (gmsh, DistMesh), same contract as `geo.mesh_polygons` |
 | `viz.py` | Dashboard: stackup, 3D view, mesh/ports/vias, currents, S-params, numerical health, kernels, timing |
 | `cli.py` | Command-line runner |
