@@ -176,7 +176,9 @@ class Metal:
 class Simulation:
     def __init__(self, stack, shapes, ports=(), vias=(), lumped=(), dmax=0.3e-3, dmax_layer=None,
                  w_ref=None, ncross=6, grade=1.0, near_fac=5.0, mesher='auto', metal=None,
-                 solver='dense', aca_tol=1e-4, refine=1.0e-3, precision='auto', gpu='auto', verbose=True, title=''):
+                 solver='dense', aca_tol=1e-4, refine=1.0e-3, precision='auto', gpu='auto', verbose=True, title='',
+                 mesh_only=False):
+        # mesh_only: stop once the mesh and the unknowns (Ne, Nv) are known (a cost estimate; nothing to solve with)
         self.st, self.title, self.metal = stack, title, metal
         self.solver = solver
         self.gpu = gpu                      # 'auto' | 'cupy' | 'torch' | 'off' (mixed direct solver LU)
@@ -289,6 +291,8 @@ class Simulation:
             self.edge_layer = self.tri_layer[self.rwg.tp]
         r = self.rwg
         self.Ne, self.Nv = r.Ne, len(self.chains)
+        if mesh_only:
+            return
         self.tri_idx = {k: np.nonzero(self.tri_layer == k)[0] for k in self.layers}
         Nt = len(r.tris)
 
