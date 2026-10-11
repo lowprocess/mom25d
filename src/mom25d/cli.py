@@ -3,7 +3,6 @@ mom25d.cli - KiCad / Gerber board or AppCSXCAD / openEMS geometry (.xml) -> S-pa
 
   mom25d board.kicad_pcb --pos board-top.pos --nets RF,GND --ground B.Cu \\
          --fmin 0.5 --fmax 10 --out results/
-  mom25d fab/board-job.gbrjob --pos board-top.pos --ground B.Cu --region 0,0,20,10
   mom25d board.kicad_pcb --config board.mom25d.toml      (same keys as the options)
   mom25d board.xml --fmin 1 --fmax 6        (a CSX file, e.g. from kicad2ems: see mom25d.csx)
 
@@ -126,7 +125,7 @@ def main(argv=None):
 
 def parser():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1], formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('board', nargs='?', help='.kicad_pcb, .gbrjob (Gerber job file) or .xml (AppCSXCAD / openEMS)')
+    ap.add_argument('board', nargs='?', help='.kicad_pcb or .xml (AppCSXCAD / openEMS); Gerber: kicad2ems')
     ap.add_argument('--config', help='TOML file with any of the options below')
     ap.add_argument('--pos', help='pick-and-place file (.pos / .csv) listing the port components')
     ap.add_argument('--nets', help='comma-separated nets to include (KiCad only; default all)')
@@ -194,12 +193,6 @@ def _main(argv=None):
         model = CSXModel(a.board, ground=a.ground, cover=a.cover, port=a.port, f_loss=0.5 * (a.fmin + a.fmax) * 1e9)
         z0 = model.port_z0 if a.z0 == 50.0 else a.z0                 # the ports' own impedances unless given
         brd = None
-    elif a.board.endswith('.gbrjob'):
-        from .gerber import GerberBoard
-        if not a.pos:
-            ap.error("Gerber input needs --pos (the ports come from the pick-and-place file)")
-        brd = GerberBoard(a.board)
-        model = brd.build(a.pos, ground=a.ground or 'B.Cu', cover=a.cover, region=region, include_mask=not a.no_mask)
     else:
         from .kicad import KiCadBoard
         brd = KiCadBoard(a.board)
@@ -218,7 +211,7 @@ def _main(argv=None):
                            mesher=a.mesher, title=name)
     sim.layer_names = {k: n for n, k in model.iface.items()}
     zc = np.array([p.zc for p in sim.ports])
-    if a.board.endswith('.gbrjob') is False and any(getattr(p, 'mode', None) for p in sim.ports):
+    if any(getattr(p, 'mode', None) for p in sim.ports):
         print("mixed-mode ports: " + ", ".join(p.name for p in sim.ports))
     if a.linear:
         f = np.linspace(a.fmin, a.fmax, a.linear) * 1e9

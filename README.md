@@ -53,9 +53,9 @@ reliable above ~1.4 GHz for this feed length (the solver warns below).*
 4. **Run** `mom25d board.kicad_pcb --pos board-top.pos --nets RF,GND --ground B.Cu
    --fmin 0.5 --fmax 10`, or put the options in a TOML file (`--config`). Outputs: `.sNp`,
    `_dashboard.png`, `_summary.json`.
-5. **Gerber fallback:** `mom25d fab/board-job.gbrjob --pos board-top.pos ...` — the stackup
+5. **Gerber:** `kicad2ems fab/board-job.gbrjob --pos board-top.pos ...` — the stackup
    comes from the KiCad job file; copper from RS-274X/X2; vias from Excellon (blind/buried spans
-   from the X2 attribute). Gerbers have no nets: crop with `--region`.
+   from the X2 attribute); nets from the X2 net attributes (TO.N), so `--nets` works as on KiCad.
 
 **Differential ports.** Give the two legs Fab texts **`P1+` / `P1-`** (or `P1P` / `P1N`), one footprint
 per trace. The pair becomes one mixed-mode port with differential (`P1d`, Z = 2·Z_odd) and common

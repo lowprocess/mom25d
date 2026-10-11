@@ -1,6 +1,6 @@
 """
 Stage-3 checks (fast): vias, off-plane integrals, mesher robustness, lumped elements, AAA,
-KiCad / Gerber import, fast operator vs dense.
+KiCad import, fast operator vs dense.
 """
 import os
 import sys
@@ -119,21 +119,6 @@ def test_kicad_import(demo_board):
     assert len(m.vias) == 23
     signal = [v for v in m.vias if v.name.startswith('RF')][0]
     assert (signal.k_bot, signal.k_top) == (1, 3)
-
-
-def test_gerber_roundtrip_matches_native(demo_board, tmp_path):
-    from shapely.ops import unary_union
-    from mom25d.kicad import KiCadBoard
-    from mom25d.gerber import GerberBoard
-    subprocess.check_call([sys.executable, os.path.join(ROOT, 'export_demo_gerbers.py'),
-                           demo_board + '.kicad_pcb', str(tmp_path)])
-    k = KiCadBoard(demo_board + '.kicad_pcb')
-    g = GerberBoard(str(tmp_path / 'demo-job.gbrjob'))
-    for lay in ('In1.Cu', 'In2.Cu', 'B.Cu'):
-        a = unary_union([x for l, n, x in k.items if l == lay])
-        b = unary_union([x for l, n, x in g.items if l == lay])
-        assert a.symmetric_difference(b).area < 0.05                    # mm^2
-    assert len(g.vias) == len(k.vias)
 
 
 def test_fast_operators_match_dense():
