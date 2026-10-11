@@ -1,0 +1,56 @@
+{
+ "board": "examples/demo_diff.kicad_pcb",
+ "valid_from_GHz": 2.078,
+ "ports": [
+  "P1d",
+  "P1c",
+  "P2d",
+  "P2c"
+ ],
+ "port_kind": [
+  "ModePort",
+  "ModePort",
+  "ModePort",
+  "ModePort"
+ ],
+ "zc": [
+  112.397911377454,
+  36.62073563703387,
+  112.397911377454,
+  36.62073563703387
+ ],
+ "unknowns": 1442,
+ "solver": "dense",
+ "em_solves": 25,
+ "fmin": 2.0,
+ "fmax": 12.0,
+ "wall_time_s": 59.3,
+ "max_passivity": 1.0158616200476744,
+ "max_reciprocity_err": 0.05971943612562915,
+ "stack": [
+  "stack (from ground up):",
+  "  D1 dielectric 1   h=0.200 mm er=4.30 tand=0.0200   -> metal F.Cu on interface 1",
+  "  ground: B.Cu (z=0)",
+  "metal interfaces: F.Cu->M1",
+  "vias: 0   ports: P1=TP1/TP2 (diff), P2=TP3/TP4 (diff)",
+  "pick-and-place: port components ['TP1', 'TP2', 'TP3', 'TP4']"
+ ],
+ "timings": {
+  "mesh": 0.04,
+  "singular integrals (static, once)": 4.07,
+  "Green tables": 1.81,
+  "smooth-kernel fill": 20.02,
+  "assemble": 12.0,
+  "LU solve": 3.36
+ },
+ "notes": [
+  "mesh: 1082 triangles, 1442 edge + 0 via unknowns  (M1: 1082 tri (polygon))",
+  "solver: dense (N = 1442)",
+  "WARNING 2.00 GHz port P1d: feed samples span only 0.35 rad - wave separation unreliable (lengthen the straight feed or use a via/gap port)",
+  "WARNING 2.00 GHz port P1c: feed samples span only 0.35 rad - wave separation unreliable (lengthen the straight feed or use a via/gap port)",
+  "WARNING 2.02 GHz port P1d: feed samples span only 0.35 rad - wave separation unreliable (lengthen the straight feed or use a via/gap port)",
+  "WARNING 2.02 GHz port P1c: feed samples span only 0.35 rad - wave separation unreliable (lengthen the straight feed or use a via/gap port)",
+  "WARNING 2.05 GHz port P1d: feed samples span only 0.36 rad - wave separation unreliable (lengthen the straight feed or use a via/gap port)",
+  "WARNING 2.05 GHz port P1c: feed samples span only 0.36 rad - wave separation unreliable (lengthen the straight feed or use a via/gap port)"
+ ]
+}

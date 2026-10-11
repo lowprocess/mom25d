@@ -1,0 +1,21 @@
+# mom25d run configuration for examples/demo_transition.kicad_pcb
+pos      = "examples/demo_transition-top.pos"
+nets     = ["RF", "GND"]
+ground   = "B.Cu"
+no_mask  = true
+fmin     = 1.0          # GHz
+fmax     = 8.0
+points   = 401
+dmax     = 0.4          # mm
+ncross   = 3
+near_fac = 3.0
+solver   = "direct"
+out      = "examples/out"
+
+[dmax_layer]            # coarse cells on the plane, refined automatically under nearby traces
+"In1.Cu" = 0.8
+
+[wref]                  # edge-grading reference widths
+"F.Cu"   = 0.35
+"In2.Cu" = 0.15
+"In1.Cu" = 1.0
