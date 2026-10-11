@@ -92,6 +92,24 @@ def test_aaa_interpolates_resonances():
     assert np.max(np.abs(r(fg / 1e9)[:, 0] - np.array([F(f)[0] for f in fg]))) < 1e-6
 
 
+def test_afs_does_not_stop_on_a_model_that_ignores_new_samples(monkeypatch):
+    """Regression (d5787ca): a fit that a new sample does not move changes by nothing between iterations while
+    it is still wrong (seen on a 10 dB coupler: stopped at 9 solves, -14 dB coupling instead of -11 dB). The
+    sweep must also see the model predict each new sample before it stops."""
+    import mom25d.afs as afs
+    real, first = afs.aaa, []
+    def stale(z, F, **kw):                                          # fitted to the first samples, ever after
+        first.append(first[0] if first else (z, F))
+        return real(*first[-1], **kw)
+    monkeypatch.setattr(afs, 'aaa', stale)
+    truth = lambda f: np.array([[0.3 + 0.2 * np.sin(f / 4e8)]], complex)
+    seen = []
+    _, _, fs, _, hist = afs.adaptive_sweep(lambda f: seen.append(f) or truth(f), 1e9, 6e9, n0=5, tol=2e-3,
+                                           max_points=12, ngrid=401, log=lambda *a: None)
+    assert len(fs) == 12                                            # ran to the cap: never converged
+    assert all(change < 2e-3 for _, change in hist[2:])             # although the model stopped changing
+
+
 def test_fast_operators_match_dense():
     """Direct (centroid far field + exact near correction) and ACA/GMRES against the dense reference
     on a two-port line between via ports."""
