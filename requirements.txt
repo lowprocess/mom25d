@@ -1,9 +1,0 @@
-numpy>=1.24
-scipy>=1.10
-matplotlib>=3.7
-shapely>=2.0
-triangle>=20230923
-pytest>=7
-tomli>=2; python_version < "3.11"
-# optional compiled core (python core/build.py): needs g++ with OpenMP
-pybind11>=2.10

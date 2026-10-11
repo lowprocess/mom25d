@@ -1,11 +1,9 @@
 """AppCSXCAD / openEMS geometry files as mom25d models: stack and ground, metal, vias, vertical metal, lumped
 parts and ports (with and without the <mom25d> hints), a solve; the gmsh mesher's contract."""
-import os, sys
 import xml.etree.ElementTree as ET
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from mom25d.csx import CSXModel                                   # noqa: E402
 
 W = 0.38                                                           # ~50 ohm on 0.2 mm FR-4

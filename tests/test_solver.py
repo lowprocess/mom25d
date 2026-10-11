@@ -1,6 +1,6 @@
 """
 Stage-3 checks (fast): vias, off-plane integrals, mesher robustness, lumped elements, AAA,
-KiCad / Gerber import, fast operator vs dense.     python -m pytest tests -q
+KiCad / Gerber import, fast operator vs dense.
 """
 import os
 import sys
@@ -10,9 +10,7 @@ import numpy as np
 import pytest
 from scipy.integrate import quad
 
-HERE = os.path.dirname(__file__)
-ROOT = os.path.join(HERE, '..')
-sys.path.insert(0, os.path.join(ROOT, 'src'))
+ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'examples', 'mom25d')
 
 from mom25d.base import C0, MU0, EPS0                                          # noqa: E402
 from mom25d.multilayer import Layer, LayerStack, line_char_ml                     # noqa: E402
@@ -104,7 +102,7 @@ def test_aaa_interpolates_resonances():
 def demo_board(tmp_path_factory):
     d = tmp_path_factory.mktemp('board')
     base = str(d / 'demo')
-    subprocess.check_call([sys.executable, os.path.join(ROOT, 'examples', 'make_demo_board.py'), base])
+    subprocess.check_call([sys.executable, os.path.join(ROOT, 'make_demo_board.py'), base])
     return base
 
 
@@ -127,7 +125,7 @@ def test_gerber_roundtrip_matches_native(demo_board, tmp_path):
     from shapely.ops import unary_union
     from mom25d.kicad import KiCadBoard
     from mom25d.gerber import GerberBoard
-    subprocess.check_call([sys.executable, os.path.join(ROOT, 'examples', 'export_demo_gerbers.py'),
+    subprocess.check_call([sys.executable, os.path.join(ROOT, 'export_demo_gerbers.py'),
                            demo_board + '.kicad_pcb', str(tmp_path)])
     k = KiCadBoard(demo_board + '.kicad_pcb')
     g = GerberBoard(str(tmp_path / 'demo-job.gbrjob'))
@@ -216,7 +214,7 @@ def test_differential_through_line():
 
 def test_kicad_differential_ports(tmp_path):
     base = str(tmp_path / 'diff')
-    subprocess.check_call([sys.executable, os.path.join(ROOT, 'examples', 'make_demo_board.py'), base, 'diff'])
+    subprocess.check_call([sys.executable, os.path.join(ROOT, 'make_demo_board.py'), base, 'diff'])
     from mom25d.kicad import KiCadBoard
     from mom25d.sim import DiffPort
     m = KiCadBoard(base + '.kicad_pcb').build(nets=['D_P', 'D_N'], ground='B.Cu', pos_file=base + '-top.pos',

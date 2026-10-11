@@ -3,7 +3,7 @@ import json, os, sys
 from shapely import affinity
 from shapely.geometry import box
 from shapely.ops import unary_union
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from mom25d.kicad import KiCadBoard, _items, _xy, _val, _layers
 from mom25d.gerber import write_gerber
 

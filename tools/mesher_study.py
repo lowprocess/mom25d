@@ -11,7 +11,7 @@ the reference: max |dS| (complex) over the frequencies and the error of |S21| in
 import argparse, json, os, sys, time
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from mom25d.csx import CSXModel                                    # noqa: E402
 from mom25d.run import renorm                                      # noqa: E402
 

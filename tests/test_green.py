@@ -1,14 +1,9 @@
 """
-Fast validation suite (about a minute):  python -m pytest tests -q
+mom25d's fast validation suite (about a minute).
 Each test checks the solver against a closed-form result or a conservation law.
 """
-import os
-import sys
-
 import numpy as np
 import pytest
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from mom25d.base import GreenTable, Stackup, line_characterization, C0, MU0, EPS0   # noqa: E402
 from mom25d.multilayer import (Layer, LayerStack, GreenTableML, line_char_ml,             # noqa: E402

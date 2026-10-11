@@ -1,7 +1,7 @@
 """mom25d.api.solve_csx: the one call a program (kicad2openems) makes - the same answer as the steps it wraps."""
 import numpy as np
 import pytest
-from test_csx import write_csx
+from test_mom25d_csx import write_csx
 
 
 def test_solve_csx(tmp_path):

@@ -9,7 +9,7 @@ import argparse, os, sys, time
 import numpy as np
 import scipy.linalg as sla
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import mom25d.gpu as mom25d_gpu
 ap = argparse.ArgumentParser()
 ap.add_argument('--backend', default='auto')

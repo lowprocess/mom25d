@@ -13,7 +13,7 @@ triangle quality and S21 against the reference.
 import argparse, os, sys, time
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from mom25d.csx import CSXModel                                    # noqa: E402
 
 CASES = [('triangle', 0.1, 10, 'reference: Triangle 0.1 mm, ncross 10'),

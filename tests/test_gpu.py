@@ -1,13 +1,11 @@
 """GPU LU path: every backend's code runs end to end against NumPy stand-ins for the exact CuPy /
 PyTorch calls it makes, and must reproduce the CPU mixed-precision solver. (Real hardware: run
 tools/gpu_selfcheck.py on the GPU machine.)"""
-import os, sys, types
+import sys, types
 import numpy as np
 import pytest
 import scipy.linalg as sla
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, 'src'))
 from mom25d.multilayer import Layer, LayerStack
 from mom25d.sim import Simulation, Via, ViaPort
 import mom25d.gpu as mom25d_gpu

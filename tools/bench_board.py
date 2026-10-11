@@ -1,7 +1,7 @@
 """Per-stage time and peak memory on the demo KiCad board (cropped), for optimisation work.
    python benchmarks/bench_board.py [solver] [region]"""
 import os, sys, time, resource, subprocess
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import numpy as np
 from mom25d.kicad import KiCadBoard
 
@@ -12,7 +12,7 @@ def rss():
 solver = sys.argv[1] if len(sys.argv) > 1 else 'direct'
 precision = sys.argv[3] if len(sys.argv) > 3 else 'double'
 region = tuple(map(float, sys.argv[2].split(','))) if len(sys.argv) > 2 else (0, 3, 24, 7)
-ex = os.path.join(os.path.dirname(__file__), '..', 'examples')
+ex = os.path.join(os.path.dirname(__file__), '..', '..', 'examples', 'mom25d')
 if not os.path.exists(os.path.join(ex, 'demo_transition.kicad_pcb')):
     subprocess.check_call([sys.executable, os.path.join(ex, 'make_demo_board.py'), os.path.join(ex, 'demo_transition')])
 m = KiCadBoard(os.path.join(ex, 'demo_transition.kicad_pcb')).build(
