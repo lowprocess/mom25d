@@ -132,9 +132,10 @@ def test_auto_without_gpu_is_silent_cpu(clean, S_cpu):
     assert np.abs(S - S_cpu).max() < 1e-12
 
 
-def test_gpu_refinement_that_stalls_falls_back_to_double_for_good(clean, S_cpu):
+def test_gpu_refinement_that_stalls_falls_back_to_double_nearby(clean, S_cpu):
     """A GPU LU too weak to precondition (here: a wrong one) must not cost the sweep: the refinement stops after
-    two restarts, the frequency is solved in double, and so is every later one."""
+    two restarts, the frequency is solved in double, and so is everything up to 1.25 x it; above that the GPU
+    is tried again (it fails at the low end of a band, and a sweep that gave up for good ran on the CPU)."""
     mods, _ = fake_cupy()
     for k, v in mods.items():
         clean.setitem(sys.modules, k, v)
@@ -145,7 +146,9 @@ def test_gpu_refinement_that_stalls_falls_back_to_double_for_good(clean, S_cpu):
     assert np.abs(S - S_cpu).max() < 1e-6 and sim.fast._hybrid_failed     # S_cpu: refined to 1e-6, this: double
     n_gpu = sum(r[0] == 'LU factor (GPU)' for r in sim.log.records)
     sim.sparams(4.5e9)
-    assert sum(r[0] == 'LU factor (GPU)' for r in sim.log.records) == n_gpu      # no GPU attempt any more
+    assert sum(r[0] == 'LU factor (GPU)' for r in sim.log.records) == n_gpu      # near the failure: double
+    sim.sparams(5.5e9)
+    assert sum(r[0] == 'LU factor (GPU)' for r in sim.log.records) == n_gpu + 1  # above 1.25 x: the GPU again
 
 
 def _S_symmetric():

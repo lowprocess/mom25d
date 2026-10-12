@@ -168,6 +168,9 @@ class HMatrix:
 # =============================================================================
 # Fast operator for a Simulation
 # =============================================================================
+HYBRID_RETRY = 1.25      # after the GPU's mixed precision fails at f, double up to this x f
+
+
 class FastOperator:
     """Builds and applies Z for a mom25d.sim.Simulation without forming it densely."""
 
@@ -607,7 +610,11 @@ class FastOperator:
         # copy the GPU factors), the refinement products dense: 5.7 s a solve on the via transition (13.5k
         # unknowns) against 8.7 s with the sparse exact near field (its CSR build alone 3.1 s) and 14.9 s double
         hybrid = precision == 'mixed' and self._gpu_for(N) is not None and self._fits(24.0 * N * N)
-        if hybrid and getattr(self, '_hybrid_failed', False):        # did not converge once: double from then on
+        if hybrid and f <= HYBRID_RETRY * getattr(self, '_hybrid_failed', 0.0):
+            # the complex64 LU failed to precondition at or above this frequency: double up to HYBRID_RETRY x
+            # the highest failure, the GPU again above it (it fails at the low end of a band, where the MPIE
+            # matrix is worst conditioned; a sweep that gave up for good after its first 1 GHz solve ran the via
+            # transition, 38 solves, on the CPU: 621 s, against 614 s without a GPU)
             precision, hybrid = 'double', False
         tiled = getattr(self, 'tiled', None) or getattr(sim, 'tiled', 'auto')
         if precision == 'mixed' and tiled != 'off' and not getattr(self, '_tiled_failed', False) and \
@@ -845,8 +852,8 @@ class FastOperator:
         sim.log.note(f"mixed precision (GPU): GMRES iterations per port {self.iters}")
         if (rel > 100 * self.mixed_tol).any():
             sim.log.note(f"mixed precision (GPU) did not converge at {f / 1e9:.4g} GHz (residual {rel.max():.1e}): "
-                         f"double precision from here on")
-            self._hybrid_failed = True
+                         f"double precision up to {HYBRID_RETRY * f / 1e9:.4g} GHz")
+            self._hybrid_failed = max(getattr(self, '_hybrid_failed', 0.0), f)
             with sim.log.timer('LU factor', f"N={Z.shape[0]}"):
                 lu, piv = sla.lu_factor(Z.T, overwrite_a=True, check_finite=False)
             Y = sla.lu_solve((lu, piv), B, trans=1, check_finite=False)
