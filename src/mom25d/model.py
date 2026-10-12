@@ -256,6 +256,6 @@ class PlanarModel:
         from .sim import Simulation
         ports = self.ports(step=step, dmax=dmax, fmin=wave_down_to)
         if characterize:
-            self.characterize(ports, fmin, fmax)
+            self.characterize(ports, fmin, fmax, dmax=dmax)        # the cells the feeds get: the same gamma
         kw.setdefault('lumped', list(self.lumped))
         return Simulation(self.stack, self.shapes, ports, vias=self.vias, dmax=dmax, **kw)
