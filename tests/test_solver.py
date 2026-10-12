@@ -194,3 +194,22 @@ def test_differential_through_line():
     assert abs(S[3, 0]) < 1e-3 and abs(S[0, 1]) < 1e-3                    # no mode conversion (symmetric)
     assert np.abs(S - S.T).max() < 1e-8
     assert sim.last['resid'].max() < 1e-2
+
+
+def test_far_field_of_a_dipole_over_ground():
+    """mom25d.farfield on a small x-directed current at height h above the ground in air against the image
+    solution: |r E| = eta k p / (4 pi) * 2 sin(k h cos theta) * (cos theta cos phi, -sin phi), shape and size."""
+    from types import SimpleNamespace as NS
+    from mom25d.farfield import far_field
+    f = 3e9
+    k0 = 2 * np.pi * f / C0
+    for h in (0.01, 0.2):
+        H = h * C0 / f
+        sim = NS(st=LayerStack([Layer(H, 1.0)]), rwg=NS(cent=np.array([[0.0, 0.0, H]]), area=np.array([1e-6])),
+                 tri_idx={1: np.array([0])}, current_density=lambda I: (np.array([1.0 + 0j]), np.array([0j])))
+        th, ph = np.array([0.0, 30, 60, 85]), np.array([0.0, 45, 90])
+        Et, Ep = far_field(sim, None, f, th, ph)
+        T, P = np.meshgrid(np.radians(th), np.radians(ph))
+        amp = np.sqrt(MU0 / EPS0) * k0 * 1e-6 / (4 * np.pi) * 2 * np.sin(k0 * H * np.cos(T))
+        assert np.allclose(np.abs(Et), amp * np.abs(np.cos(T) * np.cos(P)), rtol=1e-6, atol=1e-12)
+        assert np.allclose(np.abs(Ep), amp * np.abs(np.sin(P)), rtol=1e-6, atol=1e-12)
