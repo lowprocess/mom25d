@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from kicad2ems.board import Board
 from kicad2ems.importers.kicad import KiCadBoard
-from mom25d.board import BoardModel
+from mom25d.board import BoardModel, WALL_GAP, wall_points
 
 quiet = lambda *a: None
 
@@ -55,6 +55,9 @@ def test_walls_parts_and_errors(boards):
     length = sum(w[3] - w[2] for w in launch.walls)
     assert launch.walls and len(walls) >= length / 0.5 and not any(v.ring for v in walls)
     assert any('edge walls' in n for n in m.notes)
+    xy = np.array([(v.x, v.y) for v in m.vias])                  # walls meeting at a corner share no via
+    d = np.hypot(*(xy[:, None] - xy[None]).transpose(2, 0, 1)) + np.eye(len(xy))
+    assert d.min() > 0.9 * WALL_GAP * 1e-3
     rlc = Board(KiCadBoard(boards['rlc'] + '.kicad_pcb'), nets=['RF1', 'RF2', 'GND'], pos_file=boards['rlc'] + '-top.pos',
                 log=quiet)
     m = BoardModel(rlc.to_dict(), log=quiet)
@@ -107,3 +110,12 @@ def test_wave_ports_with_the_characterised_gamma(tmp_path):
         S = renorm(sim.sparams(f), _zc(sim, f), [50, 50])
         assert all(p.known_gamma for p in sim.ports) == (f < 0.5e9)      # 1 GHz: span enough to fit gamma
         assert abs(S[0, 0]) < 0.04 and abs(abs(S[1, 0]) - 1) < 0.01
+
+
+def test_wall_points_skip_a_via_already_there():
+    """Two walls meeting at a corner give one via there, not two (a duplicated via makes the via block
+    singular), and a wall via on top of a board via is left out."""
+    walls = [('x', 0.0, 0.0, 2.0, 0, 1), ('y', 0.0, 0.0, 2.0, 0, 1)]          # x = 0 and y = 0, meeting at (0, 0)
+    pts = wall_points(walls, 0.5)
+    assert len(pts) == 9 and sum((x, y) == (0.0, 0.0) for _, x, y in pts) == 1
+    assert len(wall_points(walls, 0.5, taken=[(0.0, 1.02)])) == 8

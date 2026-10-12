@@ -82,6 +82,48 @@ def available_memory():
     return float(avail)
 
 
+def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver='auto', tiled='auto', block=1024):
+    """How the solver of n unknowns runs and the memory it needs: dict(solver, precision, path, host, gpu)
+    (bytes). gpu: None, or (backend name, free bytes). path: 'dense' (NumPy, small n), 'double' (LU on the
+    CPU), 'hybrid' (complex64 LU on the GPU, the double Z on the host for the refinement), 'tiled' (the
+    symmetric part as L L^T tiles on the GPU, no dense Z: fast.FastOperator._solve_tiled), 'gpu-lu' (complex64
+    Z on the host and the GPU), 'cpu-mixed' (complex64 LU on the CPU), 'blr' / 'aca' (compressed, no dense Z).
+    tiled: 'auto' (where the hybrid does not fit), 'on' (whenever a CuPy GPU is there) or 'off'."""
+    avail = available_memory() if avail is None else avail
+    name, free = gpu if gpu else (None, 0.0)
+    gpu_lu = (1 if name in ('cupy', 'emulate') else 2) * 8.0 * n * n + 0.4e9      # gpu._Backend.vram_needed
+    gpu_fits = name is not None and gpu_lu <= 0.9 * free
+    work = 3 * 8.0 * n * block + 0.5e9                                          # fast.FastOperator._tiled_work
+    can_tile = tiled != 'off' and has_core and name in ('cupy', 'emulate') and work <= 0.9 * free
+    if precision == 'auto':
+        precision = 'double' if (not has_core or 18.0 * n * n + 0.9e9 <= 0.5 * avail) else 'mixed'
+        if has_core and precision == 'double' and n > 3500 and gpu_fits and 24.0 * n * n + 0.9e9 <= 0.5 * avail:
+            precision = 'mixed'
+    if precision == 'mixed' and not has_core:
+        precision = 'double'
+    hybrid = precision == 'mixed' and gpu_fits and 24.0 * n * n + 0.9e9 <= 0.8 * avail
+    if precision == 'double':
+        path, host, dev = 'double', 18.0 * n * n + 0.9e9, 0.0
+    elif can_tile and (tiled == 'on' or not hybrid):
+        budget = max(0.0, 0.9 * free - work)
+        path, dev = 'tiled', min(4.0 * n * n, budget) + work
+        host = max(0.0, 4.0 * n * n - budget) + 2 * 16.0 * n * block + 1e4 * n + 0.9e9
+    elif hybrid:
+        path, host, dev = 'hybrid', 24.0 * n * n + 0.9e9, gpu_lu
+    elif gpu_fits:
+        path, host, dev = 'gpu-lu', 10.0 * n * n + 0.9e9, gpu_lu
+    else:
+        path, host, dev = 'cpu-mixed', 10.0 * n * n + 0.9e9, 0.0
+    fits = host <= 0.8 * avail
+    if solver == 'auto':
+        solver = 'dense' if n <= 3500 and fits else ('direct' if fits else ('blr' if has_core else 'aca'))
+    if solver == 'dense':
+        path, host, dev = 'dense', 18.0 * n * n + 0.9e9, 0.0
+    elif solver in ('blr', 'aca'):
+        path, host, dev = solver, 2e4 * n + 0.9e9, 0.0
+    return dict(solver=solver, precision=precision, path=path, host=host, gpu=dev, fits=fits)
+
+
 class Via:
     """Plated via: axis (x, y), from interface k_bot to k_top, barrel radius. Z: optional series
     element (callable f -> ohms) placed in the lowest chain (e.g. a chip part to ground)."""
@@ -178,12 +220,13 @@ class Simulation:
     def __init__(self, stack, shapes, ports=(), vias=(), lumped=(), dmax=0.3e-3, dmax_layer=None,
                  w_ref=None, ncross=6, grade=1.0, near_fac=5.0, mesher='auto', metal=None,
                  solver='dense', aca_tol=1e-4, refine=1.0e-3, precision='auto', gpu='auto', verbose=True, title='',
-                 mesh_only=False):
+                 mesh_only=False, tiled='auto'):
         # mesh_only: stop once the mesh and the unknowns (Ne, Nv) are known (a cost estimate; nothing to solve with)
         self.st, self.title, self.metal = stack, title, metal
         self.solver = solver
         self.gpu = gpu                      # 'auto' | 'cupy' | 'torch' | 'off' (mixed direct solver LU)
         self.precision = precision          # 'auto' | 'double' | 'mixed' (direct: complex64 Z + refinement)
+        self.tiled = tiled                  # 'auto' | 'on' | 'off': mixed precision as L L^T tiles on the GPU (memory_plan)
         self.blr_tol, self.blr_tile, self.blr_eta = 1e-3, 512, 0.7   # solver='blr' preconditioner settings
         self.log = RunLog(verbose)
         self.dmax, self.ncross, self.grade, self.near_fac = dmax, ncross, grade, near_fac
@@ -338,35 +381,28 @@ class Simulation:
         if not has_core:
             self.log.note("note: no compiled core (python -m mom25d.core.build, or MOM25D_NO_CORE is set): "
                           "the NumPy kernels are several times slower")
-        if precision == 'auto':
-            # double whenever it fits comfortably: the complex64 LU preconditioner can stall (fine meshes, low
-            # frequency, many via chains) and the refinement then costs more than a double LU (study in
-            # kicad2ems docs/mom.md); mixed only where it saves the memory that makes the direct solver fit
-            precision = 'double' if (not has_core or 18.0 * n * n + 0.9e9 <= 0.5 * available_memory()) else 'mixed'
-            if has_core and precision == 'double' and n > 3500 and gpu != 'off':
-                # with a GPU the complex64 LU runs there and the refinement uses the double Z on the host
-                # (fast.FastOperator._solve_hybrid, re-solved in double if it does not converge): 5.7 s a solve
-                # against 14.9 s on the via transition (13.5k unknowns, Radeon RX 7800 XT)
-                from .gpu import get_backend
-                g = get_backend(gpu)
-                if g is not None and g.fits(n) and 24.0 * n * n + 0.9e9 <= 0.5 * available_memory():
-                    precision = 'mixed'
-        if precision == 'mixed' and not has_core:
-            precision = 'double'
-        self.precision = precision
+        # double whenever it fits comfortably: the complex64 LU preconditioner can stall (fine meshes, low
+        # frequency, many via chains) and the refinement then costs more than a double LU (study in kicad2ems
+        # docs/mom.md); mixed where it saves the memory that makes the direct solver fit, or where a GPU takes
+        # the complex64 LU (5.7 s a solve against 14.9 s on the via transition, 13.5k unknowns, RX 7800 XT)
+        g = None
+        if has_core and gpu != 'off' and (precision == 'mixed' or (precision == 'auto' and n > 3500)):
+            from .gpu import get_backend
+            b = get_backend(gpu)
+            g = (b.name, b.mem_free()) if b is not None else None
+        avail = available_memory()
+        plan = memory_plan(n, has_core, avail, g, precision, solver, self.tiled)
+        self.precision = precision = plan['precision']
+        self.plan = plan
         if solver in ('auto', 'direct'):
-            # peak memory of the direct solver (Z + in-place LU + sparse near field + workspace),
-            # checked against what is available now (cgroup aware) so a big model never swaps
-            need = (10.0 if precision == "mixed" else 18.0) * n * n + 0.9e9
-            avail = available_memory()
-            self.log.note(f"memory: direct solver needs ~{need / 1e9:.1f} GB ({precision} precision), "
-                          f"{avail / 1e9:.1f} GB available")
-            fits = need <= 0.8 * avail
+            self.log.note(f"memory: direct solver needs ~{plan['host'] / 1e9:.1f} GB ({precision} precision, "
+                          f"{plan['path']}" + (f", {plan['gpu'] / 1e9:.1f} GB on the GPU" if plan['gpu'] else '')
+                          + f"), {avail / 1e9:.1f} GB available")
             if solver == 'auto':
-                solver = 'dense' if n <= 3500 and fits else ('direct' if fits else ('blr' if has_core else 'aca'))
-            elif not fits:
+                solver = plan['solver']
+            elif not plan['fits']:
                 alt = 'blr' if has_core else 'aca'
-                self.log.note(f"WARNING: direct solver would need ~{need / 1e9:.1f} GB but only "
+                self.log.note(f"WARNING: direct solver would need ~{plan['host'] / 1e9:.1f} GB but only "
                               f"{avail / 1e9:.1f} GB is available - switching to {alt}. Coarser dmax / "
                               f"dmax_layer, a smaller region, or an inner-layer ground reduce N.")
                 solver = alt

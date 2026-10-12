@@ -146,3 +146,55 @@ def test_gpu_refinement_that_stalls_falls_back_to_double_for_good(clean, S_cpu):
     n_gpu = sum(r[0] == 'LU factor (GPU)' for r in sim.log.records)
     sim.sparams(4.5e9)
     assert sum(r[0] == 'LU factor (GPU)' for r in sim.log.records) == n_gpu      # no GPU attempt any more
+
+
+def _S_symmetric():
+    """The CPU double solve of (Z + Z^T) / 2: what the tiled path solves (its near field symmetrised)."""
+    sim = make_sim('off')
+    sim.precision = 'double'
+    orig = sla.lu_factor
+
+    def lu(A, **kw):
+        A[...] = 0.5 * (A + A.T)
+        return orig(A, **kw)
+    sla.lu_factor = lu
+    try:
+        return sim.sparams(4e9)
+    finally:
+        sla.lu_factor = orig
+
+
+def test_tiled_symmetric_factor_matches_cpu(clean, S_cpu):
+    """The tiled L L^T (no dense Z: block columns filled one at a time, half of them streamed from the host as
+    when the GPU is full) preconditions the refinement to the CPU answer of the symmetric part of Z, close
+    to Z's own."""
+    mods, _ = fake_cupy()
+    cla = mods['cupyx.scipy.linalg']
+    cla.solve_triangular = lambda a, b, lower=False, trans='N', check_finite=True: \
+        sla.solve_triangular(a, b, lower=lower, trans=trans, check_finite=False)
+    for k, v in mods.items():
+        clean.setitem(sys.modules, k, v)
+    sim = make_sim('cupy')
+    sim.fast.tiled, sim.fast.tiled_block = 'on', 64
+    N = sim.Ne + sim.Nv
+    gpu = mom25d_gpu.get_backend('cupy')
+    clean.setattr(type(gpu), 'mem_free', lambda self: (sim.fast._tiled_work(N, 64) + 2.0 * N * N) / 0.9)
+    S = sim.sparams(4e9)
+    assert any(r[0] == 'LDLT factor (GPU, tiled)' for r in sim.log.records), "tiled path not taken"
+    assert not any(r[0] == 'LU factor (GPU)' for r in sim.log.records)
+    assert any('streamed from the host' in n for n in sim.log.notes)
+    assert np.abs(S - _S_symmetric()).max() < 1e-6 and np.abs(S - S_cpu).max() < 1e-2
+
+
+def test_symmetric_factor_of_a_random_matrix():
+    from mom25d.ldlt import SymFactor, chol_sym
+    rng = np.random.default_rng(1)
+    N = 300
+    A = rng.standard_normal((N, N)) + 1j * rng.standard_normal((N, N))
+    Z = 0.3 * (A + A.T) / np.sqrt(N) + (1 + 0.5j) * np.eye(N)
+    L = chol_sym(Z.copy(), base=16)
+    assert np.abs(L @ L.T - Z).max() < 1e-12 and not np.triu(L, 1).any()
+    fac = SymFactor(N, lambda j0, j1: Z[j0:, j0:j1], block=64, budget=0.5 * 4 * N * N).factor()
+    assert fac.on_device.count(False) > 0
+    R = rng.standard_normal((N, 2)) + 0j
+    assert np.linalg.norm(Z @ fac.solve(R) - R) / np.linalg.norm(R) < 1e-5

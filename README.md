@@ -23,8 +23,8 @@ kicad2ems examples/demo_transition.toml --solvers mom       # the board solved b
 ```
 
 Without the compiled core the solver runs on NumPy and says so in the log (`note: mom25d ... no compiled
-core`). In kicad2ems, mom25d's settings are `--mom-dmax`, `--mom-port`, `--mom-mesher` and `--mom-solves`, or
-`dmax`, `port`, `mesher` and `solves` under `[solver.mom25d]` in a config ([options](usage.md#options)).
+core`). In kicad2ems, mom25d's settings are `--mom-dmax`, `--mom-port`, `--mom-mesher`, `--mom-solves` and
+`--mom-tiled`, or `dmax`, `port`, `mesher`, `solves` and `tiled` under `[solver.mom25d]` in a config ([options](usage.md#options)).
 
 ![KiCad via transition](img/kicad_transition_dashboard.png)
 
@@ -90,7 +90,7 @@ match the CPU solver (|ΔS| < 1e-7 in the tests). Two backends, tried in this or
 
 | Backend | Install | VRAM for N unknowns | 16 GB card |
 |---|---|---|---|
-| CuPy (hipSOLVER / cuSOLVER) | CuPy for ROCm, see the CuPy install docs | 8 N² B (LU in place) | ~41k |
+| CuPy (hipSOLVER / cuSOLVER) | `pip install cupy-rocm-7-0` (AMD, ROCm 7), `cupy-cuda12x` or `cupy-cuda13x` (NVIDIA): one of them (or this package's extras `gpu-rocm7`, `gpu-cuda12`, `gpu-cuda13`) | 8 N² B (LU in place); tiled: 4 N² B | ~41k; tiled ~60k (more streamed from the host) |
 | PyTorch (ROCm or CUDA build) | the ROCm wheel command from pytorch.org | 16 N² B | ~29k |
 
 ```bash
@@ -99,7 +99,36 @@ python tools/mom25d/gpu_selfcheck.py                                # accuracy +
 ```
 
 The GPU is used automatically when a backend is installed and the LU fits in free
-VRAM; otherwise the CPU LU runs with a note in the log. `MOM25D_GPU=cupy|torch|off` forces a backend or disables it. AMD notes:
+VRAM; otherwise the CPU LU runs with a note in the log.
+
+**Which path** (`mom25d.sim.memory_plan`, logged as `memory: direct solver needs …`):
+
+| path | when | host memory | GPU memory |
+|---|---|---|---|
+| double | fits in half the free RAM, no GPU (or N ≤ 3.5k) | 18 N² B | – |
+| hybrid | a GPU where the complex64 LU fits, and 24 N² B on the host | 24 N² B (the double Z for the refinement) | 8 N² B |
+| tiled | CuPy, where the hybrid does not fit (`tiled='on'`: always; `'off'`: never) | a block column, the sparse near field (+ the panels past the GPU) | 4 N² B (or what there is: the rest is streamed) |
+| gpu-lu / cpu-mixed | the older complex64 paths, refined matrix-free | 10 N² B | 8 N² B / – |
+
+The tiled path (`ldlt.py`) never forms Z: the matrix is symmetric, so the GPU keeps the lower half as
+complex64 L Lᵀ panels, filled on the host one block column at a time (left-looking: each column updated by
+the earlier panels, its diagonal block factored on the host in double), panels past the free VRAM held on the
+host and streamed in. No pivoting: the equilibrated MoM matrix factors without (smallest pivots 2e-3 to 6e-3
+on the examples). The near-field correction is not exactly symmetric (its singular parts are integrated
+analytically over one triangle of a pair, by quadrature over the other: up to 0.07 of the unit diagonal
+between a plane and a strip triangle), so the tiled path solves the symmetric part (Z + Zᵀ) / 2: |ΔS| ≤
+1.2e-3 against Z on the SMA launch (1-6 GHz), 2.7e-5 on the coupler; preconditioning Z itself with the factor
+of its symmetric part did not converge. Where the hybrid fits it is faster (SMA launch, 16.1k unknowns: 9.9 s
+against 14.3 s a solve; coupler at 0.15 mm, 20.3k: 9.4 s against 12.4 s), so `tiled='auto'` takes the tiled
+path only where the hybrid does not fit. What it is for: the coupler at `dmax` 0.1 mm (45,850 unknowns,
+21 GB of RAM as a dense double Z) solves in 62 s on a 16 GB card (factor 44 s, 8.6 GB of panels; refinement 6-7
+iterations, 13.5 s) where the CPU took over an hour.
+
+Two vias in one place make the via block singular: edge walls that meet at a corner used to put a via at the
+shared end twice (4 exact null vectors on the SMA launch), which a complex64 LU cannot factor (the mixed
+refinement stalled and the sweep fell back to double). `board.wall_points` leaves out a wall via within 0.1 mm
+of one already placed; the SMA launch sweep with the GPU now takes 159 s (14 solves, refinement 2-11
+iterations) against 448 s in double, |ΔS| ≤ 3e-5 at the solved frequencies. `MOM25D_GPU=cupy|torch|off` forces a backend or disables it. AMD notes:
 check the card with `rocminfo`; consumer RDNA3 cards other than the 7900 series usually need
 `HSA_OVERRIDE_GFX_VERSION=11.0.0` (RDNA2: `10.3.0`).
 
@@ -118,6 +147,7 @@ its tools `tools/mom25d/`, its examples `examples/mom25d/`.
 | `sim.py` | `Simulation`: polygons, vias, wave/gap/via ports, lumped R-L-C, metal loss, thick conductors, solvers |
 | `fast.py` | Fast operator: far/near split, `direct` / `mixed` / `blr` / `aca` solvers |
 | `gpu.py` | GPU LU backends (CuPy / PyTorch, ROCm or CUDA) for the mixed direct solver |
+| `ldlt.py` | Tiled complex-symmetric L Lᵀ (complex64) on the GPU, panels streamed from the host past its memory |
 | `blr.py` | Block low-rank LU (tile LU, SVD compression) used as a GMRES preconditioner |
 | `core/mom25d_core.cpp` (`mom25d._core`) | C++/OpenMP kernels via pybind11: matrix fill, near correction, matrix-free matvec |
 | `afs.py` | Adaptive frequency sweep (set-valued AAA rational fitting) |

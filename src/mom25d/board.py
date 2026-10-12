@@ -32,6 +32,28 @@ from .model import PlanarModel, MM
 FORMAT, VERSION = 'kicad2ems-board', 1
 
 
+WALL_R = 0.05                       # mm: the barrel radius of an edge-wall via
+WALL_GAP = 0.1                      # mm: a wall via closer than this to a via already placed is left out
+
+
+def wall_points(walls, pitch, taken=()):
+    """[(wall index, x, y)] (mm) of the vias that stand for edge walls [(axis, at, t0, t1, z0, z1)], every
+    `pitch` mm along each. A point within WALL_GAP of a via already there (`taken`, or an earlier wall's: walls
+    meeting at a corner share their end) is left out: two vias in one place make the via block singular (the
+    SMA launch: 4 duplicated wall ends, an exact null space a complex64 LU cannot factor)."""
+    pts = [tuple(p) for p in taken]
+    out = []
+    for i, (axis, at, t0, t1, _, _) in enumerate(walls):
+        n = max(2, int(round((t1 - t0) / pitch)) + 1)
+        for t in np.linspace(t0, t1, n):
+            x, y = (at, t) if axis == 'x' else (t, at)
+            if pts and np.min(np.hypot(*(np.asarray(pts) - (x, y)).T)) < WALL_GAP:
+                continue
+            pts.append((x, y))
+            out.append((i, x, y))
+    return out
+
+
 class BoardModel(PlanarModel):
     def __init__(self, data, ground=None, port='auto', pairs=False, wall_pitch=0.5e-3, log=print):
         """data: the board (board.json's content). ground: a copper layer name (default: the board's own,
@@ -85,14 +107,13 @@ class BoardModel(PlanarModel):
             if via:
                 self.vias.append(via)
         nwall = 0
-        for w in data.get('walls', []):
-            n = max(2, int(round((w['t1'] - w['t0']) * MM / wall_pitch)) + 1)
-            for t in np.linspace(w['t0'], w['t1'], n):
-                x, y = (w['at'], t) if w['axis'] == 'x' else (t, w['at'])
-                via = self._via(x, y, w['z0'], w['z1'], 0.05, f"wall@({x:.2f},{-y:.2f})", ring=False)
-                if via:
-                    self.vias.append(via)
-                    nwall += 1
+        walls = [(w['axis'], w['at'], w['t0'], w['t1'], w['z0'], w['z1']) for w in data.get('walls', [])]
+        for i, x, y in wall_points(walls, wall_pitch / MM, [(v['x'], v['y']) for v in data.get('vias', [])]):
+            w = walls[i]
+            via = self._via(x, y, w[4], w[5], WALL_R, f"wall@({x:.2f},{-y:.2f})", ring=False)
+            if via:
+                self.vias.append(via)
+                nwall += 1
         if data.get('walls'):
             self.notes.append(f"edge walls: {nwall} vias every {wall_pitch * 1e3:g} mm")
         self.lumped = []

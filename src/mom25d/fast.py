@@ -610,6 +610,17 @@ class FastOperator:
         hybrid = precision == 'mixed' and self._gpu_for(N) is not None and self._fits(24.0 * N * N)
         if hybrid and getattr(self, '_hybrid_failed', False):        # did not converge once: double from then on
             precision, hybrid = 'double', False
+        tiled = getattr(self, 'tiled', None) or getattr(sim, 'tiled', 'auto')
+        if precision == 'mixed' and tiled != 'off' and not getattr(self, '_tiled_failed', False) and \
+                (tiled == 'on' or not hybrid):
+            # no dense Z: the GPU holds half a complex64 matrix (or streams it), the host a block column
+            from .gpu import get_backend
+            gpu = get_backend(sim.gpu) if getattr(sim, 'gpu', 'off') != 'off' else None
+            blk = getattr(self, 'tiled_block', 1024)
+            if gpu is not None and hasattr(gpu, 'cp') and 0.9 * gpu.mem_free() >= self._tiled_work(N, blk):
+                X = self._solve_tiled(f, E, Sx, gpu, blk)
+                if X is not None:
+                    return X
         dt = np.complex64 if precision == 'mixed' and not hybrid else np.complex128
         with sim.log.timer('direct fill', f"N={N}, {np.dtype(dt).name}, {self.core.num_threads()} threads"):
             Z = np.zeros((N, N), dt)
@@ -702,6 +713,94 @@ class FastOperator:
                          f"- solving in double precision")
             return self.solve_direct(f, E, block, precision='double')
         return X
+
+    def _solve_tiled(self, f, E, Sx, gpu, block=1024):
+        """Mixed precision without a dense Z anywhere: the symmetric part of the equilibrated Z factored as
+        L L^T in complex64 tiles on the GPU (ldlt.SymFactor: block columns filled on the host one at a time,
+        4 N^2 bytes on the device, streamed from the host past its memory), GMRES on the matrix-free double
+        operator of that symmetric part with the factor as the preconditioner. The near-field correction is not
+        quite symmetric (its singular parts are integrated analytically over one triangle of a pair and by
+        quadrature over the other: up to 0.07 of the unit diagonal between a plane triangle and a strip one), the
+        exact Galerkin Z is: this path solves (Z + Z^T) / 2, |dS| <= 1.2e-3 on the SMA launch (1-6 GHz) against
+        Z itself. Preconditioning Z with the factor of its symmetric part did not converge (300 iterations)."""
+        from .ldlt import SymFactor
+        sim, core = self.sim, self.core
+        Ne, Nv = sim.Ne, sim.Nv
+        N = Ne + Nv
+        with sim.log.timer('near-field correction'):
+            ri, ci, vv, qc = core.near_coo(self.g, self.tb, self.q, self.nP32, self.nQ32, self.w)
+            ok = ri >= 0
+            self.dZ_exact = sparse.csr_matrix((vv[ok], (ri[ok], ci[ok])), shape=(Ne, Ne))
+            self._qcorr = qc
+            del ri, ci, vv, ok
+        if Nv:
+            with sim.log.timer('via kernels', f"{Nv} chains"):
+                self.B, self.C = sim._via_blocks(f, self._fan_columns())
+        M = sparse.bmat([[self.dZ_exact, None], [None, sparse.csr_matrix((Nv, Nv))]]) if Nv else self.dZ_exact
+        M = M + Sx
+        Ms = ((M + M.T) * 0.5).tocsc()
+        Cs = 0.5 * (self.C + self.C.T) if Nv else None
+        # the operator of the refinement: the same symmetric part
+        self.dZ_exact = (0.5 * (self.dZ_exact + self.dZ_exact.T)).tocsr()
+        Sx = (0.5 * (Sx + Sx.T)).tocsr()
+        if Nv:
+            self.C = Cs
+        diag = Ms.diagonal().astype(complex)
+        for c0 in range(0, Ne, block):
+            idx = np.arange(c0, min(c0 + block, Ne), dtype=np.int32)
+            diag[idx] += np.diagonal(core.far_block(idx, idx, self.g, self.tb, self.w))
+        if Nv:
+            diag[Ne:] += np.diagonal(Cs)
+        dsc = 1.0 / np.sqrt(np.abs(diag) + 1e-300)
+
+        def fill(j0, j1):
+            out = np.zeros((N - j0, j1 - j0), complex)
+            c1 = min(j1, Ne)
+            if j0 < c1:
+                out[:Ne - j0, :c1 - j0] = core.far_block(np.arange(j0, Ne, dtype=np.int32),
+                                                         np.arange(j0, c1, dtype=np.int32), self.g, self.tb, self.w)
+                if Nv:
+                    out[Ne - j0:, :c1 - j0] = self.B[j0:c1].T
+            if j1 > Ne:
+                v0, off = max(j0, Ne) - Ne, max(j0, Ne) - j0
+                if j0 < Ne:
+                    out[:Ne - j0, off:] = self.B[j0:Ne, v0:j1 - Ne]
+                out[off:, off:] = Cs[v0:, v0:j1 - Ne]
+            out += Ms[j0:, j0:j1].toarray()
+            out *= dsc[j0:, None]
+            out *= dsc[None, j0:j1]
+            return out
+        cp = gpu.cp
+        fac = SymFactor(N, fill, xp=cp, block=block, budget=max(0.0, 0.9 * gpu.mem_free() - self._tiled_work(N, block)),
+                        log=sim.log.note)
+        with sim.log.timer('LDLT factor (GPU, tiled)', f"N={N}, block {block}"):
+            fac.factor()
+            cp.cuda.Device().synchronize()
+        streamed = fac.on_device.count(False)
+        sim.log.note(f"tiled LDL^T: {fac.held / 1e9:.1f} GB of panels on the GPU"
+                     + (f", {streamed} of {len(fac.panels)} streamed from the host" if streamed else '')
+                     + f", smallest pivot {fac.small_pivot:.1e}")
+        B = dsc[:, None] * E
+        with sim.log.timer('refinement (GMRES, exact matvec)'):
+            Y, self.iters = gmres_batched(lambda V: dsc[:, None] * self.matvec_exact_multi(dsc[:, None] * V, Sx), B,
+                                          M=fac.solve, rtol=self.mixed_tol, restart=30, maxiter=10)
+            X = dsc[:, None] * Y
+            R = B - dsc[:, None] * self.matvec_exact_multi(X, Sx)
+            rel = np.linalg.norm(R, axis=0) / np.maximum(np.linalg.norm(B, axis=0), 1e-300)
+        fac.release()
+        sim.log.note(f"tiled mixed precision: GMRES iterations per port {self.iters}")
+        if (rel > 100 * self.mixed_tol).any():
+            sim.log.note(f"WARNING tiled mixed precision did not converge at {f / 1e9:.4g} GHz (residual "
+                         f"{rel.max():.1e}): the pivoted LU from here on")
+            self._tiled_failed = True
+            return None
+        return X
+
+    @staticmethod
+    def _tiled_work(N, block=1024):
+        """GPU bytes the tiled factor needs besides its panels: the column being updated, a streamed panel, the
+        right-hand sides of a solve."""
+        return 3 * 8.0 * N * block + 0.5e9
 
     def _gpu_for(self, N):
         """The GPU backend when one is asked for (sim.gpu), available and the LU of N unknowns fits, else None."""

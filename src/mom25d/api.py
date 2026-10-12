@@ -41,7 +41,7 @@ class Result:
 
 
 def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=False, mesher='auto', metal=None,
-                ground=None, max_solves=60, afs_tol=5e-3, log=print, progress=None):
+                ground=None, max_solves=60, afs_tol=5e-3, log=print, progress=None, tiled='auto'):
     """S-parameters of a board (a <name>_board.json path, or its content) on `freq` (Hz).
 
     dmax (m): largest cell along the copper; layers whose metal covers more than half the board (planes) get
@@ -49,7 +49,7 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     the straight feed spans enough for the fit down to the lowest frequency, else lumped), 'wave' or 'via'
     (lumped). pairs: P<n>+ / P<n>- ports as one mixed-mode port. metal: a sim.Metal (conductor loss), or None
     (lossless). log: lines of progress (the adaptive sweep's); progress(solves, max_solves, f): after each
-    EM solve."""
+    EM solve. tiled: 'auto' | 'on' | 'off', the tiled GPU solver (sim.memory_plan)."""
     from .board import BoardModel
     from .fast import _core
     from .geo import LinePort
@@ -65,7 +65,7 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     planes = {k: plane_factor * dmax for k, gs in model.shapes.items()
               if sum(g.area for g in gs) > 0.5 * model.outline_area}
     sim = model.simulation(dmax=dmax, dmax_layer=planes, fmin=fmin, fmax=fmax, solver='auto', verbose=False,
-                           wave_down_to=fmin, mesher=mesher, title=name, metal=metal)
+                           wave_down_to=fmin, mesher=mesher, title=name, metal=metal, tiled=tiled)
     f, S, info = solve_band(sim, fmin, fmax, points=len(freq), zref=model.port_z0, max_solves=max_solves,
                             afs_tol=afs_tol, log=log, progress=progress)
     if len(f) != len(freq) or not np.allclose(f, freq):              # the sweep's grid onto the requested one

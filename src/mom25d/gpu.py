@@ -59,6 +59,9 @@ class CupyBackend(_Backend):
         self.cp.get_default_memory_pool().free_all_blocks()
         return float(self.cp.cuda.Device().mem_info[0])
 
+    def mem_total(self):
+        return float(self.cp.cuda.Device().mem_info[1])
+
     def factor(self, Z):
         """Z: host complex64, C-contiguous, equilibrated. Factors Z^T (Fortran-contiguous view) in place."""
         cp = self.cp
@@ -102,6 +105,9 @@ class TorchBackend(_Backend):
         self.torch.cuda.empty_cache()
         return float(self.torch.cuda.mem_get_info()[0])
 
+    def mem_total(self):
+        return float(self.torch.cuda.mem_get_info()[1])
+
     def factor(self, Z):
         """Upload Z (row-major), factor A = Z^T (a column-major view: no extra transpose copy)."""
         torch = self.torch
@@ -139,6 +145,9 @@ class EmulatedBackend(_Backend):
         self.lu = self.piv = None
 
     def mem_free(self):
+        return float(self._mem)
+
+    def mem_total(self):
         return float(self._mem)
 
     def factor(self, Z):
