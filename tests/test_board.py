@@ -108,7 +108,7 @@ def test_wave_ports_with_the_characterised_gamma(tmp_path):
     assert all(abs(p.zc - 51) < 2 for p in sim.ports)
     for f in (0.3e9, 1e9):
         S = renorm(sim.sparams(f), _zc(sim, f), [50, 50])
-        assert all(p.known_gamma for p in sim.ports) == (f < 0.5e9)      # 1 GHz: span enough to fit gamma
+        assert all(p.known_gamma for p in sim.ports)
         assert abs(S[0, 0]) < 0.04 and abs(abs(S[1, 0]) - 1) < 0.01
 
 

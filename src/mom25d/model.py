@@ -25,6 +25,14 @@ MM = 1e-3
 KNOWN_SPAN = 0.1          # rad: the least span of a wave port's cuts at the lowest frequency, gamma known
 
 
+def _smooth(fs, v):
+    """f -> v, the polynomial through the characterised values (held beyond the ends): smooth, where linear
+    interpolation's kinks cost the adaptive sweep solves."""
+    fs, v = np.asarray(fs, float), np.asarray(v)
+    c = np.polyfit(fs / fs[-1], v, min(len(fs) - 1, 3))
+    return lambda f: np.polyval(c, np.clip(f, fs[0], fs[-1]) / fs[-1])
+
+
 class PlanarModel:
     lumped = ()
 
@@ -116,8 +124,8 @@ class PlanarModel:
                 w, L = self._feed(g, c, d, step)
                 win, need = self._wave_window(w, L, step)
                 if win is not None and kind == 'auto' and fmin:
-                    # fitting gamma too needs the cuts to span >= 0.4 rad at the lowest frequency; with gamma from
-                    # the line characterisation (characterize: gamma_fn) the two wave amplitudes need KNOWN_SPAN
+                    # with gamma from the line characterisation (characterize: gamma_fn) the two wave amplitudes
+                    # need the cuts to span KNOWN_SPAN at the lowest frequency
                     er = self.stack.layers[k - 1].er
                     beta = 2 * np.pi * fmin * np.sqrt(0.5 * (er + 1)) / 299792458.0      # a lower bound
                     if (win[2] - win[1]) * beta < KNOWN_SPAN:
@@ -209,8 +217,7 @@ class PlanarModel:
                 ge, ze, go, zo = line_char_pair(self.stack, a.layer, 0.5 * (a.w + b.w), gap, fs, planes=planes, dmax=dmax,
                                                 length=length_for(a.w + b.w + gap))
                 zd, zcm = 2 * zo.real, ze.real / 2
-                p.zd_fn = (lambda f, fs=fs, z=zd: np.interp(f, fs, z))
-                p.zc_fn = (lambda f, fs=fs, z=zcm: np.interp(f, fs, z))
+                p.zd_fn, p.zc_fn = _smooth(fs, zd), _smooth(fs, zcm)
                 p.zdiff, p.zcomm = float(zd[len(zd) // 2]), float(zcm[len(zcm) // 2])
                 log(f"  {p.name}: coupled pair on M{a.layer}, w={a.w * 1e3:.3f} mm, gap={gap * 1e3:.3f} mm: "
                     f"Zdiff = " + ", ".join(f"{v:.1f}" for v in zd) + ", Zcomm = " + ", ".join(f"{v:.1f}" for v in zcm) + " ohm")
@@ -235,15 +242,16 @@ class PlanarModel:
                                  + [f"coplanar GND, gap {gp * 1e3:.3f} mm" for gp in gaps]) or "ground only")
                     + ": Zc = " + ", ".join(f"{v:.2f}" for v in z.real) + " ohm")
             zz, gg = cache[key]
-            p.zc_fn = (lambda f, fs=fs, zz=zz: np.interp(f, fs, zz))
+            p.zc_fn = _smooth(fs, zz)
             p.zc = float(zz[len(zz) // 2])
-            # gamma / f is nearly flat: interpolated (and held beyond the ends) for feeds too short to fit it
-            p.gamma_fn = (lambda f, fs=fs, gf=gg / fs: f * (np.interp(f, fs, gf.real) + 1j * np.interp(f, fs, gf.imag)))
+            # gamma / f is nearly flat; the wave fit takes it at every frequency (sim.sparams)
+            gf = _smooth(fs, gg / fs)
+            p.gamma_fn = (lambda f, gf=gf: f * gf(f))
 
     def simulation(self, dmax=0.3e-3, step=None, fmin=1e9, fmax=10e9, characterize=True, wave_down_to=None, **kw):
         """The Simulation of this model. wave_down_to (Hz): 'auto' ports become wave ports only where the feed
         is long enough for the wave fit down to that frequency (else lumped); default: wherever the geometry
-        allows (the fit degrades below ~0.4 rad of sample span, with a warning). metal= (sim.Metal): conductor
+        allows (the fit degrades below KNOWN_SPAN of sample span, with a warning). metal= (sim.Metal): conductor
         loss (default lossless)."""
         from .sim import Simulation
         ports = self.ports(step=step, dmax=dmax, fmin=wave_down_to)

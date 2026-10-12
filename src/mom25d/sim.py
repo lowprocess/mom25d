@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from .model import KNOWN_SPAN
+FIT_SPAN = 0.4             # rad: a wave port's cuts must span this much to fit gamma (a port without a characterised one)
 import shapely
 
 from .base import MU0, EPS0, RWG, qform, combine, singular_moments, quad_pts, gram_matrix, \
@@ -680,11 +681,12 @@ class Simulation:
             if isinstance(p, LinePort):
                 s = self.samples[i]
                 Ik = self.cut_current(I, i)
-                g = PlanarMoM.fit_gamma(Ik, abs(s[1] - s[0]))
+                # gamma from the line characterisation where there is one: fitted on a short feed with a strong
+                # standing wave it came out 2-10x low (radial stub, |S11| 1.19), and switching between the fit and
+                # the characterised gamma at a span made S jump, which the adaptive sweep chased (38 solves)
                 gk = getattr(p, 'gamma_fn', None)
-                p.known_gamma = gk is not None and abs(gk(f).imag) * abs(s[-1] - s[0]) < 0.4
-                if p.known_gamma:
-                    g = gk(f)                                  # too short a span to fit gamma: the characterised one
+                p.known_gamma = gk is not None
+                g = gk(f) if p.known_gamma else PlanarMoM.fit_gamma(Ik, abs(s[1] - s[0]))
                 a, b = PlanarMoM.fit_waves(Ik, s - p.ref, g)
                 M = np.stack([np.exp(-g * (s - p.ref)), np.exp(g * (s - p.ref))], 1)
                 # residual relative to the largest response of this port over all excitations (a mode
@@ -704,7 +706,7 @@ class Simulation:
         for i, p in enumerate(self.ports):
             if isinstance(p, LinePort):
                 span = abs(self.samples[i][-1] - self.samples[i][0])
-                if abs(gam[i].imag) * span < (KNOWN_SPAN if getattr(p, 'known_gamma', False) else 0.4):
+                if abs(gam[i].imag) * span < (KNOWN_SPAN if getattr(p, 'known_gamma', False) else FIT_SPAN):
                     self.low_span.append(p.name)
                     self.log.note(f"WARNING {f / 1e9:.2f} GHz port {p.name}: feed samples span only "
                                   f"{abs(gam[i].imag) * span:.2f} rad - wave separation unreliable "
