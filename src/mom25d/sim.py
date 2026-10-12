@@ -20,6 +20,7 @@ fan-distributed and enter through the same G_q interaction as the strip charges.
 from types import SimpleNamespace
 
 import numpy as np
+from .model import KNOWN_SPAN
 import shapely
 
 from .base import MU0, C0, EPS0, RWG, qform, combine, singular_moments, quad_pts, gram_matrix, \
@@ -645,6 +646,10 @@ class Simulation:
                 s = self.samples[i]
                 Ik = self.cut_current(I, i)
                 g = PlanarMoM.fit_gamma(Ik, abs(s[1] - s[0]))
+                gk = getattr(p, 'gamma_fn', None)
+                p.known_gamma = gk is not None and abs(gk(f).imag) * abs(s[-1] - s[0]) < 0.4
+                if p.known_gamma:
+                    g = gk(f)                                  # too short a span to fit gamma: the characterised one
                 a, b = PlanarMoM.fit_waves(Ik, s - p.ref, g)
                 M = np.stack([np.exp(-g * (s - p.ref)), np.exp(g * (s - p.ref))], 1)
                 # residual relative to the largest response of this port over all excitations (a mode
@@ -664,7 +669,7 @@ class Simulation:
         for i, p in enumerate(self.ports):
             if isinstance(p, LinePort):
                 span = abs(self.samples[i][-1] - self.samples[i][0])
-                if abs(gam[i].imag) * span < 0.4:
+                if abs(gam[i].imag) * span < (KNOWN_SPAN if getattr(p, 'known_gamma', False) else 0.4):
                     self.low_span.append(p.name)
                     self.log.note(f"WARNING {f / 1e9:.2f} GHz port {p.name}: feed samples span only "
                                   f"{abs(gam[i].imag) * span:.2f} rad - wave separation unreliable "

@@ -89,3 +89,21 @@ def test_solve_board_is_the_steps_it_wraps(boards):
     assert np.allclose(res.S, S) and res.names == info['names'] == ['P1', 'P2']
     assert res.solves == len(calls) and calls[-1][:2] == (res.solves, 5)
     assert np.abs(res.S).max() <= 1 + 1e-6 and np.abs(res.S - res.S.transpose(0, 2, 1)).max() < 1e-6
+
+
+def test_wave_ports_with_the_characterised_gamma(tmp_path):
+    """A 3 mm 50 ohm line on 1.6 mm FR4 characterises to ~50 ohm (a 16 mm test line gave 1.6 / 24 / 33 ohm), and
+    a thru keeps wave ports down to frequencies where its feed spans too little to fit gamma: the characterised
+    gamma takes over, and the line stays matched and lossless."""
+    import os, subprocess, sys
+    from mom25d.run import renorm, _zc
+    gen = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'examples', 'make_demo_board.py')
+    subprocess.check_call([sys.executable, gen, str(tmp_path / 'thru'), 'thru'], stdout=subprocess.DEVNULL)
+    b = Board(KiCadBoard(str(tmp_path / 'thru.kicad_pcb')), pos_file=str(tmp_path / 'thru-top.pos'), log=lambda *a: None)
+    m = BoardModel(b.to_dict(), port='wave', log=lambda *a: None)
+    sim = m.simulation(dmax=0.4e-3, fmin=0.2e9, fmax=6e9, verbose=False, wave_down_to=0.2e9)
+    assert all(abs(p.zc - 51) < 2 for p in sim.ports)
+    for f in (0.3e9, 1e9):
+        S = renorm(sim.sparams(f), _zc(sim, f), [50, 50])
+        assert all(p.known_gamma for p in sim.ports) == (f < 0.5e9)      # 1 GHz: span enough to fit gamma
+        assert abs(S[0, 0]) < 0.04 and abs(abs(S[1, 0]) - 1) < 0.01

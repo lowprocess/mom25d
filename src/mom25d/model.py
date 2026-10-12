@@ -22,6 +22,9 @@ from shapely.ops import unary_union
 MM = 1e-3
 
 
+KNOWN_SPAN = 0.1          # rad: the least span of a wave port's cuts at the lowest frequency, gamma known
+
+
 class PlanarModel:
     lumped = ()
 
@@ -113,11 +116,12 @@ class PlanarModel:
                 w, L = self._feed(g, c, d, step)
                 win, need = self._wave_window(w, L, step)
                 if win is not None and kind == 'auto' and fmin:
-                    # the wave fit needs the sample cuts to span >= 0.4 rad at the lowest frequency
+                    # fitting gamma too needs the cuts to span >= 0.4 rad at the lowest frequency; with gamma from
+                    # the line characterisation (characterize: gamma_fn) the two wave amplitudes need KNOWN_SPAN
                     er = self.stack.layers[k - 1].er
                     beta = 2 * np.pi * fmin * np.sqrt(0.5 * (er + 1)) / 299792458.0      # a lower bound
-                    if (win[2] - win[1]) * beta < 0.4:
-                        need = max(need, L - (win[2] - win[1]) + 0.4 / beta)
+                    if (win[2] - win[1]) * beta < KNOWN_SPAN:
+                        need = max(need, L - (win[2] - win[1]) + KNOWN_SPAN / beta)
                         win = None
                 if win is not None:
                     g0, s0, s1, pstep = win
@@ -188,6 +192,12 @@ class PlanarModel:
         from .geo import LinePort
         from .sim import line_char_xs, DiffPort, line_char_pair
         fs = np.linspace(max(fmin, fmax / 3), fmax, n)    # the fit is well conditioned here; Zc ~ flat
+        # the centre-fed line must keep the source's near field (a few widths and heights) out of the fit window:
+        # 16 mm for a 3 mm line on 1.6 mm FR4 gave Zc 1.6 / 24 / 33 ohm and beta below k0, 48 mm 48-51 ohm;
+        # a 0.38 mm line on 0.2 mm was right at 16 mm
+        from .base import C0
+        H = float(self.stack.z[-1])
+        length_for = lambda w: max(16e-3, 10 * (w + H))
         cache = {}
         for p in ports:
             if isinstance(p, DiffPort):
@@ -196,7 +206,8 @@ class PlanarModel:
                 pt = Point(*(0.5 * (a.c + b.c) + a.d * mid))
                 planes = self._planes_at(a.layer, pt, a.d, a.w)
                 gap = abs((a.c - b.c) @ a.t) - 0.5 * (a.w + b.w)
-                ge, ze, go, zo = line_char_pair(self.stack, a.layer, 0.5 * (a.w + b.w), gap, fs, planes=planes, dmax=dmax)
+                ge, ze, go, zo = line_char_pair(self.stack, a.layer, 0.5 * (a.w + b.w), gap, fs, planes=planes, dmax=dmax,
+                                                length=length_for(a.w + b.w + gap))
                 zd, zcm = 2 * zo.real, ze.real / 2
                 p.zd_fn = (lambda f, fs=fs, z=zd: np.interp(f, fs, z))
                 p.zc_fn = (lambda f, fs=fs, z=zcm: np.interp(f, fs, z))
@@ -212,16 +223,22 @@ class PlanarModel:
             key = (p.layer, round(p.w * 1e7), tuple(sorted((k, round(W * 1e5)) for k, W in planes.items())),
                    tuple((round(a * 1e6), round(b * 1e6)) for a, b in cop))
             if key not in cache:
-                g, z = line_char_xs(self.stack, p.layer, p.w, fs, planes=planes, coplanar=cop, dmax=dmax)
-                cache[key] = z.real
+                g, z = line_char_xs(self.stack, p.layer, p.w, fs, planes=planes, coplanar=cop, dmax=dmax,
+                                    length=length_for(p.w))
+                cache[key] = (z.real, g)
+                if np.any(np.abs(g.imag) < 0.95 * 2 * np.pi * fs / C0):       # slower than light: a failed fit
+                    self.notes.append(f"WARNING {p.name}: the line characterisation fit failed (beta below k0): "
+                                      f"Zc {', '.join(f'{v:.1f}' for v in z.real)} ohm is not reliable - lumped ports")
                 gaps = [min(abs(a), abs(b)) - p.w / 2 for a, b in cop]
                 log(f"  {p.name}: line on M{p.layer}, w={p.w * 1e3:.3f} mm, reference metal "
                     + (", ".join([f"M{k} ({W * 1e3:.1f} mm)" for k, W in planes.items()]
                                  + [f"coplanar GND, gap {gp * 1e3:.3f} mm" for gp in gaps]) or "ground only")
                     + ": Zc = " + ", ".join(f"{v:.2f}" for v in z.real) + " ohm")
-            zz = cache[key]
+            zz, gg = cache[key]
             p.zc_fn = (lambda f, fs=fs, zz=zz: np.interp(f, fs, zz))
             p.zc = float(zz[len(zz) // 2])
+            # gamma / f is nearly flat: interpolated (and held beyond the ends) for feeds too short to fit it
+            p.gamma_fn = (lambda f, fs=fs, gf=gg / fs: f * (np.interp(f, fs, gf.real) + 1j * np.interp(f, fs, gf.imag)))
 
     def simulation(self, dmax=0.3e-3, step=None, fmin=1e9, fmax=10e9, characterize=True, wave_down_to=None, **kw):
         """The Simulation of this model. wave_down_to (Hz): 'auto' ports become wave ports only where the feed
