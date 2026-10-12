@@ -342,6 +342,14 @@ class Simulation:
             # frequency, many via chains) and the refinement then costs more than a double LU (study in
             # kicad2ems docs/mom.md); mixed only where it saves the memory that makes the direct solver fit
             precision = 'double' if (not has_core or 18.0 * n * n + 0.9e9 <= 0.5 * available_memory()) else 'mixed'
+            if has_core and precision == 'double' and n > 3500 and gpu != 'off':
+                # with a GPU the complex64 LU runs there and the refinement uses the double Z on the host
+                # (fast.FastOperator._solve_hybrid, re-solved in double if it does not converge): 5.7 s a solve
+                # against 14.9 s on the via transition (13.5k unknowns, Radeon RX 7800 XT)
+                from .gpu import get_backend
+                g = get_backend(gpu)
+                if g is not None and g.fits(n) and 24.0 * n * n + 0.9e9 <= 0.5 * available_memory():
+                    precision = 'mixed'
         if precision == 'mixed' and not has_core:
             precision = 'double'
         self.precision = precision
@@ -485,6 +493,8 @@ class Simulation:
             Z[:self.Ne, :self.Ne] += zs * self._gram
         return 0.5 * (Z + Z.T)
 
+    VIA_TABLE_PAIRS = 64                 # via pairs of one span pair above which R comes from a table
+
     def _via_blocks(self, f, QF):
         """Via rows/columns: B (Ne x Nv) strip-via coupling, C (Nv x Nv) via-via (incl. elements in vias)."""
         w = 2 * np.pi * f
@@ -517,7 +527,10 @@ class Simulation:
                 groups.setdefault(((am, bm), (an, bn)), []).append((m, n, d))
         for (sm, sn), lst in groups.items():
             dd = np.array([d for _, _, d in lst])
-            vals = vk.R(sm, sn, dd) + vk.homog(sm, sn, dd)
+            # many pairs: the smooth remainder from a table (the SMA launch's 143k pairs took 24.6 s a solve of
+            # 26.8 for its via blocks); a few: exactly
+            rv = vk.R_table(sm, sn)(dd) if len(dd) > self.VIA_TABLE_PAIRS else vk.R(sm, sn, dd)
+            vals = rv + vk.homog(sm, sn, dd)
             for (m, n, _), val in zip(lst, vals):
                 C[m, n] += val
                 if n != m:

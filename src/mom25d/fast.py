@@ -604,12 +604,18 @@ class FastOperator:
             return self._solve_direct_numpy(f, E, block)
         self.setup(f, mode='direct')
         _, Sx = self.extra_blocks(f)
-        dt = np.complex64 if precision == 'mixed' else np.complex128
+        # mixed precision with a GPU: Z filled in double and kept on the host (24 N^2 bytes with the complex64
+        # copy the GPU factors), the refinement products dense: 5.7 s a solve on the via transition (13.5k
+        # unknowns) against 8.7 s with the sparse exact near field (its CSR build alone 3.1 s) and 14.9 s double
+        hybrid = precision == 'mixed' and self._gpu_for(N) is not None and self._fits(24.0 * N * N)
+        if hybrid and getattr(self, '_hybrid_failed', False):        # did not converge once: double from then on
+            precision, hybrid = 'double', False
+        dt = np.complex64 if precision == 'mixed' and not hybrid else np.complex128
         with sim.log.timer('direct fill', f"N={N}, {np.dtype(dt).name}, {self.core.num_threads()} threads"):
             Z = np.zeros((N, N), dt)
             (self.core.fill_far_c64 if dt == np.complex64 else self.core.fill_far)(Z, self.g, self.tb, self.w)
         with sim.log.timer('near-field correction'):
-            if precision == 'mixed':
+            if precision == 'mixed' and not hybrid:
                 # keep the exact near correction (sparse, double) for the refinement products
                 ri, ci, vv, qc = self.core.near_coo(self.g, self.tb, self.q, self.nP32, self.nQ32, self.w)
                 ok = ri >= 0
@@ -631,6 +637,8 @@ class FastOperator:
             np.add.at(Z, (Sc.row, Sc.col), Sc.data.astype(dt))
         import scipy.linalg as sla
         dsc = (1.0 / np.sqrt(np.abs(np.diagonal(Z)).astype(float) + 1e-300))
+        if hybrid:
+            return self._solve_hybrid(f, Z, dsc, E)
         gpu = None
         if precision == 'mixed' and getattr(sim, 'gpu', 'off') != 'off':
             from .gpu import get_backend
@@ -694,6 +702,57 @@ class FastOperator:
                          f"- solving in double precision")
             return self.solve_direct(f, E, block, precision='double')
         return X
+
+    def _gpu_for(self, N):
+        """The GPU backend when one is asked for (sim.gpu), available and the LU of N unknowns fits, else None."""
+        if getattr(self.sim, 'gpu', 'off') == 'off':
+            return None
+        from .gpu import get_backend
+        gpu = get_backend(self.sim.gpu)
+        return gpu if gpu is not None and gpu.fits(N) else None
+
+    def _fits(self, nbytes):
+        from .sim import available_memory
+        return nbytes + 0.9e9 <= 0.8 * available_memory()
+
+    def _solve_hybrid(self, f, Z, dsc, E):
+        """Mixed precision with the LU on the GPU: Z (double, host) equilibrated, its complex64 copy factored on
+        the GPU, GMRES on the double Z with that LU as the preconditioner; double precision on the CPU when the
+        refinement does not converge."""
+        import scipy.linalg as sla
+        sim = self.sim
+        gpu = self._gpu_for(Z.shape[0])
+        Z *= dsc[:, None]
+        Z *= dsc[None, :]
+        if not getattr(self, '_gpu_logged', False):
+            self._gpu_logged = True
+            sim.log.note(f"GPU: {gpu.device} via {gpu.name}, {gpu.mem_free() / 1e9:.1f} GB free: complex64 LU there, "
+                         f"double-precision refinement on the host")
+        with sim.log.timer('LU factor (GPU)', f"N={Z.shape[0]}, {gpu.name}"):
+            try:
+                gpu.factor(Z.astype(np.complex64))
+            except Exception as e:                          # driver / unsupported dtype: double on the CPU
+                sim.log.note(f"GPU LU failed ({type(e).__name__}: {e}) - factoring on the CPU in double")
+                gpu.release()
+                lu, piv = sla.lu_factor(Z.T, overwrite_a=True, check_finite=False)
+                return dsc[:, None] * sla.lu_solve((lu, piv), dsc[:, None] * E, trans=1, check_finite=False)
+        B = dsc[:, None] * E
+        with sim.log.timer('refinement (GMRES, dense double)'):
+            # 2 restarts at most: where the complex64 LU is too weak (many via chains: the SMA launch, 536 via
+            # unknowns) 300 iterations had not converged and cost 55 s, three times a double LU
+            Y, self.iters = gmres_batched(lambda V: Z @ V, B, M=lambda R: gpu.solve(R), rtol=self.mixed_tol,
+                                          restart=30, maxiter=2)
+            rel = np.linalg.norm(B - Z @ Y, axis=0) / np.maximum(np.linalg.norm(B, axis=0), 1e-300)
+        gpu.release()
+        sim.log.note(f"mixed precision (GPU): GMRES iterations per port {self.iters}")
+        if (rel > 100 * self.mixed_tol).any():
+            sim.log.note(f"mixed precision (GPU) did not converge at {f / 1e9:.4g} GHz (residual {rel.max():.1e}): "
+                         f"double precision from here on")
+            self._hybrid_failed = True
+            with sim.log.timer('LU factor', f"N={Z.shape[0]}"):
+                lu, piv = sla.lu_factor(Z.T, overwrite_a=True, check_finite=False)
+            Y = sla.lu_solve((lu, piv), B, trans=1, check_finite=False)
+        return dsc[:, None] * Y
 
     def _solve_direct_numpy(self, f, E, block=1024):
         """Same entries as the fast operator (centroid far field + exact near correction), written

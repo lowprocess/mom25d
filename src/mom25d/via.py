@@ -178,6 +178,7 @@ class ViaKernels:
             return self._gq[key]
         self.gq = gq
         rho = rho_max * np.linspace(0, 1, nrho) ** 2
+        self.rho_max = rho_max
         self.D = {}
         keys, specs = [], []
         for span in sorted(set(spans)):
@@ -203,6 +204,12 @@ class ViaKernels:
         for j in set(lm) & set(ln):
             spec = spec - 1j * self.w * MU0 * self.st.layers[j - 1].h / (kr2 - self.net.k2[j])
         return hankel(spec, self.kr, self.dk, rho)
+
+    def R_table(self, sm, sn, nrho=200):
+        """R(sm, sn, .) tabulated on the quadratic grid of the D tables (one Hankel transform of nrho points
+        instead of one per distance): for the many via pairs of a board, R being smooth."""
+        rho = self.rho_max * np.linspace(0, 1, nrho) ** 2
+        return Table1D(rho, self.R(sm, sn, rho), self.rho_max)
 
     def homog(self, sm, sn, rho):
         lm, ln = range(sm[0] + 1, sm[1] + 1), range(sn[0] + 1, sn[1] + 1)

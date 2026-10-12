@@ -130,3 +130,19 @@ def test_auto_without_gpu_is_silent_cpu(clean, S_cpu):
     assert mom25d_gpu.get_backend('auto') is None
     S = make_sim('auto').sparams(4e9)
     assert np.abs(S - S_cpu).max() < 1e-12
+
+
+def test_gpu_refinement_that_stalls_falls_back_to_double_for_good(clean, S_cpu):
+    """A GPU LU too weak to precondition (here: a wrong one) must not cost the sweep: the refinement stops after
+    two restarts, the frequency is solved in double, and so is every later one."""
+    mods, _ = fake_cupy()
+    for k, v in mods.items():
+        clean.setitem(sys.modules, k, v)
+    sim = make_sim('cupy')
+    gpu = mom25d_gpu.get_backend('cupy')
+    clean.setattr(type(gpu), 'solve', lambda self, R: np.asarray(R, complex) * 1e-3)   # a useless preconditioner
+    S = sim.sparams(4e9)
+    assert np.abs(S - S_cpu).max() < 1e-6 and sim.fast._hybrid_failed     # S_cpu: refined to 1e-6, this: double
+    n_gpu = sum(r[0] == 'LU factor (GPU)' for r in sim.log.records)
+    sim.sparams(4.5e9)
+    assert sum(r[0] == 'LU factor (GPU)' for r in sim.log.records) == n_gpu      # no GPU attempt any more

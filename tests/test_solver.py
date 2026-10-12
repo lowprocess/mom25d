@@ -32,6 +32,16 @@ def test_via_kernels_exact_in_air():
         assert abs(tot + phi - ref) / abs(ref) < 1e-4
 
 
+def test_via_via_table_matches_the_direct_transform():
+    """The tabulated via-via remainder (boards with many via pairs) against the transform at each distance."""
+    st = LayerStack([Layer(0.2e-3, 4.3), Layer(1.0e-3, 4.3), Layer(0.2e-3, 4.3)])
+    vk = ViaKernels(5e9, st, [(0, 3), (1, 3)], [1, 2, 3], 40e-3)
+    d = np.concatenate([[0.15e-3], np.geomspace(0.3e-3, 38e-3, 60)])
+    for sm, sn in (((0, 3), (0, 3)), ((0, 3), (1, 3))):
+        exact, tab = vk.R(sm, sn, d), vk.R_table(sm, sn)(d)
+        assert np.abs(tab - exact).max() < 1e-4 * np.abs(exact).max()
+
+
 def test_offplane_reduces_to_inplane_and_converges():
     from mom25d.base import make_mesh, RWG, singular_moments
     nodes, tris = make_mesh([(0, 0, 0.3e-3, 0.06e-3)], 0.15e-3, 0.03e-3)
