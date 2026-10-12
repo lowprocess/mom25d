@@ -60,12 +60,12 @@ def aaa(z, F, tol=1e-10, mmax=80):
     return r
 
 
-def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001, log=print):
+def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001, log=print, on_step=None):
     """
     solve(f) -> S (P x P).  Returns (f_grid, S_grid (ngrid, P, P), f_samples, S_samples, history): one dict per
     model after the first, solves (samples so far), change (max |dS| from the previous model, on the grid) at
     f_change (Hz), pred (how far the previous model was from the newest sample) and f_new (Hz: the next
-    frequency solved, None when the sweep stopped).
+    frequency solved, None when the sweep stopped). on_step(entry): called with each entry as it is made.
     Converged when, twice in a row, the models from the last two iterations agree to `tol` (max |dS|) on the
     grid and the model predicted the newest sample to `tol` before it was solved. (The model change alone can
     be zero while the model is still wrong: a sparse fit that the new sample does not alter.)
@@ -87,6 +87,8 @@ def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001,
             k = int(np.argmax(dif))
             hist.append(dict(solves=len(fs), change=float(dif[k]), f_change=float(grid[k]), pred=float(pred_err),
                              f_new=None))
+            if on_step:
+                on_step(dict(hist[-1], tol=tol))
             log(f"  AFS: {len(fs)} solves, max model change {dif[k]:.1e} at {grid[k] / 1e9:.3f} GHz, "
                 f"prediction error {pred_err:.1e}")
             ok = ok + 1 if dif[k] < tol and pred_err < tol else 0
