@@ -213,3 +213,32 @@ def test_far_field_of_a_dipole_over_ground():
         amp = np.sqrt(MU0 / EPS0) * k0 * 1e-6 / (4 * np.pi) * 2 * np.sin(k0 * H * np.cos(T))
         assert np.allclose(np.abs(Et), amp * np.abs(np.cos(T) * np.cos(P)), rtol=1e-6, atol=1e-12)
         assert np.allclose(np.abs(Ep), amp * np.abs(np.sin(P)), rtol=1e-6, atol=1e-12)
+
+
+def test_near_field_of_a_dipole_over_ground():
+    """mom25d.farfield.near_field (plane-wave spectrum, zero-padded FFT) against the exact field of a small x
+    dipole 2 mm above the ground and its image, on planes 0.5 and 1 mm above it."""
+    from types import SimpleNamespace as NS
+    from mom25d.farfield import near_field
+    f = 3e9
+    w, k = 2 * np.pi * f, 2 * np.pi * f / C0
+    H, h, n = 2e-3, 0.1e-3, 256
+    x = (np.arange(n) - n // 2) * h
+    Jx = np.zeros((n, n), complex)
+    Jx[n // 2, n // 2] = 1.0 / (h * h)                                  # moment 1 A m along x
+
+    def dipole(r, rs, p):
+        R = r - rs
+        Rm = np.linalg.norm(R, axis=-1)[..., None]
+        u, kr = R / Rm, k * Rm
+        g = np.exp(-1j * kr) / (4 * np.pi * Rm)
+        return -1j * w * MU0 * g * ((1 + 1 / (1j * kr) - 1 / kr ** 2) * p - (1 + 3 / (1j * kr) - 3 / kr ** 2) *
+                                    (u @ p)[..., None] * u)
+    pts = np.array([[0, 0], [1e-3, 0], [0, 1e-3], [2e-3, 1.5e-3]])
+    i = (pts / h).round().astype(int) + n // 2
+    p = np.array([1.0, 0, 0])
+    for d in (0.5e-3, 1e-3):
+        E = near_field(NS(st=LayerStack([Layer(H, 1.0)])), {1: (Jx, 0 * Jx)}, x, x, f, d)[i[:, 0], i[:, 1]]
+        obs = np.column_stack([pts, np.full(len(pts), H + d)])
+        exact = dipole(obs, np.array([0, 0, H]), p) + dipole(obs, np.array([0, 0, -H]), -p)
+        assert np.abs(E - exact).max() < 1e-3 * np.abs(exact).max()
