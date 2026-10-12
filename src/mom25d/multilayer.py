@@ -22,11 +22,11 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import numpy as np
-from scipy.special import jv, ellipk
+from scipy.special import ellipk
 from scipy.interpolate import CubicSpline
 
 from .base import (MU0, C0, EPS0, RWG, qform, combine, singular_moments, quad_pts,
-                    _BAR3, _W3, _BAR6, _W6, Port, PlanarMoM, renormalize)
+                    _BAR3, _W3, _BAR6, _W6, Port, PlanarMoM)
 
 
 # =============================================================================
@@ -324,31 +324,6 @@ def make_mesh_ml(rects, dmax, ncross, narrow, xlines=(), ylines=(), grade=1.0):
 # =============================================================================
 # Integrals between triangle sets (smooth kernels)
 # =============================================================================
-def smooth_block(Pa, wa, Pb, wb, gt, nb=24):
-    """
-    Moments of the tabulated smooth kernels between triangle sets a (observation) and b (source).
-    Returns A0, Axo, Ayo, Axs, Ays, Arr, Q0 with  Axo[p,q] = int int x_p G,  Axs[p,q] = int int x_q G.
-    """
-    na, nt = len(Pa), len(Pb)
-    out = [np.zeros((na, nt), complex) for _ in range(7)]
-    for p0 in range(0, na, nb):
-        sl = slice(p0, min(na, p0 + nb))
-        pa = Pa[sl][:, None, :, None, :]
-        pb = Pb[None, :, None, :, :]
-        rho = np.sqrt(((pa - pb) ** 2).sum(-1))
-        W = wa[sl][:, None, :, None] * wb[None, :, None, :]
-        GA, GQ = gt.AQ(rho)
-        GA, GQ = GA * W, GQ * W
-        out[0][sl] = GA.sum((2, 3))
-        out[1][sl] = (GA * pa[..., 0]).sum((2, 3))
-        out[2][sl] = (GA * pa[..., 1]).sum((2, 3))
-        out[3][sl] = (GA * pb[..., 0]).sum((2, 3))
-        out[4][sl] = (GA * pb[..., 1]).sum((2, 3))
-        out[5][sl] = (GA * (pa * pb).sum(-1)).sum((2, 3))
-        out[6][sl] = GQ.sum((2, 3))
-    return out
-
-
 # =============================================================================
 # Solver
 # =============================================================================

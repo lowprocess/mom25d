@@ -110,7 +110,7 @@ class SymFactor:
 
     def solve(self, R):
         """Z^-1 R (host, N or N x k), complex64 arithmetic on the device."""
-        xp, b = self.xp, self.b
+        xp = self.xp
         R = np.asarray(R)
         vec = R.ndim == 1
         Y = xp.asarray(R.reshape(self.N, -1).astype(np.complex64))

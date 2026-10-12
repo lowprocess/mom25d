@@ -29,7 +29,7 @@ import numpy as np
 from scipy.special import jv, kv
 from scipy.interpolate import CubicSpline
 
-from .base import MU0, C0, EPS0
+from .base import MU0, C0
 
 
 # =============================================================================

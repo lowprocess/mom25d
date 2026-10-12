@@ -23,7 +23,7 @@ import numpy as np
 from .model import KNOWN_SPAN
 import shapely
 
-from .base import MU0, C0, EPS0, RWG, qform, combine, singular_moments, quad_pts, gram_matrix, \
+from .base import MU0, EPS0, RWG, qform, combine, singular_moments, quad_pts, gram_matrix, \
     _BAR3, _W3, _BAR6, _W6, PlanarMoM
 from .multilayer import RunLog, GreenTableML, make_mesh_ml, MLPort
 from .geo import LinePort, port_from_axis, to_geometry, is_manhattan_rects, mesh_polygons
@@ -540,7 +540,6 @@ class Simulation:
         C = np.zeros((self.Nv, self.Nv), complex)
         spans = [(kb, kt) for _, kb, kt in self.chains]
         vk = ViaKernels(f, self.st, spans, self.layers, self.rho_max)
-        self.via_kernels = vk
         # fan-distributed end charges (G_q between triangles, same machinery as strips)
         if len(self.F):
             T = QF @ self.dF                                   # (Nt, Nv) potential of fan charges
@@ -741,87 +740,6 @@ class Simulation:
         I = I[:self.Ne]
         a = r.Aal @ I
         return r.cent[:, 0] * a - r.Bx @ I, r.cent[:, 1] * a - r.By @ I
-
-
-# =============================================================================
-# Thick conductors: two sheets + sidewall connectors
-# =============================================================================
-class Sheets(tuple):
-    """A metal 'layer' made of several interfaces (the two sheets of a thick conductor)."""
-    pass
-
-
-def thicken(stack, shapes, thickness, pitch=0.25e-3, radius=None):
-    """
-    Two-sheet model of thick conductors.
-      thickness : {interface k: t}   metal on k becomes sheets at k (bottom) and k+1 (top), a new
-                  layer of thickness t (permittivity of the layer above, or air on top) between them
-      pitch     : spacing of the sidewall connectors along every polygon boundary
-    Returns (stack2, shapes2, kmap, side_vias). kmap maps old interface -> new bottom sheet index;
-    use sheets(k) for ports / lumped elements that must act on both sheets.
-    """
-    from .multilayer import Layer, LayerStack
-    layers = [Layer(l.h, l.er, l.tand, l.name) for l in stack.layers]
-    top_er = stack.top_er
-    shapes2 = {k: list(v) for k, v in shapes.items()}
-    kmap = {k: k for k in range(stack.N + 1)}
-    sheets = {}
-    for k in sorted(thickness, reverse=True):
-        t = thickness[k]
-        if k == len(layers) and stack.top == 'open':
-            layers.append(Layer(t, top_er, 0.0, f"t{k}"))
-        else:
-            above = layers[k]
-            assert above.h > t, f"layer above M{k} thinner than the metal"
-            layers[k] = Layer(above.h - t, above.er, above.tand, above.name)
-            layers.insert(k, Layer(t, above.er, above.tand, f"t{k}"))
-        new = {}
-        for kk, v in shapes2.items():
-            new[kk + 1 if kk > k else kk] = v
-        new[k + 1] = list(shapes2[k])
-        shapes2 = new
-        for kk in list(kmap):
-            if kmap[kk] > k:
-                kmap[kk] += 1
-    st2 = LayerStack(layers, top=stack.top, top_er=top_er)
-    side = []
-    for k, t in thickness.items():
-        kb = kmap[k]
-        rad = radius or min(pitch / (2 * np.pi), t / 2)     # thin-wire model needs radius < length
-        g = to_geometry(shapes[k])
-        polys = [g] if g.geom_type == 'Polygon' else list(g.geoms)
-        for p in polys:
-            for ring in [p.exterior] + list(p.interiors):
-                n = max(4, int(np.ceil(ring.length / pitch)))
-                for s in np.arange(n) / n * ring.length:
-                    pt = ring.interpolate(s)
-                    side.append(Via(pt.x, pt.y, kb, kb + 1, radius=rad, name=f"side{k}", ring=False))
-        sheets[k] = Sheets((kb, kb + 1))
-    return st2, shapes2, kmap, side, sheets
-
-
-def line_char(stack, layer, w, freqs, length=20e-3, dmax=0.5e-3, ncross=6, metal=None, thick=None,
-              pitch=0.25e-3, verbose=False):
-    """Zc and gamma of a uniform strip (centre-fed long line); optional thickness and metal loss."""
-    L2, margin = length / 2, 2e-3
-    shapes = {layer: [(-L2, -w / 2, L2, w / 2)]}
-    st, vias, lay = stack, [], layer
-    if thick:
-        st, shapes, kmap, vias, sh = thicken(stack, shapes, {layer: thick}, pitch=pitch)
-        lay = sh[layer]
-    pR = LinePort(lay, (0, 0), (1, 0), w, L2 - margin, s0=1e-3, step=dmax, name='R')
-    pL = LinePort(lay, (0, 0), (-1, 0), w, L2 - margin, s0=1e-3, step=dmax, name='L')
-    sim = Simulation(st, shapes, [pR, pL], vias=vias, dmax=dmax, w_ref=w, ncross=ncross, metal=metal,
-                     verbose=verbose)
-    gam, zc = [], []
-    for f in freqs:
-        I = sim.currents(f, sim.excitation()[:, [0]])
-        IR, IL = sim.cut_current(I, 0), sim.cut_current(I, 1)
-        g = PlanarMoM.fit_gamma(np.hstack([IR, IL]), dmax)
-        A, B = PlanarMoM.fit_waves(IR, sim.samples[0], g)
-        Cp, Dp = PlanarMoM.fit_waves(IL, sim.samples[1], g)
-        gam.append(g); zc.append(1.0 / ((A[0] - B[0]) - (Cp[0] - Dp[0])))
-    return np.array(gam), np.array(zc), sim
 
 
 def line_char_xs(stack, layer, w, freqs, planes=None, coplanar=None, via_pitch=1e-3, via_r=0.15e-3,

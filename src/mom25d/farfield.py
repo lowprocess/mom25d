@@ -2,7 +2,7 @@
 mom25d.farfield - the far field of the surface currents of a solve: patterns, directivity, gain, efficiency.
 
     ff = far_field(sim, I, f, theta, phi)        # r E_theta, r E_phi (V) on a theta x phi grid (degrees)
-    p = antenna_powers(sim, I, f, port=0)          # accepted and radiated power, efficiency, directivity
+    U, prad = radiated(Eth, Eph, theta, phi)       # radiation intensity and radiated power
 
 Every metal interface radiates into the half-space above the stack (the top medium, top_er): its current
 J(x, y), Fourier transformed at k_rho = k_top sin(theta), gives the tangential E on the top interface through
@@ -81,17 +81,6 @@ def radiated(Eth, Eph, theta, phi, eta=ETA0):
 def port_power(sim, I, port=0):
     """Power accepted at a port driven by mom25d's 1 V source (excitation column `port`): Re(V I*) / 2."""
     return 0.5 * abs(np.real(np.conj(np.sum(sim.port_current(I, port)))))
-
-
-def antenna_powers(sim, I, f, port=0, step=2.0):
-    """Accepted and radiated power, efficiency (radiated / accepted: substrate loss and surface waves are loss)
-    and directivity of the currents I (driven at `port`), from the far field over the upper hemisphere."""
-    th, ph = np.arange(0, 90 + step / 2, step), np.arange(0, 360 + step / 2, step)
-    Eth, Eph = far_field(sim, I, f, th, ph)
-    U, prad = radiated(Eth, Eph, th, ph)
-    pacc = port_power(sim, I, port)
-    return dict(f=f, Pacc=pacc, Prad=prad, eff=prad / pacc if pacc > 0 else np.nan,
-                D=4 * np.pi * U.max() / prad if prad > 0 else np.nan, theta=th, phi=ph, U=U)
 
 
 def near_field(sim, layers_J, x, y, f, height, pad=2):

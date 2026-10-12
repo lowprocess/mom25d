@@ -71,7 +71,6 @@ class BLRFactor:
                         T[i][j] = ('D', M.astype(dtype))
                 else:
                     T[i][j] = ('D', M.astype(dtype))
-        self.mem_assembled = self._memory(T)
         # ---- right-looking tile LU with pivoting inside the diagonal tiles --------------------
         self.lu = [None] * nb
         for k in range(nb):

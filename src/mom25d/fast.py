@@ -18,7 +18,6 @@ from scipy import sparse
 from scipy.sparse.linalg import LinearOperator, gmres, splu
 from scipy.spatial import cKDTree
 
-from .base import _BAR3, _W3, _BAR6, _W6
 from .multilayer import GreenTableML
 from .sing import offplane_pairs
 
