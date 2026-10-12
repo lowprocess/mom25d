@@ -62,7 +62,10 @@ def aaa(z, F, tol=1e-10, mmax=80):
 
 def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001, log=print):
     """
-    solve(f) -> S (P x P).  Returns (f_grid, S_grid (ngrid, P, P), f_samples, S_samples, history).
+    solve(f) -> S (P x P).  Returns (f_grid, S_grid (ngrid, P, P), f_samples, S_samples, history): one dict per
+    model after the first, solves (samples so far), change (max |dS| from the previous model, on the grid) at
+    f_change (Hz), pred (how far the previous model was from the newest sample) and f_new (Hz: the next
+    frequency solved, None when the sweep stopped).
     Converged when, twice in a row, the models from the last two iterations agree to `tol` (max |dS|) on the
     grid and the model predicted the newest sample to `tol` before it was solved. (The model change alone can
     be zero while the model is still wrong: a sparse fit that the new sample does not alter.)
@@ -82,7 +85,8 @@ def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001,
         if prev is not None:
             dif = np.abs(Mg - prev).max(1)
             k = int(np.argmax(dif))
-            hist.append((len(fs), dif[k]))
+            hist.append(dict(solves=len(fs), change=float(dif[k]), f_change=float(grid[k]), pred=float(pred_err),
+                             f_new=None))
             log(f"  AFS: {len(fs)} solves, max model change {dif[k]:.1e} at {grid[k] / 1e9:.3f} GHz, "
                 f"prediction error {pred_err:.1e}")
             ok = ok + 1 if dif[k] < tol and pred_err < tol else 0
@@ -97,6 +101,8 @@ def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001,
         if min(abs(np.array(fs) - fnew)) < (fmax - fmin) / (4 * ngrid):
             gaps = np.diff(np.sort(fs)); i = int(np.argmax(gaps)); fnew = np.sort(fs)[i] + gaps[i] / 2
         prev = Mg
+        if hist:
+            hist[-1]['f_new'] = float(fnew)
         Snew = solve(fnew)
         pred_err = float(np.abs(model(np.array([fnew / sc]))[0] - Snew.ravel()).max())
         fs.append(fnew); Ss.append(Snew)

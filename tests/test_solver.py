@@ -117,7 +117,9 @@ def test_afs_does_not_stop_on_a_model_that_ignores_new_samples(monkeypatch):
     _, _, fs, _, hist = afs.adaptive_sweep(lambda f: seen.append(f) or truth(f), 1e9, 6e9, n0=5, tol=2e-3,
                                            max_points=12, ngrid=401, log=lambda *a: None)
     assert len(fs) == 12                                            # ran to the cap: never converged
-    assert all(change < 2e-3 for _, change in hist[2:])             # although the model stopped changing
+    assert all(h['change'] < 2e-3 for h in hist[2:])                # although the model stopped changing
+    assert [h['solves'] for h in hist] == list(range(6, 13)) and hist[-1]['f_new'] is None
+    assert all(h['f_new'] in seen for h in hist[:-1])
 
 
 def test_fast_operators_match_dense():

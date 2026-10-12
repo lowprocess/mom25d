@@ -43,7 +43,8 @@ def _zc(sim, f):
 def solve_band(sim, fmin, fmax, points=401, zref=50.0, linear=None, afs_tol=2e-3, max_solves=40, log=print,
                keep_mid=False, progress=None):
     """S-parameters of sim over fmin..fmax (Hz): returns (f, S (nf, n, n), info dict with solves, seconds,
-    zref and the solved frequencies). max_solves: cap of the adaptive sweep. keep_mid: one extra solve at
+    zref, the solved frequencies, and afs / afs_tol: the adaptive sweep's history (afs.adaptive_sweep) and
+    tolerance). max_solves: cap of the adaptive sweep. keep_mid: one extra solve at
     mid-band keeping the currents (sim.last). progress(solves, at most, f): after each EM solve."""
     t0 = time.time()
     zr = out_refs(sim, zref)
@@ -61,8 +62,9 @@ def solve_band(sim, fmin, fmax, points=401, zref=50.0, linear=None, afs_tol=2e-3
         S = np.array([solve(fi) for fi in f])
     else:
         from .afs import adaptive_sweep
-        f, S, fs, _, _ = adaptive_sweep(solve, fmin, fmax, tol=afs_tol, ngrid=points, max_points=max_solves, log=log)
+        f, S, fs, _, hist = adaptive_sweep(solve, fmin, fmax, tol=afs_tol, ngrid=points, max_points=max_solves,
+                                           log=log)
     if keep_mid:
         sim.sparams(fs[len(fs) // 2], keep=True)
     return f, S, dict(solves=len(fs), seconds=time.time() - t0, zref=zr.tolist(), solved=list(map(float, fs)),
-                      names=[p.name for p in sim.ports])
+                      names=[p.name for p in sim.ports], afs=[] if linear else hist, afs_tol=afs_tol)

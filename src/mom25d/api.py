@@ -36,6 +36,8 @@ class Result:
     seconds: float                  # model, mesh, port characterisation and sweep
     core: bool                      # the compiled core was used
     notes: list = field(default_factory=list)
+    afs: list = field(default_factory=list)     # the adaptive sweep's history (afs.adaptive_sweep), one dict a model
+    afs_tol: float = None                       # its tolerance (max |dS|)
     model: object = None            # the BoardModel
     sim: object = None              # the Simulation
 
@@ -77,4 +79,5 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
                   unknowns=int(sim.Ne + sim.Nv), triangles=int(len(sim.rwg.tris)), solver=sim.solver,
                   precision=getattr(sim, 'precision', 'double'), mesher=mesher, solves=int(info['solves']),
                   solved=list(info['solved']), seconds=time.time() - t0, core=_core is not None,
-                  notes=list(model.notes) + list(sim.log.notes), model=model, sim=sim)
+                  notes=list(model.notes) + list(sim.log.notes), model=model, sim=sim,
+                  afs=list(info.get('afs', [])), afs_tol=info.get('afs_tol'))
