@@ -68,13 +68,25 @@ def j0_matrix(rho, kr):
     return J
 
 
+def j0_sum(rho, kr, W):
+    """sum_k J0(rho_i kr_k) W[s, k]: (nspec, len(rho)). The compiled core sums the real part of the contour
+    without the Bessel matrix (OpenMP); the lifted part, complex kr, is NumPy's (j0_matrix)."""
+    from .fast import _core
+    rho, W = np.atleast_1d(np.asarray(rho, float)), np.atleast_2d(np.asarray(W, complex))
+    if _core is None or not hasattr(_core, 'hankel_real'):
+        return (j0_matrix(rho, kr) @ W.T).T
+    real = np.abs(kr.imag) < 1e-300
+    out = _core.hankel_real(rho, np.ascontiguousarray(kr.real[real]), np.ascontiguousarray(W[:, real]))
+    if (~real).any():
+        out = out + (jv(0, rho[:, None] * kr[None, ~real]) @ W[:, ~real].T).T
+    return out
+
+
 def hankel(spec, kr, dk, rho):
     """(1/2pi) int spec(kr) J0(kr rho) kr dkr  for an array of rho; spec may be (npts,) or (nspec, npts)."""
-    J = j0_matrix(rho, kr)
     spec = np.asarray(spec)
-    if spec.ndim == 1:
-        return (J @ (spec * kr * dk)) / (2 * np.pi)
-    return (J @ (spec * (kr * dk)[None, :]).T).T / (2 * np.pi)
+    out = j0_sum(rho, kr, np.atleast_2d(spec) * (kr * dk)[None, :]) / (2 * np.pi)
+    return out[0] if spec.ndim == 1 else out
 
 
 class Table1D:

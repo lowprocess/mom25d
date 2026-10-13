@@ -244,3 +244,74 @@ def test_near_field_of_a_dipole_over_ground():
         obs = np.column_stack([pts, np.full(len(pts), H + d)])
         exact = dipole(obs, np.array([0, 0, H]), p) + dipole(obs, np.array([0, 0, -H]), -p)
         assert np.abs(E - exact).max() < 1e-3 * np.abs(exact).max()
+
+
+def test_new_core_kernels_match_numpy():
+    """near_pairs, hankel_real (j0_sum), fan_q and scale_c64 of the compiled core against their NumPy versions."""
+    core = pytest.importorskip('mom25d._core')
+    from shapely.geometry import box, Point
+    from scipy.spatial import cKDTree
+    from mom25d.via import j0_sum, j0_matrix
+    st = LayerStack([Layer(0.2e-3, 4.3, 0.02), Layer(0.2e-3, 4.3, 0.02)])
+    w, L = 0.35e-3, 8e-3
+    geo2 = [box(-L / 2, -w / 2, L / 2, w / 2), Point(L / 2, 0).buffer(0.25e-3)]
+    geo1 = [box(-L / 2, -2e-3, L / 2 + 1e-3, 2e-3).difference(Point(L / 2, 0).buffer(0.5e-3))]
+    sim = Simulation(st, {1: geo1, 2: geo2}, [ViaPort(Via(-L / 2, 0, 1, 2, 0.1e-3)), ViaPort(Via(L / 2, 0, 0, 2, 0.1e-3))],
+                     dmax=0.4e-3, dmax_layer={1: 0.6e-3}, w_ref={2: w, 1: 1e-3}, solver='direct', verbose=False)
+    fo, r = sim.fast, sim.rwg
+    # near pairs: the KD-tree + np.unique of before, the same pairs in the same order
+    size = sim.tri_size
+    lists = cKDTree(r.cent).query_ball_point(r.cent, fo.near_fac * size)
+    P = np.concatenate([np.full(len(q), p) for p, q in enumerate(lists)])
+    Q = np.concatenate([np.asarray(q, int) for q in lists])
+    key = np.unique(np.concatenate([P * len(size) + Q, Q * len(size) + P]))
+    P, Q = key // len(size), key % len(size)
+    dz = np.abs(st.z[fo.layer_of_tri[P]] - st.z[fo.layer_of_tri[Q]])
+    keep = np.linalg.norm(r.cent[P] - r.cent[Q], axis=1) ** 2 + dz ** 2 < (fo.near_fac * np.maximum(size[P], size[Q])) ** 2
+    assert np.array_equal(fo.nP, P[keep]) and np.array_equal(fo.nQ, Q[keep])
+    # the Sommerfeld sums: a contour lifted at the start, real after it
+    t = np.linspace(0, 2e4, 3000)
+    kr = t + 1j * np.where(t < 500, 50 * np.sin(np.pi * t / 500), 0.0)
+    rho = np.linspace(0, 5e-3, 41)
+    W = np.random.default_rng(0).normal(size=(2, len(kr))) * (1 + 0.3j)
+    ref = (j0_matrix(rho, kr) @ W.T).T
+    assert np.abs(j0_sum(rho, kr, W) - ref).max() < 1e-12 * np.abs(ref).max()
+    # the fan columns
+    fo.setup(4e9, mode='sparse')
+    assert len(sim.F)
+    Qc = fo._fan_columns()
+    keep_core, fo.core = fo.core, None
+    Qp = fo._fan_columns()
+    fo.core = keep_core
+    assert np.abs(Qc - Qp).max() < 1e-12 * np.abs(Qp).max()
+    # Z <- D Z D and its complex64 copy
+    Z = np.random.default_rng(1).normal(size=(50, 50)) + 1j * np.random.default_rng(2).normal(size=(50, 50))
+    d = np.random.default_rng(3).uniform(0.5, 2, 50)
+    Zr = Z * d[:, None] * d[None, :]
+    Z64 = core.scale_c64(Z, d)
+    assert np.allclose(Z, Zr) and Z64.dtype == np.complex64 and np.allclose(Z64, Zr, rtol=1e-6)
+
+
+def test_core_choice():
+    """core='compiled': the core's direct solver for a small board too (auto: NumPy's dense one there);
+    use_core('python'): no compiled kernels; the answers agree."""
+    pytest.importorskip('mom25d._core')
+    from shapely.geometry import box, Point
+    from mom25d import fast
+    w, h, L = 0.35e-3, 0.2e-3, 10e-3
+    st = LayerStack([Layer(h, 4.3, 0.02)])
+    geo = [box(-L / 2, -w / 2, L / 2, w / 2), Point(-L / 2, 0).buffer(0.25e-3), Point(L / 2, 0).buffer(0.25e-3)]
+    mk = lambda core: Simulation(st, {1: geo}, [ViaPort(Via(-L / 2, 0, 0, 1, 0.1e-3), 54.0),
+                                                ViaPort(Via(L / 2, 0, 0, 1, 0.1e-3), 54.0)],
+                                 dmax=0.3e-3, w_ref=w, solver='auto', core=core, verbose=False)
+    auto, comp = mk('auto'), mk('compiled')
+    assert auto.solver == 'dense' and comp.solver == 'direct'
+    assert np.abs(auto.sparams(4e9) - comp.sparams(4e9)).max() < 0.01
+    prev = fast.use_core('python')
+    try:
+        assert fast._core is None and mk('auto').solver == 'dense'
+    finally:
+        fast.set_core(prev)
+    assert fast._core is not None
+    with pytest.raises(ValueError):
+        fast.use_core('gpu')

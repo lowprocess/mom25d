@@ -8,6 +8,11 @@
 //                   off-plane and image parts + quadrature of the tabulated rest), scattered into a
 //                   dense Z (atomic adds), into a y = dZ x product, or returned as COO triplets
 //   offplane_pairs: analytic 1/sqrt(rho^2+d^2) moments for pair lists (validation / reuse)
+//   near_pairs    : the near triangle pairs (a grid search; the KD-tree + np.unique of fast.py, same order)
+//   hankel_real   : sum_k J0(rho_i kr_k) W[s, k] over the real part of a Sommerfeld contour, without the
+//                   (n_rho x n_k) Bessel matrix (the Green tables and the via kernels)
+//   scale_c64     : Z <- D Z D (equilibration) and its complex64 copy, one pass (the GPU LU's input)
+//   fan_q         : G_q moments between every triangle and the via fan triangles (centroid rule)
 //
 // Everything mirrors the NumPy implementation in mom25d_fast.py (same tables and conventions),
 // which stays the fallback when this module is not built.
@@ -18,6 +23,8 @@
 #include <vector>
 #include <algorithm>
 #include <stdexcept>
+#include <math.h>
+#include <cstdint>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -507,6 +514,133 @@ int num_threads() {
 #endif
 }
 
+// ---------------------------------------------------------------------------------------------
+// near triangle pairs: rho^2 + dz^2 < (fac * max(size_p, size_q))^2, sorted by (p, q) - the set and the
+// order of fast.py's KD-tree ball queries, symmetrised with np.unique and filtered
+// ---------------------------------------------------------------------------------------------
+py::tuple near_pairs(arr<double> cent, arr<double> size, arr<double> z, double fac) {
+    const int Nt = (int)size.shape(0);
+    const double *c = cent.data(), *sz = size.data(), *zz = z.data();
+    double smax = 0, x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
+    for (int t = 0; t < Nt; ++t) {
+        smax = std::max(smax, sz[t]);
+        x0 = std::min(x0, c[2 * t]); x1 = std::max(x1, c[2 * t]);
+        y0 = std::min(y0, c[2 * t + 1]); y1 = std::max(y1, c[2 * t + 1]);
+    }
+    double cell = std::max(fac * smax, 1e-12);
+    long nx = std::max(1L, (long)((x1 - x0) / cell) + 1), ny = std::max(1L, (long)((y1 - y0) / cell) + 1);
+    while (nx * ny > 4L * Nt + 16) { cell *= 1.5; nx = (long)((x1 - x0) / cell) + 1; ny = (long)((y1 - y0) / cell) + 1; }
+    std::vector<long> cellof(Nt), start(nx * ny + 1, 0), order(Nt);
+    for (int t = 0; t < Nt; ++t) {
+        long i = std::min(nx - 1, (long)((c[2 * t] - x0) / cell)), j = std::min(ny - 1, (long)((c[2 * t + 1] - y0) / cell));
+        cellof[t] = i * ny + j; start[cellof[t] + 1]++;
+    }
+    for (long k = 0; k < nx * ny; ++k) start[k + 1] += start[k];
+    { std::vector<long> fill(start.begin(), start.end() - 1);
+      for (int t = 0; t < Nt; ++t) order[fill[cellof[t]]++] = t; }
+    const long reach = (long)std::ceil(fac * smax / cell);
+    std::vector<std::vector<int>> nb(Nt);
+    {
+        py::gil_scoped_release nogil;
+#pragma omp parallel for schedule(dynamic, 64)
+        for (int p = 0; p < Nt; ++p) {
+            long ci = cellof[p] / ny, cj = cellof[p] % ny;
+            std::vector<int> &out = nb[p];
+            for (long i = std::max(0L, ci - reach); i <= std::min(nx - 1, ci + reach); ++i)
+                for (long j = std::max(0L, cj - reach); j <= std::min(ny - 1, cj + reach); ++j)
+                    for (long k = start[i * ny + j]; k < start[i * ny + j + 1]; ++k) {
+                        int q = (int)order[k];
+                        double dx = c[2 * p] - c[2 * q], dy = c[2 * p + 1] - c[2 * q + 1], dz = zz[p] - zz[q];
+                        double R = fac * std::max(sz[p], sz[q]);
+                        if (dx * dx + dy * dy + dz * dz < R * R) out.push_back(q);
+                    }
+            std::sort(out.begin(), out.end());
+        }
+    }
+    size_t n = 0;
+    for (auto &v : nb) n += v.size();
+    py::array_t<int64_t> P(n), Q(n);
+    int64_t *pp = P.mutable_data(), *qq = Q.mutable_data();
+    size_t k = 0;
+    for (int p = 0; p < Nt; ++p)
+        for (int q : nb[p]) { pp[k] = p; qq[k] = q; ++k; }
+    return py::make_tuple(P, Q);
+}
+
+// ---------------------------------------------------------------------------------------------
+// out[s, i] = sum_k J0(rho_i kr_k) W[s, k] for real kr (glibc's j0), rho-parallel
+// ---------------------------------------------------------------------------------------------
+py::array_t<cd> hankel_real(arr<double> rho, arr<double> kr, arr<cd> W) {
+    const int nr = (int)rho.shape(0), nk = (int)kr.shape(0), ns = (int)W.shape(0);
+    if ((int)W.shape(1) != nk) throw std::invalid_argument("hankel_real: W must be (nspec, len(kr))");
+    py::array_t<cd> out({ns, nr});
+    cd *o = out.mutable_data();
+    const double *r = rho.data(), *k = kr.data();
+    const cd *w = W.data();
+    {
+        py::gil_scoped_release nogil;
+#pragma omp parallel
+        {
+            std::vector<cd> acc(ns);
+#pragma omp for schedule(static)
+            for (int i = 0; i < nr; ++i) {
+                std::fill(acc.begin(), acc.end(), cd(0));
+                for (int m = 0; m < nk; ++m) {
+                    double j = ::j0(r[i] * k[m]);
+                    for (int s = 0; s < ns; ++s) acc[s] += j * w[(size_t)s * nk + m];
+                }
+                for (int s = 0; s < ns; ++s) o[(size_t)s * nr + i] = acc[s];
+            }
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Z <- diag(d) Z diag(d) in place, and its complex64 copy (one pass over the matrix, row-parallel)
+// ---------------------------------------------------------------------------------------------
+py::array_t<cf> scale_c64(py::array_t<cd, py::array::c_style> Z, arr<double> d) {
+    auto b = Z.request();
+    const size_t n = b.shape[0], m = b.shape[1];
+    if ((size_t)d.shape(0) != n || n != m) throw std::invalid_argument("scale_c64: Z square, d its size");
+    cd *z = (cd *)b.ptr;
+    const double *dd = d.data();
+    py::array_t<cf> out({n, m});
+    cf *o = out.mutable_data();
+    {
+        py::gil_scoped_release nogil;
+#pragma omp parallel for schedule(static)
+        for (long i = 0; i < (long)n; ++i) {
+            cd *zr = z + (size_t)i * m; cf *orow = o + (size_t)i * m;
+            for (size_t j = 0; j < m; ++j) { zr[j] *= dd[i] * dd[j]; orow[j] = cf(zr[j]); }
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// G_q (centroid rule, singular parts added) x area_t x area_f between every triangle t and fan triangle f
+// ---------------------------------------------------------------------------------------------
+py::array_t<cd> fan_q(py::dict geom, py::dict tabs, arr<int> F) {
+    MeshHold mh(geom); TabHold th(tabs);
+    const Mesh &g = mh.m; const Tables &tb = th.t;
+    const int Nt = g.Nt, nf = (int)F.shape(0);
+    const int *f = F.data();
+    py::array_t<cd> out({Nt, nf});
+    cd *o = out.mutable_data();
+    {
+        py::gil_scoped_release nogil;
+#pragma omp parallel for schedule(static)
+        for (int t = 0; t < Nt; ++t)
+            for (int j = 0; j < nf; ++j) {
+                cd ga, gq;
+                tb.kern(g.lt[t], g.lt[f[j]], dist(g.cent, t, f[j]), ga, gq);
+                o[(size_t)t * nf + j] = gq * (g.area[t] * g.area[f[j]]);
+            }
+    }
+    return out;
+}
+
 PYBIND11_MODULE(_core, m) {
     m.doc() = "compiled kernels for mom25d";
     m.def("fill_far", &fill_far_t<cd>, "far-field entries into a complex128 Z");
@@ -519,4 +653,8 @@ PYBIND11_MODULE(_core, m) {
     m.def("near_matvec", &near_matvec);
     m.def("near_coo", &near_coo);
     m.def("num_threads", &num_threads);
+    m.def("near_pairs", &near_pairs, "near triangle pairs (sorted by p, q)");
+    m.def("hankel_real", &hankel_real, "sum_k J0(rho kr_k) W[s, k] for real kr");
+    m.def("scale_c64", &scale_c64, "Z <- D Z D in place, and its complex64 copy");
+    m.def("fan_q", &fan_q, "G_q moments between every triangle and the fan triangles");
 }

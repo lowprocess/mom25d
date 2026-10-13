@@ -21,13 +21,38 @@ from scipy.spatial import cKDTree
 from .multilayer import GreenTableML
 from .sing import offplane_pairs
 
+import os as _os
 try:                                    # optional compiled kernels (python -m mom25d.core.build)
-    import os as _os
-    from . import _core
-    if _os.environ.get('MOM25D_NO_CORE'):
-        _core = None
+    from . import _core as _built
 except ImportError:
-    _core = None
+    _built = None
+_core = None if _os.environ.get('MOM25D_NO_CORE') else _built
+
+
+def use_core(mode='auto'):
+    """Which kernels mom25d uses from now on: 'auto' (the compiled core if built, unless MOM25D_NO_CORE is set),
+    'compiled' (the core: RuntimeError if it is not built) or 'python' (NumPy). Returns the previous module (or
+    None), for set_core to put back."""
+    global _core
+    prev = _core
+    if mode == 'python':
+        _core = None
+    elif mode == 'compiled':
+        if _built is None:
+            raise RuntimeError("mom25d's compiled core is not built (python -m mom25d.core.build): it cannot be "
+                               "chosen; 'python' or 'auto' run on NumPy")
+        _core = _built
+    elif mode == 'auto':
+        _core = None if _os.environ.get('MOM25D_NO_CORE') else _built
+    else:
+        raise ValueError(f"core: auto, compiled or python, not {mode!r}")
+    return prev
+
+
+def set_core(module):
+    """Put back what use_core returned."""
+    global _core
+    _core = module
 
 
 # =============================================================================
@@ -211,8 +236,15 @@ class FastOperator:
     # ---- near pairs (geometry only) ---------------------------------------------------------------
     def _near_pairs(self):
         sim, r = self.sim, self.sim.rwg
-        tree = cKDTree(r.cent)
         size = sim.tri_size
+        if _core is not None and hasattr(_core, 'near_pairs'):     # the same pairs, in the same order
+            P, Q = _core.near_pairs(np.ascontiguousarray(r.cent, float), np.ascontiguousarray(size, float),
+                                    np.ascontiguousarray(sim.st.z[self.layer_of_tri], float), float(self.near_fac))
+            self.nP, self.nQ = P, Q
+            sim.log.note(f"fast solver: {len(self.nP)} near triangle pairs "
+                         f"({len(self.nP) / len(size):.0f} per triangle)")
+            return
+        tree = cKDTree(r.cent)
         P, Q = [], []
         rad = self.near_fac * size
         lists = tree.query_ball_point(r.cent, rad)
@@ -361,13 +393,16 @@ class FastOperator:
         sim, r = self.sim, self.sim.rwg
         F = sim.F
         lt = self.layer_of_tri
-        QF = np.zeros((len(r.tris), len(F)), complex)
-        for j, q in enumerate(F):
-            rho = np.linalg.norm(r.cent - r.cent[q], axis=1)
-            for a in self.layers:
-                m = lt == a
-                _, GQ = self._kern(a, lt[q], rho[m])
-                QF[m, j] = GQ * r.area[m] * r.area[q]
+        if self.core is not None and hasattr(self.core, 'fan_q') and getattr(self, 'tb', None) is not None:
+            QF = self.core.fan_q(self.g, self.tb, np.asarray(F, np.int32))           # compiled, OpenMP
+        else:
+            QF = np.zeros((len(r.tris), len(F)), complex)
+            for j, q in enumerate(F):
+                rho = np.linalg.norm(r.cent - r.cent[q], axis=1)
+                for a in self.layers:
+                    m = lt == a
+                    _, GQ = self._kern(a, lt[q], rho[m])
+                    QF[m, j] = GQ * r.area[m] * r.area[q]
         # exact correction for near pairs only (same split as the rest of the operator)
         pos = {q: j for j, q in enumerate(F)}
         sel = np.isin(self.nQ, F)
@@ -827,15 +862,20 @@ class FastOperator:
         import scipy.linalg as sla
         sim = self.sim
         gpu = self._gpu_for(Z.shape[0])
-        Z *= dsc[:, None]
-        Z *= dsc[None, :]
+        if self.core is not None and hasattr(self.core, 'scale_c64') and Z.dtype == complex and Z.flags.c_contiguous:
+            Z64 = self.core.scale_c64(Z, np.ascontiguousarray(dsc, float))
+        else:
+            Z *= dsc[:, None]
+            Z *= dsc[None, :]
+            Z64 = None
         if not getattr(self, '_gpu_logged', False):
             self._gpu_logged = True
             sim.log.note(f"GPU: {gpu.device} via {gpu.name}, {gpu.mem_free() / 1e9:.1f} GB free: complex64 LU there, "
                          f"double-precision refinement on the host")
         with sim.log.timer('LU factor (GPU)', f"N={Z.shape[0]}, {gpu.name}"):
             try:
-                gpu.factor(Z.astype(np.complex64))
+                gpu.factor(Z.astype(np.complex64) if Z64 is None else Z64)
+                del Z64
             except Exception as e:                          # driver / unsupported dtype: double on the CPU
                 sim.log.note(f"GPU LU failed ({type(e).__name__}: {e}) - factoring on the CPU in double")
                 gpu.release()

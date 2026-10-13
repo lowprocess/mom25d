@@ -43,7 +43,8 @@ class Result:
 
 
 def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=False, mesher='auto', metal=None,
-                ground=None, max_solves=60, afs_tol=5e-3, log=print, progress=None, tiled='auto', on_step=None):
+                ground=None, max_solves=60, afs_tol=5e-3, log=print, progress=None, tiled='auto', on_step=None,
+                core='auto'):
     """S-parameters of a board (a <name>_board.json path, or its content) on `freq` (Hz).
 
     dmax (m): largest cell along the copper; layers whose metal covers more than half the board (planes) get
@@ -52,11 +53,10 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     (lumped). pairs: P<n>+ / P<n>- ports as one mixed-mode port. metal: a sim.Metal (conductor loss), or None
     (lossless). log: lines of progress (the adaptive sweep's); progress(solves, max_solves, f): after each
     EM solve. tiled: 'auto' | 'on' | 'off', the tiled GPU solver (sim.memory_plan). on_step(entry): after each
-    model of the adaptive sweep (its change and prediction error, afs.adaptive_sweep)."""
-    from .board import BoardModel
-    from .fast import _core
-    from .geo import LinePort
-    from .run import solve_band
+    model of the adaptive sweep (its change and prediction error, afs.adaptive_sweep). core: 'auto' (the
+    compiled core where built; NumPy's dense solver for small boards), 'compiled' (the core for every size) or
+    'python' (NumPy only), fast.use_core."""
+    from . import fast
     name = os.path.basename(board) if isinstance(board, str) else 'board'
     if isinstance(board, str):
         with open(board) as fh:
@@ -64,11 +64,25 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     freq = np.asarray(freq, float)
     fmin, fmax = float(freq[0]), float(freq[-1])
     t0 = time.time()
+    prev = fast.use_core(core)
+    try:
+        return _solve_board(board, freq, name, fmin, fmax, t0, dmax, plane_factor, port, pairs, mesher, metal,
+                            ground, max_solves, afs_tol, log, progress, tiled, on_step, core)
+    finally:
+        fast.set_core(prev)
+
+
+def _solve_board(board, freq, name, fmin, fmax, t0, dmax, plane_factor, port, pairs, mesher, metal, ground,
+                 max_solves, afs_tol, log, progress, tiled, on_step, core):
+    from .board import BoardModel
+    from .fast import _core
+    from .geo import LinePort
+    from .run import solve_band
     model = BoardModel(board, ground=ground, port=port, pairs=pairs, log=log)
     planes = {k: plane_factor * dmax for k, gs in model.shapes.items()
               if sum(g.area for g in gs) > 0.5 * model.outline_area}
     sim = model.simulation(dmax=dmax, dmax_layer=planes, fmin=fmin, fmax=fmax, solver='auto', verbose=False,
-                           wave_down_to=fmin, mesher=mesher, title=name, metal=metal, tiled=tiled)
+                           wave_down_to=fmin, mesher=mesher, title=name, metal=metal, tiled=tiled, core=core)
     f, S, info = solve_band(sim, fmin, fmax, points=len(freq), zref=model.port_z0, max_solves=max_solves,
                             afs_tol=afs_tol, log=log, progress=progress, on_step=on_step)
     if len(f) != len(freq) or not np.allclose(f, freq):              # the sweep's grid onto the requested one

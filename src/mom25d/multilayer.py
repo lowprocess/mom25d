@@ -236,10 +236,8 @@ class GreenTableML:
             e = 2 * np.pi * np.exp(-kr * self.d) / kr
             GA, Gq = GA - self.cA * e, Gq - self.cq * e
         rho = rho_max * np.linspace(0, 1, nrho) ** 2
-        from .via import j0_matrix
-        J = j0_matrix(rho, kr)
-        dA = J @ (GA * kr * dk) / (2 * np.pi)
-        dQ = J @ (Gq * kr * dk) / (2 * np.pi)
+        from .via import j0_sum
+        dA, dQ = j0_sum(rho, kr, np.stack([GA * kr * dk, Gq * kr * dk])) / (2 * np.pi)
         self.rho = np.linspace(0, rho_max, nfine)
         self.A_rest = CubicSpline(rho, dA)(self.rho)
         self.Q_rest = CubicSpline(rho, dQ)(self.rho)

@@ -221,13 +221,14 @@ class Simulation:
     def __init__(self, stack, shapes, ports=(), vias=(), lumped=(), dmax=0.3e-3, dmax_layer=None,
                  w_ref=None, ncross=6, grade=1.0, near_fac=5.0, mesher='auto', metal=None,
                  solver='dense', aca_tol=1e-4, refine=1.0e-3, precision='auto', gpu='auto', verbose=True, title='',
-                 mesh_only=False, tiled='auto'):
+                 mesh_only=False, tiled='auto', core='auto'):
         # mesh_only: stop once the mesh and the unknowns (Ne, Nv) are known (a cost estimate; nothing to solve with)
         self.st, self.title, self.metal = stack, title, metal
         self.solver = solver
         self.gpu = gpu                      # 'auto' | 'cupy' | 'torch' | 'off' (mixed direct solver LU)
         self.precision = precision          # 'auto' | 'double' | 'mixed' (direct: complex64 Z + refinement)
         self.tiled = tiled                  # 'auto' | 'on' | 'off': mixed precision as L L^T tiles on the GPU (memory_plan)
+        self.core_mode = core               # 'compiled': the compiled core's direct solver for small boards too
         self.blr_tol, self.blr_tile, self.blr_eta = 1e-3, 512, 0.7   # solver='blr' preconditioner settings
         self.log = RunLog(verbose)
         self.dmax, self.ncross, self.grade, self.near_fac = dmax, ncross, grade, near_fac
@@ -401,6 +402,9 @@ class Simulation:
                           + f"), {avail / 1e9:.1f} GB available")
             if solver == 'auto':
                 solver = plan['solver']
+                if solver == 'dense' and self.core_mode == 'compiled' and has_core:   # the core, not NumPy's
+                    plan = memory_plan(n, has_core, avail, g, precision, 'direct', self.tiled)
+                    self.precision, self.plan, solver = plan['precision'], plan, plan['solver']
             elif not plan['fits']:
                 alt = 'blr' if has_core else 'aca'
                 self.log.note(f"WARNING: direct solver would need ~{plan['host'] / 1e9:.1f} GB but only "
