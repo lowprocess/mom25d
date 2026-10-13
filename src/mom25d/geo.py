@@ -114,13 +114,16 @@ def edge_offsets(w_ref, ncross, grade=1.0):
 # Mesher
 # =============================================================================
 def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), amax=None,
-                  max_offset_frac=0.45, tol=1e-9, fine=None, dmax_fine=None):
+                  max_offset_frac=0.45, tol=1e-9, fine=None, dmax_fine=None, edge_zone=None):
     """
     geom   : shapely (Multi)Polygon of one metal layer
     dmax   : max edge length along conductors / in open regions
     w_ref  : reference strip width for the edge grading (narrowest trace on the layer)
     lines  : [(p0, p1), ...] constraint segments (port gap and cut lines), clipped to geom
     vias   : [(x, y, radius), ...] points to insert as vertices (+ an octagon of the via radius)
+    edge_zone : (experimental) shapely area where the current crowds at edges (the signal copper buffered by
+             ~0.5 mm): the edge rings are kept only inside it. Demo transition (cropped): 4.9k unknowns instead of
+             8.4k, S within 0.006 of the full rings (2.4x faster a solve); not yet wired into Simulation
     Returns nodes (N,2), tris (M,3) counter-clockwise, and the list of via vertex ids.
     """
     if geom.is_empty:
@@ -129,7 +132,10 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
     for d in edge_offsets(w_ref, ncross, grade):
         inner = geom.buffer(-d, join_style='mitre', mitre_limit=2.0)
         if not inner.is_empty:
-            linework += _rings(inner)
+            rings = _rings(inner)
+            if edge_zone is not None:
+                rings = [r.intersection(edge_zone) for r in rings]
+            linework += rings
     for p0, p1 in lines:
         seg = LineString([p0, p1]).intersection(geom)
         if not seg.is_empty:
