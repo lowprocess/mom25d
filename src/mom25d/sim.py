@@ -83,6 +83,9 @@ def available_memory():
     return float(avail)
 
 
+MIXED_MIN_N = 3500       # above this, 'auto' precision is mixed whenever the compiled core is there
+
+
 def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver='auto', tiled='auto', block=1024):
     """How the solver of n unknowns runs and the memory it needs: dict(solver, precision, path, host, gpu)
     (bytes). gpu: None, or (backend name, free bytes). path: 'dense' (NumPy, small n), 'double' (LU on the
@@ -98,7 +101,11 @@ def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver
     can_tile = tiled != 'off' and has_core and name in ('cupy', 'emulate') and work <= 0.9 * free
     if precision == 'auto':
         precision = 'double' if (not has_core or 18.0 * n * n + 0.9e9 <= 0.5 * avail) else 'mixed'
-        if has_core and precision == 'double' and n > 3500 and gpu_fits and 24.0 * n * n + 0.9e9 <= 0.5 * avail:
+        if has_core and precision == 'double' and n > MIXED_MIN_N:
+            # complex64 LU + GMRES refinement on the CPU too: half the LU flops and 10 N^2 bytes instead of 18
+            # (demo transition cropped, 8.4k unknowns, 2 cores: 14.0 s a solve against 18.0 s, |dS| <= 7e-6 over
+            # 1-8 GHz); where the refinement stalls, fast.solve_direct redoes it in double and stays in double
+            # up to MIXED_RETRY x that frequency
             precision = 'mixed'
     if precision == 'mixed' and not has_core:
         precision = 'double'
@@ -383,10 +390,10 @@ class Simulation:
         if not has_core:
             self.log.note("note: no compiled core (python -m mom25d.core.build, or MOM25D_NO_CORE is set): "
                           "the NumPy kernels are several times slower")
-        # double whenever it fits comfortably: the complex64 LU preconditioner can stall (fine meshes, low
-        # frequency, many via chains) and the refinement then costs more than a double LU (study in kicad2ems
-        # docs/mom.md); mixed where it saves the memory that makes the direct solver fit, or where a GPU takes
-        # the complex64 LU (5.7 s a solve against 14.9 s on the via transition, 13.5k unknowns, RX 7800 XT)
+        # mixed above MIXED_MIN_N (memory_plan): the complex64 LU on the GPU (5.7 s a solve against 14.9 s on
+        # the via transition, 13.5k unknowns, RX 7800 XT) or on the CPU (about 1.3x faster than double). The
+        # complex64 preconditioner can stall (fine meshes, low frequency, many via chains; docs/mom.md): that
+        # solve is redone in double, and the frequencies up to MIXED_RETRY x it stay in double
         g = None
         if has_core and gpu != 'off' and (precision == 'mixed' or (precision == 'auto' and n > 3500)):
             from .gpu import get_backend

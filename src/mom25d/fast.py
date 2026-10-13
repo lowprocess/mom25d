@@ -194,6 +194,9 @@ class HMatrix:
 # Fast operator for a Simulation
 # =============================================================================
 HYBRID_RETRY = 1.25      # after the GPU's mixed precision fails at f, double up to this x f
+MIXED_RETRY = HYBRID_RETRY   # the same after the complex64 LU (CPU or GPU) fails to precondition
+MIXED_MAX_ITER = 30      # refinement iterations before giving up on the complex64 LU (2 on the demo transition; a stall
+                         # ran all 300 of restart 30 x 10: 150 s on 8.4k unknowns against 18 s for a double LU)
 
 
 class FastOperator:
@@ -651,6 +654,9 @@ class FastOperator:
             # matrix is worst conditioned; a sweep that gave up for good after its first 1 GHz solve ran the via
             # transition, 38 solves, on the CPU: 621 s, against 614 s without a GPU)
             precision, hybrid = 'double', False
+        if precision == 'mixed' and not hybrid and f <= MIXED_RETRY * getattr(self, '_mixed_failed', 0.0):
+            # the same for the complex64 LU (CPU or GPU): a failure costs the mixed solve and a double one
+            precision = 'double'
         tiled = getattr(self, 'tiled', None) or getattr(sim, 'tiled', 'auto')
         if precision == 'mixed' and tiled != 'off' and not getattr(self, '_tiled_failed', False) and \
                 (tiled == 'on' or not hybrid):
@@ -740,7 +746,7 @@ class FastOperator:
         with sim.log.timer('refinement (GMRES, exact matvec)'):
             Y, self.iters = gmres_batched(
                 lambda V: dsc[:, None] * self.matvec_exact_multi(dsc[:, None] * V, Sx),
-                dsc[:, None] * E, M=lambda R: lu_apply(R), rtol=self.mixed_tol, restart=30, maxiter=10)
+                dsc[:, None] * E, M=lambda R: lu_apply(R), rtol=self.mixed_tol, restart=MIXED_MAX_ITER, maxiter=1)
             X = dsc[:, None] * Y
         if gpu is not None:
             gpu.release()
@@ -751,7 +757,8 @@ class FastOperator:
         rel = np.linalg.norm(R, axis=0) / np.maximum(np.linalg.norm(dsc[:, None] * E, axis=0), 1e-300)
         if (rel > 100 * self.mixed_tol).any():
             sim.log.note(f"WARNING mixed precision did not converge at {f / 1e9:.4g} GHz (residual {rel.max():.1e}) "
-                         f"- solving in double precision")
+                         f"- solving in double precision up to {MIXED_RETRY * f / 1e9:.4g} GHz")
+            self._mixed_failed = max(getattr(self, '_mixed_failed', 0.0), f)
             return self.solve_direct(f, E, block, precision='double')
         return X
 

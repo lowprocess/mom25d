@@ -315,3 +315,15 @@ def test_core_choice():
     assert fast._core is not None
     with pytest.raises(ValueError):
         fast.use_core('gpu')
+
+
+def test_memory_plan_cpu_mixed():
+    """Above MIXED_MIN_N, 'auto' is mixed precision on the CPU too (complex64 LU + refinement); double below
+    it and without the compiled core."""
+    from mom25d.sim import memory_plan, MIXED_MIN_N
+    big = memory_plan(MIXED_MIN_N + 1000, has_core=True, avail=64e9, gpu=None, solver='direct')
+    assert (big['precision'], big['path']) == ('mixed', 'cpu-mixed')
+    assert memory_plan(MIXED_MIN_N - 500, has_core=True, avail=64e9, gpu=None, solver='direct')['precision'] == 'double'
+    assert memory_plan(MIXED_MIN_N + 1000, has_core=False, avail=64e9, gpu=None, solver='direct')['precision'] == 'double'
+    assert memory_plan(MIXED_MIN_N + 1000, has_core=True, avail=64e9, gpu=None, precision='double',
+                       solver='direct')['precision'] == 'double'
