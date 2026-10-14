@@ -396,3 +396,5 @@ def test_square_vias_pads_and_antipads():
     g = _square_vias(pour, [(5e-3, 5e-3)])
     assert len(g.interiors) == 1 and len(g.interiors[0].coords) == 5 and abs(g.area - pour.area) < 1e-3 * hole.area
     assert _square_vias(pour, [(2e-3, 2e-3)]).equals(pour)
+    hexa = _square_vias(pad, [(0, 0)], sides=6)
+    assert len(hexa.exterior.coords) == 7 and abs(hexa.area - pad.area) < 1e-3 * pad.area

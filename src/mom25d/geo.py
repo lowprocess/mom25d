@@ -149,10 +149,15 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
         for q in fine_parts:                                  # region boundaries as constraints
             linework += _rings(q)
     vpts = []
-    for (x, y, r) in vias:
+    for via in vias:
+        x, y, r = via[:3]
         vpts.append((x, y))
         if r > 0:
-            ring = Point(x, y).buffer(r, quad_segs=2).exterior   # octagon
+            if len(via) > 3:                                     # (x, y, r, n): a regular n-gon
+                n = int(via[3]); a = 2 * np.pi * np.arange(n + 1) / n + np.pi / n
+                ring = LineString(np.c_[x + r * np.cos(a), y + r * np.sin(a)])
+            else:
+                ring = Point(x, y).buffer(r, quad_segs=2).exterior   # octagon
             linework.append(LineString(ring.coords).intersection(geom))
     # snap-rounding noding: T-junctions (port lines ending on edges) must split the edge exactly
     noded = shapely.unary_union([g for g in linework if not g.is_empty], grid_size=tol)

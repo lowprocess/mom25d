@@ -264,7 +264,7 @@ def _square_vias(geom, pts, sides=4):
             if p.area < 1.2 * np.pi * r * r:              # a pad by itself
                 q = sq((x, y), eq(p.area))
             else:                                         # a pad on a trace: the square that holds the round pad
-                q = p.union(sq((x, y), r * np.sqrt(2)))
+                q = p.union(sq((x, y), r / np.cos(np.pi / sides)))
             if q.is_valid and q.buffer(1e-9).contains(P):
                 parts[hit[0]] = q
         else:
@@ -290,7 +290,7 @@ class Simulation:
                  w_ref=None, ncross=6, grade=1.0, near_fac=5.0, mesher='auto', metal=None,
                  solver='dense', aca_tol=1e-4, refine=1.0e-3, precision='auto', gpu='auto', verbose=True, title='',
                  mesh_only=False, tiled='auto', core='auto', quads=False, quad_tol=25.0, zone=None, dmax_out=None,
-                 signal_vias='round', stitching_vias='auto', signal=None):
+                 signal_vias='round', stitching_vias='auto', signal=None, via_barrel=True):
         # mesh_only: stop once the mesh and the unknowns (Ne, Nv) are known (a cost estimate; nothing to solve with)
         self.st, self.title, self.metal = stack, title, metal
         self.solver = solver
@@ -320,22 +320,31 @@ class Simulation:
             # it the copper is meshed plainly: no edge rings, no via octagons, small pads (stitching vias) as
             # coarse polygons, and no refinement of the layers nearby under it
             geoms = {k: _simplify_outside(g, zone) for k, g in geoms.items()}
-        # how each via is meshed: 'round' (its pad and antipad as drawn, an octagon of the via radius) or 'square'
-        # (pad and antipad as squares, the via a single vertex); stitching 'auto': square outside the zone
-        assert signal_vias in ('round', 'square') and stitching_vias in ('auto', 'round', 'square')
+        # how each via is meshed: 'round' (its pad and antipad as drawn, an octagon of the via radius) or n sides
+        # ('square' = 4): pad and antipad as n-gons, the barrel an n-gon of the via radius (via_barrel) or a single
+        # vertex; stitching 'auto': square outside the zone
+        def sides_of(m):
+            if m in ('round', 'auto'):
+                return m
+            n = 4 if m == 'square' else int(m)
+            assert n >= 3, f"a via needs at least 3 sides, not {m!r}"
+            return n
+        signal_vias, stitching_vias = sides_of(signal_vias), sides_of(stitching_vias)
+        assert signal_vias != 'auto'
         def via_mode(v):
             kind = getattr(v, 'kind', None)
             if kind == 'signal':
                 return signal_vias
             if kind == 'stitching':
                 if stitching_vias == 'auto':
-                    return 'square' if zone is not None and not zone.contains(shapely.Point(v.x, v.y)) else 'round'
+                    return 4 if zone is not None and not zone.contains(shapely.Point(v.x, v.y)) else 'round'
                 return stitching_vias
             return 'round'                                    # port vias, vias of hand-built models
         self.via_mode = {id(v): via_mode(v) for v in self.vias}
-        sq = [v for v in self.vias if self.via_mode[id(v)] == 'square']
-        if sq:
-            geoms = {k: _square_vias(g, [(v.x, v.y) for v in sq if v.k_bot < k <= v.k_top or v.k_bot <= k < v.k_top])
+        self.via_barrel = via_barrel
+        for n in sorted({m for m in self.via_mode.values() if m != 'round'}):
+            vs = [v for v in self.vias if self.via_mode[id(v)] == n]
+            geoms = {k: _square_vias(g, [(v.x, v.y) for v in vs if v.k_bot <= k <= v.k_top], sides=n)
                      for k, g in geoms.items()}
         self.geoms = geoms
         dmax_layer = dmax_layer or {}
@@ -405,7 +414,15 @@ class Simulation:
                 else:
                     wr = (w_ref.get(k) if isinstance(w_ref, dict) else w_ref) or self._guess_wref(geoms[k], lp_here)
                     seg = [lp.line(s) for lp, s in lines[k]]
-                    vpts = [(v.x, v.y, v.a if v.ring and self.via_mode[id(v)] == 'round' else 0.0) for _, v in vias_here]
+                    def vpt(v):
+                        m = self.via_mode[id(v)]
+                        if m == 'round':
+                            return (v.x, v.y, v.a if v.ring else 0.0)
+                        # an n-sided via: its barrel as an n-gon (signal vias, via_barrel) or a single vertex
+                        barrel = (v.ring and getattr(v, 'kind', None) == 'signal' and via_barrel
+                                  and not mesher.startswith('gmsh'))
+                        return (v.x, v.y, v.a, m) if barrel else (v.x, v.y, 0.0)
+                    vpts = [vpt(v) for _, v in vias_here]
                     fine = None
                     if refine and dm > 1.2 * dmax:
                         # resolve return currents under/over metal on nearby layers
