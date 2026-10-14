@@ -648,6 +648,9 @@ class FastOperator:
         # copy the GPU factors), the refinement products dense: 5.7 s a solve on the via transition (13.5k
         # unknowns) against 8.7 s with the sparse exact near field (its CSR build alone 3.1 s) and 14.9 s double
         hybrid = precision == 'mixed' and self._gpu_for(N) is not None and self._fits(24.0 * N * N)
+        quads = getattr(sim, 'qT', None) is not None
+        if quads:
+            hybrid = False                          # quad cells: the projected LU on the CPU (for now)
         if hybrid and f <= HYBRID_RETRY * getattr(self, '_hybrid_failed', 0.0):
             # the complex64 LU failed to precondition at or above this frequency: double up to HYBRID_RETRY x
             # the highest failure, the GPU again above it (it fails at the low end of a band, where the MPIE
@@ -659,7 +662,7 @@ class FastOperator:
             precision = 'double'
         tiled = getattr(self, 'tiled', None) or getattr(sim, 'tiled', 'auto')
         if precision == 'mixed' and tiled != 'off' and not getattr(self, '_tiled_failed', False) and \
-                (tiled == 'on' or not hybrid):
+                (tiled == 'on' or not hybrid) and not quads:
             # no dense Z: the GPU holds half a complex64 matrix (or streams it), the host a block column
             from .gpu import get_backend
             gpu = get_backend(sim.gpu) if getattr(sim, 'gpu', 'off') != 'off' else None
@@ -694,6 +697,8 @@ class FastOperator:
             Sc = Sx.tocoo()
             np.add.at(Z, (Sc.row, Sc.col), Sc.data.astype(dt))
         import scipy.linalg as sla
+        if quads:
+            return self._solve_quads(f, Z, E, Sx, precision, block)
         dsc = (1.0 / np.sqrt(np.abs(np.diagonal(Z)).astype(float) + 1e-300))
         if hybrid:
             return self._solve_hybrid(f, Z, dsc, E)
@@ -755,6 +760,50 @@ class FastOperator:
         # matrix is ill-conditioned); an unconverged refinement returns garbage, so check and redo in double
         R = dsc[:, None] * E - dsc[:, None] * self.matvec_exact_multi(X, Sx)
         rel = np.linalg.norm(R, axis=0) / np.maximum(np.linalg.norm(dsc[:, None] * E, axis=0), 1e-300)
+        if (rel > 100 * self.mixed_tol).any():
+            sim.log.note(f"WARNING mixed precision did not converge at {f / 1e9:.4g} GHz (residual {rel.max():.1e}) "
+                         f"- solving in double precision up to {MIXED_RETRY * f / 1e9:.4g} GHz")
+            self._mixed_failed = max(getattr(self, '_mixed_failed', 0.0), f)
+            return self.solve_direct(f, E, block, precision='double')
+        return X
+
+    def _solve_quads(self, f, Z, E, Sx, precision, block=1024):
+        """The direct solve on the quad-cell subspace (sim.qT, quads.py): Z_q = T^T Z T, LU of Z_q, I = T I_q.
+        precision='mixed': complex64 LU of Z_q preconditioning GMRES on T^T A T (A the exact operator)."""
+        import scipy.linalg as sla
+        sim, T = self.sim, self.sim.qT
+        Nq = T.shape[1]
+        from .quads import project
+        qi = sim.quad_info
+        with sim.log.timer('quad projection', f"{T.shape[0]} -> {Nq}"):
+            if not hasattr(self, '_qC'):
+                self._qC = T[qi['elim']].tocsr()
+            Zq = project(Z, qi['keep'], qi['elim'], self._qC)
+            del Z
+        dt = np.complex64 if precision == 'mixed' else np.complex128
+        Zq = Zq.T                                     # Z_q^T, Fortran order: factored in place (trans=1)
+        Eq = np.asarray(T.T @ E)
+        dsc = 1.0 / np.sqrt(np.abs(np.diagonal(Zq)).astype(float) + 1e-300)
+        with sim.log.timer('LU factor', f"N={Nq} (quads)"):
+            Zq *= dsc[:, None].astype(dt)
+            Zq *= dsc[None, :].astype(dt)
+            lu, piv = sla.lu_factor(Zq, overwrite_a=True, check_finite=False)
+            del Zq
+        self.iters = []
+        if precision != 'mixed':
+            with sim.log.timer('LU solve'):
+                return T @ (dsc[:, None] * sla.lu_solve((lu, piv), dsc[:, None] * Eq, trans=1, check_finite=False))
+        with sim.log.timer('refinement (GMRES, exact matvec)'):
+            Y, self.iters = gmres_batched(
+                lambda V: dsc[:, None] * (T.T @ self.matvec_exact_multi(T @ (dsc[:, None] * V), Sx)),
+                dsc[:, None] * Eq,
+                M=lambda R: sla.lu_solve((lu, piv), R.astype(np.complex64), trans=1, check_finite=False).astype(complex),
+                rtol=self.mixed_tol, restart=MIXED_MAX_ITER, maxiter=1)
+            Xq = dsc[:, None] * Y
+        sim.log.note(f"mixed precision: GMRES iterations per port {self.iters}")
+        X = T @ Xq
+        R = T.T @ (E - self.matvec_exact_multi(X, Sx))
+        rel = np.linalg.norm(dsc[:, None] * R, axis=0) / np.maximum(np.linalg.norm(dsc[:, None] * Eq, axis=0), 1e-300)
         if (rel > 100 * self.mixed_tol).any():
             sim.log.note(f"WARNING mixed precision did not converge at {f / 1e9:.4g} GHz (residual {rel.max():.1e}) "
                          f"- solving in double precision up to {MIXED_RETRY * f / 1e9:.4g} GHz")

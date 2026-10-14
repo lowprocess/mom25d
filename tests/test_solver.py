@@ -327,3 +327,29 @@ def test_memory_plan_cpu_mixed():
     assert memory_plan(MIXED_MIN_N + 1000, has_core=False, avail=64e9, gpu=None, solver='direct')['precision'] == 'double'
     assert memory_plan(MIXED_MIN_N + 1000, has_core=True, avail=64e9, gpu=None, precision='double',
                        solver='direct')['precision'] == 'double'
+
+
+def test_quad_cells_match_triangles_with_fewer_unknowns():
+    """quads=True (quads.py): triangle pairs on straight runs merged into constant-divergence quad cells. A
+    stepped microstrip on the tensor mesh: about a third fewer unknowns, S within 0.01 of the triangles, the
+    merged currents carry the same charge density on both triangles of a quad."""
+    w, W, h = 0.35e-3, 1.5e-3, 0.2e-3
+    st = LayerStack([Layer(h, 4.3)])
+    g, zc = line_char_ml(st, 1, w, [6e9]); z = zc[0].real
+    L, Lw = 16e-3, 5e-3
+    rects = [(-L / 2, -w / 2, L / 2, w / 2), (-Lw / 2, -W / 2, Lw / 2, W / 2)]
+    out = {}
+    for q in (False, True):
+        ports = [LinePort(1, (-L / 2 + 0.5e-3, 0), (1, 0), w, 4e-3, s0=1.5e-3, step=0.7e-3, zc=z),
+                 LinePort(1, (L / 2 - 0.5e-3, 0), (-1, 0), w, 4e-3, s0=1.5e-3, step=0.7e-3, zc=z)]
+        sim = Simulation(st, {1: rects}, ports, dmax=0.4e-3, w_ref=w, ncross=4, verbose=False, quads=q,
+                         solver='direct', precision='double')
+        out[q] = sim, sim.sparams(6e9)
+    (s0, S0), (s1, S1) = out[False], out[True]
+    n0, n1 = s0.Ne + s0.Nv, s1.qT.shape[1]
+    assert n1 < 0.7 * n0
+    assert np.abs(S1 - S0).max() < 0.01
+    assert abs(S1[0, 1] - S1[1, 0]) < 1e-3                  # wave-port fits: ~5e-5 either way
+    I = s1.qT @ np.random.default_rng(0).standard_normal(n1)
+    rho, d = s1.rwg.D @ I[:s1.Ne], s1.quad_info['elim']
+    assert np.abs(rho[s1.rwg.tp[d]] - rho[s1.rwg.tm[d]]).max() < 1e-12 * np.abs(rho).max()

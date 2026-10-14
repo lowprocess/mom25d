@@ -44,7 +44,7 @@ class Result:
 
 def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=False, mesher='auto', metal=None,
                 ground=None, max_solves=60, afs_tol=5e-3, log=print, progress=None, tiled='auto', on_step=None,
-                core='auto'):
+                core='auto', quads=False):
     """S-parameters of a board (a <name>_board.json path, or its content) on `freq` (Hz).
 
     dmax (m): largest cell along the copper; layers whose metal covers more than half the board (planes) get
@@ -67,13 +67,13 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     prev = fast.use_core(core)
     try:
         return _solve_board(board, freq, name, fmin, fmax, t0, dmax, plane_factor, port, pairs, mesher, metal,
-                            ground, max_solves, afs_tol, log, progress, tiled, on_step, core)
+                            ground, max_solves, afs_tol, log, progress, tiled, on_step, core, quads)
     finally:
         fast.set_core(prev)
 
 
 def _solve_board(board, freq, name, fmin, fmax, t0, dmax, plane_factor, port, pairs, mesher, metal, ground,
-                 max_solves, afs_tol, log, progress, tiled, on_step, core):
+                 max_solves, afs_tol, log, progress, tiled, on_step, core, quads=False):
     from .board import BoardModel
     from .fast import _core
     from .geo import LinePort
@@ -82,7 +82,8 @@ def _solve_board(board, freq, name, fmin, fmax, t0, dmax, plane_factor, port, pa
     planes = {k: plane_factor * dmax for k, gs in model.shapes.items()
               if sum(g.area for g in gs) > 0.5 * model.outline_area}
     sim = model.simulation(dmax=dmax, dmax_layer=planes, fmin=fmin, fmax=fmax, solver='auto', verbose=False,
-                           wave_down_to=fmin, mesher=mesher, title=name, metal=metal, tiled=tiled, core=core)
+                           wave_down_to=fmin, mesher=mesher, title=name, metal=metal, tiled=tiled, core=core,
+                           quads=quads)
     f, S, info = solve_band(sim, fmin, fmax, points=len(freq), zref=model.port_z0, max_solves=max_solves,
                             afs_tol=afs_tol, log=log, progress=progress, on_step=on_step)
     if len(f) != len(freq) or not np.allclose(f, freq):              # the sweep's grid onto the requested one

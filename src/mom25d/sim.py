@@ -228,7 +228,7 @@ class Simulation:
     def __init__(self, stack, shapes, ports=(), vias=(), lumped=(), dmax=0.3e-3, dmax_layer=None,
                  w_ref=None, ncross=6, grade=1.0, near_fac=5.0, mesher='auto', metal=None,
                  solver='dense', aca_tol=1e-4, refine=1.0e-3, precision='auto', gpu='auto', verbose=True, title='',
-                 mesh_only=False, tiled='auto', core='auto'):
+                 mesh_only=False, tiled='auto', core='auto', quads=False, quad_tol=25.0):
         # mesh_only: stop once the mesh and the unknowns (Ne, Nv) are known (a cost estimate; nothing to solve with)
         self.st, self.title, self.metal = stack, title, metal
         self.solver = solver
@@ -378,6 +378,23 @@ class Simulation:
         self._gram = None
         self._xcache = {}
         self._edge_sets()
+        self.qT = None
+        if quads:
+            # (experimental) near-rectangular triangle pairs as quad cells: their diagonal is no longer an
+            # unknown (quads.py); the matrix is filled on the triangles and projected before the LU
+            from .quads import quad_subspace
+            keep_e = [i for g in self.gap if g is not None for i in g[0]]
+            keep_e += [i for c in self.cuts if c is not None for idx, _ in c for i in idx]
+            keep_e += [i for e in self.lumped_edges for i in e[0]]
+            with self.log.timer('quad cells'):
+                self.qT, qi = quad_subspace(r, r.Ne + self.Nv, exclude_tris=self.F, exclude_edges=keep_e,
+                                            tol_deg=quad_tol)
+            self.quad_info = qi
+            self.log.note(f"quads: {qi['quads']} quad cells ({qi['tris_merged']} of {qi['tris']} triangles), "
+                          f"{qi['full']} -> {qi['reduced']} unknowns")
+            if solver not in ('dense', 'direct', 'auto'):
+                self.log.note(f"quads: not with solver {solver} yet - ignored")
+                self.qT = None
         self.tables, self.last = {}, None
         for p in self.ports:
             if isinstance(p, LinePort) and not isinstance(p, ModePort) and getattr(p, 'zc_fn', None) is None and p.zc == 50.0:
@@ -419,6 +436,9 @@ class Simulation:
                               f"dmax_layer, a smaller region, or an inner-layer ground reduce N.")
                 solver = alt
             self.solver = solver
+            if self.qT is not None and solver not in ('dense', 'direct'):
+                self.log.note(f"quads: not with solver {solver} yet - ignored")
+                self.qT = None
             self.log.note(f"solver: {solver} (N = {n})")
         if solver in ('aca', 'direct', 'blr'):
             from .fast import FastOperator
@@ -678,6 +698,10 @@ class Simulation:
             return self.fast.solve_direct(f, E, precision=self.precision)
         if self.solver == 'blr':
             return self.fast.solve_blr(f, E, tol=self.blr_tol, tile=self.blr_tile, eta=self.blr_eta)
+        if self.qT is not None:
+            T = self.qT
+            Z = self.impedance(f)
+            return T @ self.solve(np.asarray(T.T @ (T.T @ Z.T).T), np.asarray(T.T @ E))
         return self.solve(self.impedance(f), E)
 
     def sparams(self, f, keep=False):

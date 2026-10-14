@@ -7,9 +7,9 @@ base = os.path.join(ROOT, 'examples', 'demo_transition')
 D = Board(KiCadBoard(base + '.kicad_pcb'), nets=['RF', 'GND'], ground='B.Cu', pos_file=base + '-top.pos',
           region=(0, 3, 24, 7), log=lambda *a: None).to_dict()
 BASE = dict(dmax=0.3e-3, dmax_layer={2: 0.8e-3}, w_ref={1: 0.15e-3, 2: 1e-3, 3: 0.35e-3}, ncross=4, near_fac=3.0)
-def make(**kw):
+def make(port='auto', **kw):
     a = dict(BASE); a.update(kw)
-    m = BoardModel(D, log=lambda *a: None)
+    m = BoardModel(D, port=port, log=lambda *a: None)
     return m.simulation(verbose=False, solver='direct', characterize=False, **a)
 VARIANTS = {
   'default (triangle, ncross 4)': {},
