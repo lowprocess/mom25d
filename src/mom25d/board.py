@@ -115,6 +115,8 @@ class BoardModel(PlanarModel):
         self.vias = []
         for v in data.get('vias', []):
             via = self._via(v['x'], v['y'], v['z0'], v['z1'], v['r'], f"{v.get('net', '')}@({v['x']:.2f},{-v['y']:.2f})")
+            if via and gnets:                       # Simulation(signal_vias=, stitching_vias=): how each is meshed
+                via.kind = 'stitching' if v.get('net') in gnets else 'signal'
             if via:
                 self.vias.append(via)
         nwall = 0
@@ -123,6 +125,7 @@ class BoardModel(PlanarModel):
             w = walls[i]
             via = self._via(x, y, w[4], w[5], WALL_R, f"wall@({x:.2f},{-y:.2f})", ring=False)
             if via:
+                via.kind = 'stitching'
                 self.vias.append(via)
                 nwall += 1
         if data.get('walls'):

@@ -262,6 +262,8 @@ class PlanarModel:
         if characterize:
             self.characterize(ports, fmin, fmax, dmax=dmax)        # the cells the feeds get: the same gamma
         kw.setdefault('lumped', list(self.lumped))
+        if getattr(self, 'signal', None) is not None:
+            kw.setdefault('signal', self.signal)
         zone = kw.pop('zone', None)
         if zone is not None and zone != 'off':
             # (experimental) mesh detail only near the signal copper: zone = the distance (m) around it

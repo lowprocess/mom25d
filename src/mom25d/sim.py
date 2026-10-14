@@ -238,6 +238,50 @@ def _simplify_outside(geom, zone, max_area=1.0e-6, sides=4):
     return shapely.unary_union(out)
 
 
+PAD_MAX = 0.75e-3       # _square_vias: copper around a via within this radius is a pad (or an antipad, for a hole)
+
+
+def _square_vias(geom, pts, sides=4):
+    """The pads and antipads of the vias at `pts` as squares, for a coarse mesh around them: a round pad has ~30
+    edges and its via an octagon, each a spoke of the fan; a square, 4. A pad on its own becomes a square of the
+    same area; one joined to a trace becomes the square around it (it keeps the joint), and a round hole (an
+    antipad) around a via that does not attach here a square hole of the same area."""
+    def sq(c, R):
+        a = 2 * np.pi * np.arange(sides) / sides + np.pi / sides
+        return shapely.Polygon(np.c_[c[0] + R * np.cos(a), c[1] + R * np.sin(a)])
+    eq = lambda area: np.sqrt(2 * area / (sides * np.sin(2 * np.pi / sides)))       # same-area circumradius
+    for x, y in pts:
+        P = shapely.Point(x, y)
+        parts = list(getattr(geom, 'geoms', [geom]))
+        hit = [i for i, p in enumerate(parts) if p.buffer(1e-9).contains(P)]
+        if hit:
+            p = parts[hit[0]]
+            r = p.exterior.distance(P) if not p.interiors else min([p.exterior.distance(P)] +
+                                                                    [h.distance(P) for h in p.interiors])
+            ring_ = P.buffer(1.6 * r).difference(P.buffer(r))
+            if r <= 0 or r > PAD_MAX or p.intersection(ring_).area > 0.4 * ring_.area:
+                continue        # a via in a pour (near its edge or a hole) or on a trace: the vertex is enough
+            if p.area < 1.2 * np.pi * r * r:              # a pad by itself
+                q = sq((x, y), eq(p.area))
+            else:                                         # a pad on a trace: the square that holds the round pad
+                q = p.union(sq((x, y), r * np.sqrt(2)))
+            if q.is_valid and q.buffer(1e-9).contains(P):
+                parts[hit[0]] = q
+        else:
+            for i, p in enumerate(parts):
+                ins = list(p.interiors)
+                j = next((j for j, h in enumerate(ins) if shapely.Polygon(h).contains(P)), None)
+                if j is None or shapely.Polygon(ins[j]).area > np.pi * PAD_MAX ** 2:
+                    continue
+                new = shapely.Polygon(p.exterior, ins[:j] + ins[j + 1:] +
+                                      [sq((x, y), eq(shapely.Polygon(ins[j]).area)).exterior])
+                if new.is_valid:
+                    parts[i] = new
+                break
+        geom = shapely.unary_union(parts)
+    return geom
+
+
 # =============================================================================
 # Simulation
 # =============================================================================
@@ -245,7 +289,8 @@ class Simulation:
     def __init__(self, stack, shapes, ports=(), vias=(), lumped=(), dmax=0.3e-3, dmax_layer=None,
                  w_ref=None, ncross=6, grade=1.0, near_fac=5.0, mesher='auto', metal=None,
                  solver='dense', aca_tol=1e-4, refine=1.0e-3, precision='auto', gpu='auto', verbose=True, title='',
-                 mesh_only=False, tiled='auto', core='auto', quads=False, quad_tol=25.0, zone=None, dmax_out=None):
+                 mesh_only=False, tiled='auto', core='auto', quads=False, quad_tol=25.0, zone=None, dmax_out=None,
+                 signal_vias='round', stitching_vias='auto', signal=None):
         # mesh_only: stop once the mesh and the unknowns (Ne, Nv) are known (a cost estimate; nothing to solve with)
         self.st, self.title, self.metal = stack, title, metal
         self.solver = solver
@@ -270,11 +315,28 @@ class Simulation:
             assert k in stack.metal_interfaces, f"interface {k} cannot carry metal in this stack"
         geoms = {k: to_geometry(shapes[k]) for k in self.layers}
         self.zone = zone
-        if zone is not None:
+        if zone is not None and stitching_vias == 'auto':
             # (experimental) zone: where the current crowds (the signal copper and around it, BoardModel). Outside
             # it the copper is meshed plainly: no edge rings, no via octagons, small pads (stitching vias) as
             # coarse polygons, and no refinement of the layers nearby under it
             geoms = {k: _simplify_outside(g, zone) for k, g in geoms.items()}
+        # how each via is meshed: 'round' (its pad and antipad as drawn, an octagon of the via radius) or 'square'
+        # (pad and antipad as squares, the via a single vertex); stitching 'auto': square outside the zone
+        assert signal_vias in ('round', 'square') and stitching_vias in ('auto', 'round', 'square')
+        def via_mode(v):
+            kind = getattr(v, 'kind', None)
+            if kind == 'signal':
+                return signal_vias
+            if kind == 'stitching':
+                if stitching_vias == 'auto':
+                    return 'square' if zone is not None and not zone.contains(shapely.Point(v.x, v.y)) else 'round'
+                return stitching_vias
+            return 'round'                                    # port vias, vias of hand-built models
+        self.via_mode = {id(v): via_mode(v) for v in self.vias}
+        sq = [v for v in self.vias if self.via_mode[id(v)] == 'square']
+        if sq:
+            geoms = {k: _square_vias(g, [(v.x, v.y) for v in sq if v.k_bot < k <= v.k_top or v.k_bot <= k < v.k_top])
+                     for k, g in geoms.items()}
         self.geoms = geoms
         dmax_layer = dmax_layer or {}
 
@@ -343,8 +405,7 @@ class Simulation:
                 else:
                     wr = (w_ref.get(k) if isinstance(w_ref, dict) else w_ref) or self._guess_wref(geoms[k], lp_here)
                     seg = [lp.line(s) for lp, s in lines[k]]
-                    vpts = [(v.x, v.y, v.a if v.ring and (zone is None or zone.contains(shapely.Point(v.x, v.y))) else 0.0)
-                            for _, v in vias_here]
+                    vpts = [(v.x, v.y, v.a if v.ring and self.via_mode[id(v)] == 'round' else 0.0) for _, v in vias_here]
                     fine = None
                     if refine and dm > 1.2 * dmax:
                         # resolve return currents under/over metal on nearby layers
@@ -420,8 +481,24 @@ class Simulation:
             keep_e = [i for g in self.gap if g is not None for i in g[0]]
             keep_e += [i for c in self.cuts if c is not None for idx, _ in c for i in idx]
             keep_e += [i for e in self.lumped_edges for i in e[0]]
+            excl = self.F
+            if quads == 'centre':
+                # only in the middle of the lines: no triangle with a corner on the copper outline (the edge strips
+                # stay triangles) and, where the signal copper is known (BoardModel), none off it (pours, pads)
+                cnt = {}
+                for a, b, c in r.tris:
+                    for e in ((a, b), (b, c), (c, a)):
+                        e = (min(e), max(e)); cnt[e] = cnt.get(e, 0) + 1
+                bnode = np.zeros(len(r.nodes), bool)
+                for (a, b), n_ in cnt.items():
+                    if n_ == 1:
+                        bnode[[a, b]] = True
+                off_ = bnode[r.tris].any(1)
+                if signal is not None:
+                    off_ |= ~shapely.contains_xy(signal, r.cent[:, 0], r.cent[:, 1])
+                excl = np.union1d(self.F, np.nonzero(off_)[0])
             with self.log.timer('quad cells'):
-                self.qT, qi = quad_subspace(r, r.Ne + self.Nv, exclude_tris=self.F, exclude_edges=keep_e,
+                self.qT, qi = quad_subspace(r, r.Ne + self.Nv, exclude_tris=excl, exclude_edges=keep_e,
                                             tol_deg=quad_tol)
             self.quad_info = qi
             self.log.note(f"quads: {qi['quads']} quad cells ({qi['tris_merged']} of {qi['tris']} triangles), "

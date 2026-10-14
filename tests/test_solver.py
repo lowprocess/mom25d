@@ -378,3 +378,21 @@ def test_signal_zone_coarsens_away_from_the_signal():
     assert np.abs(S1 - S0).max() < 0.02
     sq = _simplify_outside(pads[0], box(0, 0, 1e-3, 1e-3).buffer(-0.4e-3).union(Point(1, 1).buffer(1e-3)))
     assert len(sq.exterior.coords) == 5 and abs(sq.area - pads[0].area) < 1e-3 * pads[0].area
+
+
+def test_square_vias_pads_and_antipads():
+    """_square_vias: a pad on its own becomes a same-area square, a pad on a trace the square around it (still
+    joined), a round antipad a same-area square hole; a via in a pour is left alone."""
+    from shapely.geometry import box, Point
+    from mom25d.sim import _square_vias
+    pad = Point(0, 0).buffer(0.3e-3)
+    g = _square_vias(pad, [(0, 0)])
+    assert len(g.exterior.coords) == 5 and abs(g.area - pad.area) < 1e-3 * pad.area
+    joined = pad.union(box(0, -0.1e-3, 3e-3, 0.1e-3))
+    g = _square_vias(joined, [(0, 0)])
+    assert g.geom_type == 'Polygon' and g.contains(pad.buffer(-1e-7)) and g.contains(Point(2.9e-3, 0))
+    hole = Point(5e-3, 5e-3).buffer(0.5e-3)
+    pour = box(0, 0, 10e-3, 10e-3).difference(hole)
+    g = _square_vias(pour, [(5e-3, 5e-3)])
+    assert len(g.interiors) == 1 and len(g.interiors[0].coords) == 5 and abs(g.area - pour.area) < 1e-3 * hole.area
+    assert _square_vias(pour, [(2e-3, 2e-3)]).equals(pour)
