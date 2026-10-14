@@ -100,7 +100,8 @@ def _solve_board(board, freq, name, fmin, fmax, t0, dmax, plane_factor, port, pa
     ports = [dict(name=p.name, kind='wave' if isinstance(p, LinePort) else 'lumped',
                   zc=float(getattr(p, 'zc', 0) or 0)) for p in sim.ports]
     return Result(f=freq, S=S, names=list(info['names']), zref=list(info['zref']), ports=ports,
-                  unknowns=int(sim.Ne + sim.Nv), triangles=int(len(sim.rwg.tris)), solver=sim.solver,
+                  unknowns=int(sim.qT.shape[1]) if getattr(sim, 'qT', None) is not None else int(sim.Ne + sim.Nv),
+                  triangles=int(len(sim.rwg.tris)), solver=sim.solver,
                   precision=getattr(sim, 'precision', 'double'), mesher=mesher, solves=int(info['solves']),
                   solved=list(info['solved']), seconds=time.time() - t0, core=_core is not None,
                   notes=list(model.notes) + list(sim.log.notes), model=model, sim=sim,
