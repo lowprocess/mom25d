@@ -100,6 +100,17 @@ class BoardModel(PlanarModel):
         self._zk = zk
         S = lambda g: affinity.scale(g, MM, MM, origin=(0, 0))
         self.shapes = {k: [S(unary_union(copper[lay])).buffer(0)] for lay, k in self.iface.items() if copper.get(lay)}
+        # the signal copper (every net but the ground nets), all layers projected: where the current crowds and
+        # the mesh needs its detail (zone=, PlanarModel.simulation); None when the board names no ground net
+        gnets = set(data.get('ground_nets') or [])
+        sig = [shape(p['polygon']) for lay, ps in data.get('copper', {}).items() if lay in self.iface
+               for p in ps if gnets and p.get('net') not in gnets]
+        self.signal = S(unary_union(sig)).buffer(0) if sig else None
+        # the signal vias (their return vias sit around them) and the thickest dielectric (how far the fields
+        # reach from a trace), for the zone's extent
+        self.signal_vias = [(v['x'] * MM, v['y'] * MM) for v in data.get('vias', [])
+                            if gnets and v.get('net') not in gnets]
+        self.h_max = max((l['z1'] - l['z0']) * MM for l in diels) if diels else 0.0
         # ---- vias, edge walls, parts, ports ----
         self.vias = []
         for v in data.get('vias', []):

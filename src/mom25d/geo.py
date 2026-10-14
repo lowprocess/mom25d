@@ -114,7 +114,7 @@ def edge_offsets(w_ref, ncross, grade=1.0):
 # Mesher
 # =============================================================================
 def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), amax=None,
-                  max_offset_frac=0.45, tol=1e-9, fine=None, dmax_fine=None, edge_zone=None):
+                  max_offset_frac=0.45, tol=1e-9, fine=None, dmax_fine=None, edge_zone=None, split_chains=False):
     """
     geom   : shapely (Multi)Polygon of one metal layer
     dmax   : max edge length along conductors / in open regions
@@ -123,7 +123,9 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
     vias   : [(x, y, radius), ...] points to insert as vertices (+ an octagon of the via radius)
     edge_zone : (experimental) shapely area where the current crowds at edges (the signal copper buffered by
              ~0.5 mm): the edge rings are kept only inside it. Demo transition (cropped): 4.9k unknowns instead of
-             8.4k, S within 0.006 of the full rings (2.4x faster a solve); not yet wired into Simulation
+             8.4k, S within 0.006 of the full rings (2.4x faster a solve); Simulation(zone=) passes it
+    split_chains : each outline at the spacing of the region it runs through (zone=; the default spaces a whole
+             chain by where its centroid falls, which a closed outline's centroid can get wrong)
     Returns nodes (N,2), tris (M,3) counter-clockwise, and the list of via vertex ids.
     """
     if geom.is_empty:
@@ -160,7 +162,16 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
     for pc in pieces:
         if pc.length < tol:
             continue
-        dm = dmax_fine if (fine_u is not None and fine_u.contains(pc.centroid)) else dmax
+        if split_chains and fine_u is not None and not fine_u.contains(pc) and fine_u.intersects(pc):
+            # a chain that runs in and out of the fine region (a pad or trace outline around the zone's edge):
+            # each part at its own spacing (the centroid of a closed outline can lie anywhere)
+            for part, d_ in ((pc.intersection(fine_u), dmax_fine), (pc.difference(fine_u), dmax)):
+                for q in getattr(part, 'geoms', [part]):
+                    if q.geom_type == 'LineString' and q.length >= tol:
+                        chains.append(np.asarray(shapely.segmentize(q, d_).coords)[:, :2])
+            continue
+        inside = fine_u is not None and (fine_u.contains(pc) if split_chains else fine_u.contains(pc.centroid))
+        dm = dmax_fine if inside else dmax
         chains.append(np.asarray(shapely.segmentize(pc, dm).coords)[:, :2])
     allp = np.vstack(chains + [np.array(vpts).reshape(-1, 2)]) if vpts else np.vstack(chains)
     # merge near-coincident vertices (noding round-off would otherwise create sliver triangles)

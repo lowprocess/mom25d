@@ -221,6 +221,23 @@ class Metal:
         return g / self.sigma / np.tanh(g * self.t)
 
 
+def _simplify_outside(geom, zone, max_area=1.0e-6, sides=4):
+    """Small pieces of copper wholly outside `zone` (pads of stitching vias, a few hundred um across) as regular
+    `sides`-gons of the same area about their centroid: their outline carries next to no current, and a round pad
+    costs one unknown per side (the spokes of the via's fan)."""
+    parts = list(getattr(geom, 'geoms', [geom]))
+    out = []
+    for p in parts:
+        if p.area < max_area and not p.intersects(zone) and not p.interiors:
+            c = p.centroid
+            R = np.sqrt(2 * p.area / (sides * np.sin(2 * np.pi / sides)))
+            a = 2 * np.pi * np.arange(sides) / sides + np.pi / sides
+            q = shapely.Polygon(np.c_[c.x + R * np.cos(a), c.y + R * np.sin(a)])
+            p = q if q.is_valid and q.buffer(1e-9).contains(p.centroid) else p
+        out.append(p)
+    return shapely.unary_union(out)
+
+
 # =============================================================================
 # Simulation
 # =============================================================================
@@ -228,7 +245,7 @@ class Simulation:
     def __init__(self, stack, shapes, ports=(), vias=(), lumped=(), dmax=0.3e-3, dmax_layer=None,
                  w_ref=None, ncross=6, grade=1.0, near_fac=5.0, mesher='auto', metal=None,
                  solver='dense', aca_tol=1e-4, refine=1.0e-3, precision='auto', gpu='auto', verbose=True, title='',
-                 mesh_only=False, tiled='auto', core='auto', quads=False, quad_tol=25.0):
+                 mesh_only=False, tiled='auto', core='auto', quads=False, quad_tol=25.0, zone=None, dmax_out=None):
         # mesh_only: stop once the mesh and the unknowns (Ne, Nv) are known (a cost estimate; nothing to solve with)
         self.st, self.title, self.metal = stack, title, metal
         self.solver = solver
@@ -252,6 +269,12 @@ class Simulation:
         for k in self.layers:
             assert k in stack.metal_interfaces, f"interface {k} cannot carry metal in this stack"
         geoms = {k: to_geometry(shapes[k]) for k in self.layers}
+        self.zone = zone
+        if zone is not None:
+            # (experimental) zone: where the current crowds (the signal copper and around it, BoardModel). Outside
+            # it the copper is meshed plainly: no edge rings, no via octagons, small pads (stitching vias) as
+            # coarse polygons, and no refinement of the layers nearby under it
+            geoms = {k: _simplify_outside(g, zone) for k, g in geoms.items()}
         self.geoms = geoms
         dmax_layer = dmax_layer or {}
 
@@ -320,11 +343,13 @@ class Simulation:
                 else:
                     wr = (w_ref.get(k) if isinstance(w_ref, dict) else w_ref) or self._guess_wref(geoms[k], lp_here)
                     seg = [lp.line(s) for lp, s in lines[k]]
-                    vpts = [(v.x, v.y, v.a if v.ring else 0.0) for _, v in vias_here]
+                    vpts = [(v.x, v.y, v.a if v.ring and (zone is None or zone.contains(shapely.Point(v.x, v.y))) else 0.0)
+                            for _, v in vias_here]
                     fine = None
                     if refine and dm > 1.2 * dmax:
                         # resolve return currents under/over metal on nearby layers
-                        near = [geoms[j].buffer(3 * abs(stack.z[j] - stack.z[k]) + 2 * dmax)
+                        near = [(geoms[j] if zone is None else geoms[j].intersection(zone))
+                                .buffer(3 * abs(stack.z[j] - stack.z[k]) + 2 * dmax)
                                 for j in self.layers if j != k and abs(stack.z[j] - stack.z[k]) < refine]
                         fine = shapely.unary_union(near) if near else None
                     mesh_fn = mesh_polygons
@@ -332,8 +357,17 @@ class Simulation:
                         from functools import partial
                         from .mesh_gmsh import mesh_polygons_gmsh
                         mesh_fn = partial(mesh_polygons_gmsh, mode=mesher.split('-')[1] if '-' in mesher else 'layers')
-                    nd, tr, vids = mesh_fn(geoms[k], dm, wr, ncross, grade, lines=seg, vias=vpts,
-                                           fine=fine, dmax_fine=2 * dmax if fine is not None else None)
+                    zkw = dict(edge_zone=zone, split_chains=True) if zone is not None and mesh_fn is mesh_polygons else {}
+                    dm_mesh, dm_fine = dm, (2 * dmax if fine is not None else None)
+                    if zone is not None and dmax_out and dmax_out > dm and mesh_fn is mesh_polygons:
+                        # outside the zone the copper carries little current: cells up to dmax_out there,
+                        # dm (or the refinement's 2 dmax) inside it
+                        zf = geoms[k].intersection(zone)
+                        if not zf.is_empty and zf.area < 0.99 * geoms[k].area:      # else: all of it is signal
+                            fine = zf if fine is None else shapely.unary_union([fine, zf])
+                            dm_mesh, dm_fine = dmax_out, min(dm, dm_fine or dm)
+                    nd, tr, vids = mesh_fn(geoms[k], dm_mesh, wr, ncross, grade, lines=seg, vias=vpts,
+                                           fine=fine, dmax_fine=dm_fine, **zkw)
                 for (i, v), vid in zip(vias_here, vids):
                     assert vid >= 0, f"via {v.name}: not on the M{k} mesh"
                     via_vertex[(i, k)] = vid + off

@@ -33,6 +33,10 @@ def _smooth(fs, v):
     return lambda f: np.polyval(c, np.clip(f, fs[0], fs[-1]) / fs[-1])
 
 
+ZONE_DIST = 0.5e-3      # zone='auto': the mesh detail within this distance of the signal copper,
+ZONE_H = 1.5            # or this many times the thickest dielectric (a GCPW's fence vias on 0.8 mm: 0.82 mm out),
+ZONE_VIA = 1.0e-3       # and within this distance of a signal via (its return vias)
+
 class PlanarModel:
     lumped = ()
 
@@ -258,4 +262,16 @@ class PlanarModel:
         if characterize:
             self.characterize(ports, fmin, fmax, dmax=dmax)        # the cells the feeds get: the same gamma
         kw.setdefault('lumped', list(self.lumped))
+        zone = kw.pop('zone', None)
+        if zone is not None and zone != 'off':
+            # (experimental) mesh detail only near the signal copper: zone = the distance (m) around it
+            sig = getattr(self, 'signal', None)
+            if sig is not None:
+                d = max(ZONE_DIST, ZONE_H * getattr(self, 'h_max', 0.0)) if zone == 'auto' else float(zone)
+                from shapely.geometry import Point
+                from shapely.ops import unary_union
+                kw['zone'] = unary_union([sig.buffer(d)] + [Point(x, y).buffer(ZONE_VIA)
+                                                            for x, y in getattr(self, 'signal_vias', [])])
+            else:
+                kw['zone'] = None
         return Simulation(self.stack, self.shapes, ports, vias=self.vias, dmax=dmax, **kw)

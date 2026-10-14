@@ -353,3 +353,28 @@ def test_quad_cells_match_triangles_with_fewer_unknowns():
     I = s1.qT @ np.random.default_rng(0).standard_normal(n1)
     rho, d = s1.rwg.D @ I[:s1.Ne], s1.quad_info['elim']
     assert np.abs(rho[s1.rwg.tp[d]] - rho[s1.rwg.tm[d]]).max() < 1e-12 * np.abs(rho).max()
+
+
+def test_signal_zone_coarsens_away_from_the_signal():
+    """zone= (experimental): edge rings, via octagons and pad detail only near the signal copper. A microstrip
+    between two rows of stitching-via pads: far fewer unknowns, S within 0.02, the pads become squares."""
+    from shapely.geometry import box, Point
+    from mom25d.sim import _simplify_outside
+    w, h, L = 0.35e-3, 0.2e-3, 10e-3
+    st = LayerStack([Layer(h, 4.3)])
+    g, zc = line_char_ml(st, 1, w, [5e9]); z = zc[0].real
+    xs = np.arange(-3.5e-3, 3.6e-3, 1.0e-3)
+    pads = [Point(x, y).buffer(0.3e-3) for x in xs for y in (-1.2e-3, 1.2e-3)]
+    out = {}
+    for zone in (None, box(-L / 2, -w / 2, L / 2, w / 2).buffer(0.5e-3)):
+        ports = [LinePort(1, (-L / 2 + 0.5e-3, 0), (1, 0), w, 3e-3, s0=1.0e-3, step=0.6e-3, zc=z),
+                 LinePort(1, (L / 2 - 0.5e-3, 0), (-1, 0), w, 3e-3, s0=1.0e-3, step=0.6e-3, zc=z)]
+        vias = [Via(p.centroid.x, p.centroid.y, 0, 1, 0.15e-3) for p in pads]
+        sim = Simulation(st, {1: [box(-L / 2, -w / 2, L / 2, w / 2)] + pads}, ports, vias=vias, dmax=0.3e-3, w_ref=w,
+                         verbose=False, solver='direct', precision='double', zone=zone, dmax_out=1.5e-3)
+        out[zone is None] = sim.Ne + sim.Nv, sim.sparams(5e9)
+    (n0, S0), (n1, S1) = out[True], out[False]
+    assert n1 < 0.6 * n0
+    assert np.abs(S1 - S0).max() < 0.02
+    sq = _simplify_outside(pads[0], box(0, 0, 1e-3, 1e-3).buffer(-0.4e-3).union(Point(1, 1).buffer(1e-3)))
+    assert len(sq.exterior.coords) == 5 and abs(sq.area - pads[0].area) < 1e-3 * pads[0].area
