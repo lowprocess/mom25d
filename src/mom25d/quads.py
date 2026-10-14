@@ -109,14 +109,15 @@ def _edge_nodes(tri, a):
 
 
 def project(Z, keep, elim, C):
-    """T^T Z T for T = (identity on `keep`, rows `elim` = C), without forming T: Z (N x N) dense, C (ne x Nr)
-    sparse. Stays in Z's dtype; returns the Nr x Nr matrix (C order)."""
+    """T^T Z T for T = (identity on `keep` in its first len(keep) columns, rows `elim` = C), without forming T:
+    Z (N x N) dense, C (ne x Nr) sparse, Nr >= len(keep) (the columns past len(keep) are combined functions on the
+    eliminated unknowns, line.py). Stays in Z's dtype; returns the Nr x Nr matrix (C order)."""
     rdt = np.float32 if Z.dtype == np.complex64 else np.float64
     C = sparse.csr_matrix(C, dtype=rdt)
     Ct = C.T.tocsr()
-    M = np.take(Z, keep, axis=1)                       # Z T = Z[:, keep] + Z[:, elim] C
-    M += np.asarray(Ct @ np.take(Z, elim, axis=1).T).T
-    Zq = np.take(M, keep, axis=0)                      # T^T (Z T) = M[keep] + C^T M[elim]
-    Zq += np.asarray(Ct @ np.take(M, elim, axis=0))
+    nk, Nr = len(keep), C.shape[1]
+    ZT = np.asarray(Ct @ np.take(Z, elim, axis=1).T).T            # Z T = [Z[:, keep], 0] + Z[:, elim] C
+    ZT[:, :nk] += np.take(Z, keep, axis=1)
+    Zq = np.asarray(Ct @ np.take(ZT, elim, axis=0))               # T^T (Z T) = [ZT[keep]; 0] + C^T ZT[elim]
+    Zq[:nk] += np.take(ZT, keep, axis=0)
     return Zq
-

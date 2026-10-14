@@ -42,12 +42,13 @@ class Result:
     sim: object = None              # the Simulation
 
 
+LINE_STEP = 2.0    # lines=: the line functions' columns, x dmax (1-3 x gave the same S on the test boards)
 ZONE_OUT = 5.0     # zone=: cells up to this x dmax outside the zone around the signal copper
 
 
 def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=False, mesher='auto', metal=None,
                 ground=None, max_solves=60, afs_tol=5e-3, log=print, progress=None, tiled='auto', on_step=None,
-                core='auto', quads=False, zone=None, signal_vias='round', stitching_vias='auto'):
+                core='auto', quads=False, zone=None, signal_vias='round', stitching_vias='auto', lines=None):
     """S-parameters of a board (a <name>_board.json path, or its content) on `freq` (Hz).
 
     dmax (m): largest cell along the copper; layers whose metal covers more than half the board (planes) get
@@ -71,14 +72,14 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     try:
         return _solve_board(board, freq, name, fmin, fmax, t0, dmax, plane_factor, port, pairs, mesher, metal,
                             ground, max_solves, afs_tol, log, progress, tiled, on_step, core, quads, zone,
-                            signal_vias, stitching_vias)
+                            signal_vias, stitching_vias, lines)
     finally:
         fast.set_core(prev)
 
 
 def _solve_board(board, freq, name, fmin, fmax, t0, dmax, plane_factor, port, pairs, mesher, metal, ground,
                  max_solves, afs_tol, log, progress, tiled, on_step, core, quads=False, zone=None,
-                 signal_vias='round', stitching_vias='auto'):
+                 signal_vias='round', stitching_vias='auto', lines=None):
     from .board import BoardModel
     from .fast import _core
     from .geo import LinePort
@@ -89,6 +90,7 @@ def _solve_board(board, freq, name, fmin, fmax, t0, dmax, plane_factor, port, pa
     sim = model.simulation(dmax=dmax, dmax_layer=planes, fmin=fmin, fmax=fmax, solver='auto', verbose=False,
                            wave_down_to=fmin, mesher=mesher, title=name, metal=metal, tiled=tiled, core=core,
                            quads=quads, signal_vias=signal_vias, stitching_vias=stitching_vias,
+                           **(dict(line_basis=lines, line_step=LINE_STEP) if lines and lines != 'off' else {}),
                            **(dict(zone=zone, dmax_out=ZONE_OUT * dmax) if zone else {}))
     f, S, info = solve_band(sim, fmin, fmax, points=len(freq), zref=model.port_z0, max_solves=max_solves,
                             afs_tol=afs_tol, log=log, progress=progress, on_step=on_step)
