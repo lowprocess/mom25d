@@ -9,4 +9,4 @@ mom25d: a 2.5D (planar) Method-of-Moments solver for PCB structures.
 Boards reach it through kicad2ems (`kicad2ems board.kicad_pcb --solvers mom`), which reads KiCad and
 Gerber files and writes the board every solver gets; mom25d reads that file without kicad2ems.
 """
-__version__ = '261019-r2'
+__version__ = '261019-r3'
