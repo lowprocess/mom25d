@@ -903,8 +903,8 @@ class Simulation:
             self.log.note(f"WARNING {f / 1e9:.2f} GHz port {self.ports[i].name}: wave-fit residual "
                           f"{resid[i]:.1e} - sample cuts too close to a discontinuity (use s1) "
                           f"or too short a feed for this frequency")
-        self.last = dict(f=f, I=I if keep else None, gamma=gam, resid=resid)
-        return S
+        self.last = dict(f=f, I=I if keep else None, gamma=gam, resid=resid, A=Ap, B=Bp)   # A, B: the waves of each
+        return S                                                                          # excitation column
 
     def sweep(self, freqs, zc=None, currents_at=None):
         out = SimpleNamespace(f=np.asarray(freqs), S=[], gamma=[], resid=[], recip=[], passiv=[], I=None, fI=None)
