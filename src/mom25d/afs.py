@@ -71,6 +71,15 @@ def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001,
     be zero while the model is still wrong: a sparse fit that the new sample does not alter.)
     """
     fs = list(np.linspace(fmin, fmax, n0))
+
+    def checked(f):
+        S = solve_raw(f)
+        if not np.isfinite(S).all():                            # the fit would fail on it with an SVD error
+            raise FloatingPointError(f"the EM solve at {f / 1e9:.4g} GHz gave non-finite S-parameters (on the GPU: "
+                                     f"MOM25D_GPU=off solves on the CPU)")
+        return S
+
+    solve_raw, solve = solve, checked
     Ss = [solve(f) for f in fs]
     P = Ss[0].shape[0]
     grid = np.linspace(fmin, fmax, ngrid)
