@@ -151,6 +151,20 @@ def test_gpu_refinement_that_stalls_falls_back_to_double_nearby(clean, S_cpu):
     assert sum(r[0] == 'LU factor (GPU)' for r in sim.log.records) == n_gpu + 1  # above 1.25 x: the GPU again
 
 
+def test_gpu_refinement_that_breaks_down_falls_back_to_double(clean, S_cpu):
+    """A GMRES breakdown (a NaN residual, as the complex64 LU gave at 0.1 GHz on a dfsynth low-pass) is a
+    failure too: NaN compares false against the tolerance, and once slipped through as the result."""
+    mods, _ = fake_cupy()
+    for k, v in mods.items():
+        clean.setitem(sys.modules, k, v)
+    sim = make_sim('cupy')
+    gpu = mom25d_gpu.get_backend('cupy')
+    clean.setattr(type(gpu), 'solve', lambda self, R: np.full(np.shape(R), np.nan, complex))
+    with np.errstate(invalid='ignore'):
+        S = sim.sparams(4e9)
+    assert np.isfinite(S).all() and np.abs(S - S_cpu).max() < 1e-6 and sim.fast._hybrid_failed
+
+
 def _S_symmetric():
     """The CPU double solve of (Z + Z^T) / 2: what the tiled path solves (its near field symmetrised)."""
     sim = make_sim('off')
