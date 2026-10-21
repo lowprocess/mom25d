@@ -84,10 +84,10 @@ def test_solve_board_is_the_steps_it_wraps(boards):
     data = board(boards['lowpass'])
     f = np.linspace(1e9, 3e9, 5)
     calls = []
-    res = solve_board(data, f, dmax=0.8e-3, max_solves=5, log=quiet, progress=lambda *a: calls.append(a))
+    res = solve_board(data, f, dmax=1.6e-3, max_solves=5, log=quiet, progress=lambda *a: calls.append(a))
     m = BoardModel(data, log=quiet)
     planes = {k: 2.4e-3 for k, gs in m.shapes.items() if sum(g.area for g in gs) > 0.5 * m.outline_area}
-    sim = m.simulation(dmax=0.8e-3, dmax_layer=planes, fmin=1e9, fmax=3e9, solver='auto', verbose=False, wave_down_to=1e9)
+    sim = m.simulation(dmax=1.6e-3, dmax_layer=planes, fmin=1e9, fmax=3e9, solver='auto', verbose=False, wave_down_to=1e9)
     fs, S, info = solve_band(sim, 1e9, 3e9, points=5, zref=m.port_z0, max_solves=5, afs_tol=5e-3, log=quiet)
     assert np.allclose(res.S, S) and res.names == info['names'] == ['P1', 'P2']
     assert res.solves == len(calls) and calls[-1][:2] == (res.solves, 5)
