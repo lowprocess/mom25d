@@ -760,7 +760,7 @@ class FastOperator:
         # matrix is ill-conditioned); an unconverged refinement returns garbage, so check and redo in double
         R = dsc[:, None] * E - dsc[:, None] * self.matvec_exact_multi(X, Sx)
         rel = np.linalg.norm(R, axis=0) / np.maximum(np.linalg.norm(dsc[:, None] * E, axis=0), 1e-300)
-        if (rel > 100 * self.mixed_tol).any():
+        if not (rel <= 100 * self.mixed_tol).all():          # NaN too: a GMRES breakdown
             sim.log.note(f"WARNING mixed precision did not converge at {f / 1e9:.4g} GHz (residual {rel.max():.1e}) "
                          f"- solving in double precision up to {MIXED_RETRY * f / 1e9:.4g} GHz")
             self._mixed_failed = max(getattr(self, '_mixed_failed', 0.0), f)
@@ -804,7 +804,7 @@ class FastOperator:
         X = T @ Xq
         R = T.T @ (E - self.matvec_exact_multi(X, Sx))
         rel = np.linalg.norm(dsc[:, None] * R, axis=0) / np.maximum(np.linalg.norm(dsc[:, None] * Eq, axis=0), 1e-300)
-        if (rel > 100 * self.mixed_tol).any():
+        if not (rel <= 100 * self.mixed_tol).all():          # NaN too: a GMRES breakdown
             sim.log.note(f"WARNING mixed precision did not converge at {f / 1e9:.4g} GHz (residual {rel.max():.1e}) "
                          f"- solving in double precision up to {MIXED_RETRY * f / 1e9:.4g} GHz")
             self._mixed_failed = max(getattr(self, '_mixed_failed', 0.0), f)
@@ -886,7 +886,7 @@ class FastOperator:
             rel = np.linalg.norm(R, axis=0) / np.maximum(np.linalg.norm(B, axis=0), 1e-300)
         fac.release()
         sim.log.note(f"tiled mixed precision: GMRES iterations per port {self.iters}")
-        if (rel > 100 * self.mixed_tol).any():
+        if not (rel <= 100 * self.mixed_tol).all():          # NaN too: a GMRES breakdown
             sim.log.note(f"WARNING tiled mixed precision did not converge at {f / 1e9:.4g} GHz (residual "
                          f"{rel.max():.1e}): the pivoted LU from here on")
             self._tiled_failed = True
@@ -946,7 +946,7 @@ class FastOperator:
             rel = np.linalg.norm(B - Z @ Y, axis=0) / np.maximum(np.linalg.norm(B, axis=0), 1e-300)
         gpu.release()
         sim.log.note(f"mixed precision (GPU): GMRES iterations per port {self.iters}")
-        if (rel > 100 * self.mixed_tol).any():
+        if not (rel <= 100 * self.mixed_tol).all():          # NaN too: a GMRES breakdown
             sim.log.note(f"mixed precision (GPU) did not converge at {f / 1e9:.4g} GHz (residual {rel.max():.1e}): "
                          f"double precision up to {HYBRID_RETRY * f / 1e9:.4g} GHz")
             self._hybrid_failed = max(getattr(self, '_hybrid_failed', 0.0), f)
