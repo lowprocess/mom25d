@@ -210,14 +210,17 @@ class PlanarModel:
         from .base import C0
         H = float(self.stack.z[-1])
         length_for = lambda w: max(16e-3, 10 * (w + H))
+        # the reference planes no wider than the line and 3 H each side: the field is gone by then (Zc and gamma
+        # within 0.01 % of a 13 mm plane's on sma_launch), and a wide plane had been most of the unknowns
+        narrow = lambda planes, w: {k: min(W, w + 6 * H) for k, W in planes.items()}
         cache = {}
         for p in ports:
             if isinstance(p, DiffPort):
                 a, b = p.pos, p.neg
                 mid = 0.5 * (a.s0 + a.s1)
                 pt = Point(*(0.5 * (a.c + b.c) + a.d * mid))
-                planes = self._planes_at(a.layer, pt, a.d, a.w)
                 gap = abs((a.c - b.c) @ a.t) - 0.5 * (a.w + b.w)
+                planes = narrow(self._planes_at(a.layer, pt, a.d, a.w), a.w + b.w + gap)
                 ge, ze, go, zo = line_char_pair(self.stack, a.layer, 0.5 * (a.w + b.w), gap, fs, planes=planes, dmax=dmax,
                                                 length=length_for(a.w + b.w + gap))
                 zd, zcm = 2 * zo.real, ze.real / 2
@@ -229,7 +232,7 @@ class PlanarModel:
             if not isinstance(p, LinePort):
                 continue
             pt = Point(*(p.c + p.d * 0.5 * (p.s0 + p.s1)))
-            planes = self._planes_at(p.layer, pt, p.d, p.w)
+            planes = narrow(self._planes_at(p.layer, pt, p.d, p.w), p.w)
             cop = self._coplanar_at(p.layer, pt, p.d, p.w)
             key = (p.layer, round(p.w * 1e7), tuple(sorted((k, round(W * 1e5)) for k, W in planes.items())),
                    tuple((round(a * 1e6), round(b * 1e6)) for a, b in cop))
