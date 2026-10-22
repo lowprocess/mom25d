@@ -9,6 +9,9 @@ most, until they agree everywhere on the band.
 import numpy as np
 
 
+SMALL = 1e-4          # entries below this fraction of the largest are fitted apart (see aaa)
+
+
 def aaa(z, F, tol=1e-10, mmax=80):
     """Set-valued AAA (Nakatsukasa, Sete, Trefethen 2018; Lietaert et al. 2022).
     z: (n,) sample points, F: (n, m) values.  Returns r(zz) -> (len(zz), m)."""
@@ -17,6 +20,20 @@ def aaa(z, F, tol=1e-10, mmax=80):
     if F.ndim == 1:
         F = F[:, None]
     n, m = F.shape
+    small = np.abs(F).max(0) < SMALL * np.abs(F).max()
+    if small.any() and not small.all():
+        # entries below SMALL of the largest (ports with no path between them: a cut network's, at the solver's
+        # noise) fitted on their own: in the shared denominator they had decided the poles the large entries
+        # left free, and spoilt the large entries' model between the samples
+        big_r, small_r = aaa(z, F[:, ~small], tol, mmax), aaa(z, F[:, small], tol, mmax)
+
+        def r(zz):
+            a, b = big_r(zz), small_r(zz)
+            out = np.empty((len(a), m), complex)
+            out[:, ~small], out[:, small] = a, b
+            return out
+        r.support, r.weights = big_r.support, big_r.weights
+        return r
     scale = np.maximum(np.abs(F).max(0), 1e-300)
     Fs = F / scale
     J = np.ones(n, bool)
