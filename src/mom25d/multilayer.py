@@ -12,7 +12,7 @@ mom25d.multilayer - Stage 2 (part 1) of the 2.5D planar MoM solver: multilayer s
     integrated analytically; the remainder is tabulated per frequency.
   * Non-uniform tensor mesh: n cells across narrow strips, dmax along them
   * Layer-aware ports, run log (timings), and diagnostics (wave-fit residual, reciprocity,
-    passivity) for the visualisation module (mom25d.viz).
+    passivity).
 
 Not yet: vias / vertical currents (stage 2, part 2), conductor thickness, lumped components.
 Time convention exp(+j w t).

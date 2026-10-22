@@ -11,12 +11,11 @@ Stage-2 demo: broadside-coupled stripline quarter-wave coupler (two metal layers
 
 Lossless and fully enclosed -> no radiation, so sum_i |S_i1|^2 must be 1 (strict check).
 Homogeneous dielectric -> even/odd modes have equal velocity -> P4 (isolated) should be very low.
-Outputs: coupler_dashboard.png, coupler.s4p
-Run: python demo_ml.py   (a few minutes)
+Outputs: coupler.s4p
+Run: python demo_multilayer.py   (a few minutes)
 """
 import numpy as np
 from mom25d.multilayer import *
-import mom25d.viz as viz
 
 er, w = 4.3, 0.15e-3
 st = LayerStack([Layer(0.2e-3, er, name='core'), Layer(0.1e-3, er, name='prepreg'),
@@ -59,4 +58,3 @@ if __name__ == '__main__':
                 row = vals[4*r:4*r+4]
                 fh.write((f"{fi:.6e} " if r == 0 else " " * 13) +
                          " ".join(f"{v.real:.6e} {v.imag:.6e}" for v in row) + "\n")
-    print('wrote', viz.dashboard(sim, res, 'coupler_dashboard.png'))
