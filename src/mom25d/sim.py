@@ -420,8 +420,7 @@ class Simulation:
                         if m == 'round':
                             return (v.x, v.y, v.a if v.ring else 0.0)
                         # an n-sided via: its barrel as an n-gon (signal vias, via_barrel) or a single vertex
-                        barrel = (v.ring and getattr(v, 'kind', None) == 'signal' and via_barrel
-                                  and not mesher.startswith('gmsh'))
+                        barrel = v.ring and getattr(v, 'kind', None) == 'signal' and via_barrel
                         return (v.x, v.y, v.a, m) if barrel else (v.x, v.y, 0.0)
                     vpts = [vpt(v) for _, v in vias_here]
                     fine = None
@@ -431,26 +430,21 @@ class Simulation:
                                 .buffer(3 * abs(stack.z[j] - stack.z[k]) + 2 * dmax)
                                 for j in self.layers if j != k and abs(stack.z[j] - stack.z[k]) < refine]
                         fine = shapely.unary_union(near) if near else None
-                    mesh_fn = mesh_polygons
-                    if mesher.startswith('gmsh'):                    # gmsh | gmsh-rings | gmsh-graded
-                        from functools import partial
-                        from .mesh_gmsh import mesh_polygons_gmsh
-                        mesh_fn = partial(mesh_polygons_gmsh, mode=mesher.split('-')[1] if '-' in mesher else 'layers')
-                    zkw = dict(edge_zone=zone, split_chains=True) if zone is not None and mesh_fn is mesh_polygons else {}
+                    zkw = dict(edge_zone=zone, split_chains=True) if zone is not None else {}
                     dm_mesh, dm_fine = dm, (2 * dmax if fine is not None else None)
-                    if zone is not None and dmax_out and dmax_out > dm and mesh_fn is mesh_polygons:
+                    if zone is not None and dmax_out and dmax_out > dm:
                         # outside the zone the copper carries little current: cells up to dmax_out there,
                         # dm (or the refinement's 2 dmax) inside it
                         zf = geoms[k].intersection(zone)
                         if not zf.is_empty and zf.area < 0.99 * geoms[k].area:      # else: all of it is signal
                             fine = zf if fine is None else shapely.unary_union([fine, zf])
                             dm_mesh, dm_fine = dmax_out, min(dm, dm_fine or dm)
-                    nd, tr, vids = mesh_fn(geoms[k], dm_mesh, wr, ncross, grade, lines=seg, vias=vpts,
-                                           fine=fine, dmax_fine=dm_fine, **zkw)
+                    nd, tr, vids = mesh_polygons(geoms[k], dm_mesh, wr, ncross, grade, lines=seg, vias=vpts,
+                                                 fine=fine, dmax_fine=dm_fine, **zkw)
                 for (i, v), vid in zip(vias_here, vids):
                     assert vid >= 0, f"via {v.name}: not on the M{k} mesh"
                     via_vertex[(i, k)] = vid + off
-                self.mesher_used[k] = 'tensor' if use_tensor else (mesher if mesher.startswith('gmsh') else 'polygon')
+                self.mesher_used[k] = 'tensor' if use_tensor else 'polygon'
                 nodes.append(nd); tris.append(tr + off); tl.append(np.full(len(tr), k)); off += len(nd)
             self.rwg = RWG(np.vstack(nodes), np.vstack(tris))
             self.tri_layer = np.concatenate(tl)

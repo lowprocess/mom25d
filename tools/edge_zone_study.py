@@ -11,7 +11,7 @@ def solve(sim):
     S = np.array([renorm(sim.sparams(f), np.array([p.zc for p in sim.ports]), zr) for f in F])
     return S, (time.time() - t) / len(F)
 cases = [('REF dmax 0.2 ncross 6', lambda: make(**VARIANTS['REF dmax 0.2 ncross 6']))]
-cases += [(n, (lambda kw=VARIANTS[n]: make(**kw))) for n in ['default (triangle, ncross 4)', 'gmsh (layers)', 'ncross 2', 'dmax 0.5']]
+cases += [(n, (lambda kw=VARIANTS[n]: make(**kw))) for n in ['default (triangle, ncross 4)', 'ncross 2', 'dmax 0.5']]
 cases += [(n, (lambda b=ZONES[n][0]: zoned(b))) for n in ['zone 1.0 mm', 'zone 0.5 mm']]
 cases += [('zone 0.3 mm', lambda: zoned(0.3))]
 ref = None; out = {}

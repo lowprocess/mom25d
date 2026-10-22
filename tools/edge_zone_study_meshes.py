@@ -1,4 +1,4 @@
-import os, sys, json, time, numpy as np
+import os, sys
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'); sys.path.insert(0, ROOT)
 from kicad2ems.board import Board
 from kicad2ems.importers.kicad import KiCadBoard
@@ -13,9 +13,6 @@ def make(port='auto', **kw):
     return m.simulation(verbose=False, solver='direct', characterize=False, **a)
 VARIANTS = {
   'default (triangle, ncross 4)': {},
-  'gmsh (layers)': dict(mesher='gmsh'),
-  'gmsh-rings': dict(mesher='gmsh-rings'),
-  'gmsh-graded': dict(mesher='gmsh-graded'),
   'grade 1.5': dict(grade=1.5),
   'grade 2': dict(grade=2.0),
   'ncross 3': dict(ncross=3),

@@ -1,5 +1,5 @@
 """
-Mesher study: accuracy per unknown of the polygon meshers (triangle, gmsh boundary layers, gmsh graded) on
+Mesher study: accuracy per unknown of mom25d's polygon mesh (Triangle, offset rings at the copper edges) on
 a board (a kicad2ems <name>_board.json), against a fine reference mesh.
 
     python tools/mom25d/mesher_study.py out/board_board.json [--freqs 2.9,3.1,...] [--out study.json]
@@ -35,7 +35,7 @@ def main():
     ap.add_argument('board')
     ap.add_argument('--freqs', default='2.0,2.9,3.1,3.2,3.25,3.3,3.4,3.6,5.0')
     ap.add_argument('--ref', default='triangle:0.08:10', help='reference mesher:dmax_mm:ncross')
-    ap.add_argument('--cases', default='triangle,gmsh;0.4,0.3,0.2,0.15;6|gmsh-graded;0.6,0.4;4,6')
+    ap.add_argument('--cases', default='triangle;0.4,0.3,0.2,0.15;4,6,8')
     ap.add_argument('--out', default='mesher_study.json')
     a = ap.parse_args()
     freqs = np.array([float(v) for v in a.freqs.split(',')]) * 1e9
