@@ -415,7 +415,7 @@ def test_line_functions_on_a_straight_run():
         sim = Simulation(st, {1: geo}, [ViaPort(v1, 50.0), ViaPort(v2, 50.0)], dmax=0.3e-3, w_ref=w, ncross=4,
                          verbose=False, solver='direct', precision='double', line_basis=lb)
         out[lb] = sim, sim.sparams(6e9)
-    (s0, S0), (s1, S1) = out[None], out['on']
+    (_, S0), (s1, S1) = out[None], out['on']
     qi = s1.quad_info
     assert qi['runs'] == 1 and qi['functions'] < qi['edges_replaced'] / 6
     assert np.abs(S1 - S0).max() < 0.003

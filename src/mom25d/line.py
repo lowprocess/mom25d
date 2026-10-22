@@ -21,7 +21,6 @@ stay unknowns of their own; the runs stop short of bends, tees and pads (by `mar
                             exclude_edges=..)
 """
 import numpy as np
-import shapely
 from shapely.geometry import Polygon
 from shapely.geometry.polygon import orient
 from scipy import sparse

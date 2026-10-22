@@ -115,7 +115,7 @@ def project(Z, keep, elim, C):
     rdt = np.float32 if Z.dtype == np.complex64 else np.float64
     C = sparse.csr_matrix(C, dtype=rdt)
     Ct = C.T.tocsr()
-    nk, Nr = len(keep), C.shape[1]
+    nk = len(keep)
     ZT = np.asarray(Ct @ np.take(Z, elim, axis=1).T).T            # Z T = [Z[:, keep], 0] + Z[:, elim] C
     ZT[:, :nk] += np.take(Z, keep, axis=1)
     Zq = np.asarray(Ct @ np.take(ZT, elim, axis=0))               # T^T (Z T) = [ZT[keep]; 0] + C^T ZT[elim]
