@@ -55,19 +55,42 @@ def set_core(module):
     _core = module
 
 
-NEAR_CHUNK = 8_000_000      # near-field triplets per piece of the sparse matrix (_near_csr)
+NEAR_CHUNK = 8_000_000      # near-field triplets per piece of the sum into the sparse matrix (_near_csr)
 
 
-def _near_csr(ri, ci, vv, n):
-    """The n x n CSR of the core's near-field triplets (row < 0: unused), duplicates summed, built a piece at a
-    time: the masked copies and SciPy's COO -> CSR of all of them at once had peaked at 3x the triplets' own
-    memory (70 M triplets, 1.7 GB, on the SMA launch's port characterisation: 5 GB more than the matrix)."""
-    out = sparse.csr_matrix((n, n), dtype=vv.dtype)
-    for s in range(0, len(ri), NEAR_CHUNK):
-        r, c, v = ri[s:s + NEAR_CHUNK], ci[s:s + NEAR_CHUNK], vv[s:s + NEAR_CHUNK]
-        ok = r >= 0
-        out = out + sparse.csr_matrix((v[ok], (r[ok], c[ok])), shape=(n, n))
-    return out
+def _near_pattern(ri, ci, n):
+    """The CSR structure of the core's near-field triplets (row < 0: unused): the same at every frequency, a
+    pair's nine slots being the edges of its two triangles. (indptr, indices, the used slots in CSR order,
+    where each entry's run of them starts)."""
+    slot = np.flatnonzero(ri >= 0)
+    key = ri[slot].astype(np.int64) * n + ci[slot]
+    o = np.argsort(key)
+    slot, key = slot[o].astype(np.int32), key[o]
+    del o
+    first = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
+    key = key[first]
+    indptr = np.r_[0, np.cumsum(np.bincount(key // n, minlength=n))].astype(np.int32)
+    return indptr, (key % n).astype(np.int32), slot, first.astype(np.int32)
+
+
+def _near_csr(ri, ci, vv, n, owner):
+    """The n x n CSR of the core's near-field triplets, duplicates summed. The structure is built once and
+    kept on `owner` (_near_pattern: 3.4 s on the SMA launch's 84 M triplets); each frequency then only sums
+    its values into it, a piece at a time (0.6 s, against 3.1 s for SciPy's COO -> CSR every frequency)."""
+    pat = getattr(owner, '_near_pat', None)
+    if pat is None or pat[0] != (len(ri), n):
+        pat = owner._near_pat = ((len(ri), n), _near_pattern(ri, ci, n))
+    indptr, indices, slot, first = pat[1]
+    data = np.empty(len(first), vv.dtype)
+    a = 0
+    while a < len(first):                              # whole entries per piece: about NEAR_CHUNK slots
+        b = min(len(first), int(np.searchsorted(first, first[a] + NEAR_CHUNK)))
+        s1 = first[b] if b < len(first) else len(slot)
+        data[a:b] = np.add.reduceat(vv[slot[first[a]:s1]], first[a:b] - first[a])
+        a = b
+    M = sparse.csr_matrix((data, indices, indptr), shape=(n, n))
+    M.has_canonical_format = True
+    return M
 
 
 # =============================================================================
@@ -476,6 +499,7 @@ class FastOperator:
                       P3=np.ascontiguousarray(sim.P3), W3=np.ascontiguousarray(sim.W3),
                       P6=np.ascontiguousarray(sim.P6), W6=np.ascontiguousarray(sim.W6))
         self.nP32, self.nQ32 = self.nP.astype(np.int32), self.nQ.astype(np.int32)
+        self._near_pat = None                          # _near_csr: the structure of these pairs
 
     def _core_tables(self):
         L = len(self.layers)
@@ -552,7 +576,7 @@ class FastOperator:
         with sim.log.timer('near-field correction'):
             if self.core is not None:
                 ri, ci, vv, qc = self.core.near_coo(self.g, self.tb, self.q, self.nP32, self.nQ32, self.w)
-                dZ = _near_csr(ri, ci, vv, sim.Ne)
+                dZ = _near_csr(ri, ci, vv, sim.Ne, self)
                 self._qcorr = qc
                 del ri, ci, vv
             else:
@@ -693,7 +717,7 @@ class FastOperator:
             if precision == 'mixed' and not hybrid:
                 # keep the exact near correction (sparse, double) for the refinement products
                 ri, ci, vv, qc = self.core.near_coo(self.g, self.tb, self.q, self.nP32, self.nQ32, self.w)
-                self.dZ_exact = _near_csr(ri, ci, vv, Ne)
+                self.dZ_exact = _near_csr(ri, ci, vv, Ne, self)
                 del ri, ci, vv
                 Dc = self.dZ_exact.tocoo()
                 Z[Dc.row, Dc.col] += Dc.data.astype(dt)            # one entry per (row, col): no add.at needed
@@ -839,7 +863,7 @@ class FastOperator:
         N = Ne + Nv
         with sim.log.timer('near-field correction'):
             ri, ci, vv, qc = core.near_coo(self.g, self.tb, self.q, self.nP32, self.nQ32, self.w)
-            self.dZ_exact = _near_csr(ri, ci, vv, Ne)
+            self.dZ_exact = _near_csr(ri, ci, vv, Ne, self)
             self._qcorr = qc
             del ri, ci, vv
         if Nv:
