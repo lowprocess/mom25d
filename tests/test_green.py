@@ -5,14 +5,16 @@ Each test checks the solver against a closed-form result or a conservation law.
 import numpy as np
 import pytest
 
-from mom25d.base import GreenTable, Stackup, line_characterization, C0, MU0, EPS0   # noqa: E402
-from mom25d.multilayer import (Layer, LayerStack, GreenTableML, line_char_ml,             # noqa: E402
-                       stripline_z0_cohn)
+from mom25d.base import C0, MU0, EPS0
+from mom25d.multilayer import Layer, LayerStack, GreenTableML, stripline_z0_cohn
+from mom25d.sim import line_char_xs
+from mom25d_reference import GreenTable, Stackup                    # the first solver's Sommerfeld integrals
 
 RHO = np.array([1e-5, 1e-4, 5e-4, 2e-3, 8e-3, 15e-3])
 
 
-def test_single_layer_green_matches_stage1():
+def test_single_layer_green_matches_sommerfeld():
+    """One layer: the spectral network's kernels against the Sommerfeld integrals of the grounded slab."""
     f = 5e9
     g1 = GreenTable(f, Stackup(0.2e-3, 4.3, 0.02), 20e-3)
     g2 = GreenTableML(f, LayerStack([Layer(0.2e-3, 4.3, 0.02)]), 1, 1, 20e-3)
@@ -40,7 +42,7 @@ def test_air_stack_matches_exact_images(o, s):
 def test_stripline_vs_cohn():
     b, er, w = 0.4e-3, 4.3, 0.15e-3
     st = LayerStack([Layer(b / 2, er), Layer(b / 2, er)], top='pec')
-    g, z = line_char_ml(st, 1, w, [5e9])
+    g, z = line_char_xs(st, 1, w, [5e9], ncross=6)
     eps_eff = (g[0].imag / (2 * np.pi * 5e9 / C0)) ** 2
     assert abs(z[0].real / stripline_z0_cohn(w, b, er) - 1) < 0.01      # within 1 %
     assert abs(eps_eff / er - 1) < 0.002                                # TEM: eps_eff = er
@@ -50,8 +52,7 @@ def test_stripline_vs_cohn():
 def test_split_substrate_equals_single_layer():
     w, h = 0.35e-3, 0.2e-3
     st = LayerStack([Layer(h / 2, 4.3, 0.02), Layer(h / 2, 4.3, 0.02)])
-    # same (uniform) cross-strip mesh as stage 1 -> results must agree closely
-    g2, z2 = line_char_ml(st, 2, w, [5e9], ncross=6, grade=0.0)
-    g1, z1 = line_characterization(Stackup(h, 4.3, 0.02), w, [5e9], dx=0.5e-3, dy=w / 6)
+    g2, z2 = line_char_xs(st, 2, w, [5e9])                          # the substrate in two layers of one
+    g1, z1 = line_char_xs(LayerStack([Layer(h, 4.3, 0.02)]), 1, w, [5e9])
     assert abs(z2[0].real / z1[0].real - 1) < 0.002
     assert abs(g2[0].imag / g1[0].imag - 1) < 0.002

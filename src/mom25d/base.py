@@ -1,147 +1,16 @@
 """
-mom25d.py - Stage 1 of a 2.5D planar Method-of-Moments solver (open source, pure NumPy/SciPy)
-
-Structure : metal sheets on top of a grounded dielectric slab (microstrip-type, single layer)
-Equation  : mixed-potential integral equation (MPIE), Galerkin, RWG basis on triangles
-Kernels   : layered-media Green's functions via Sommerfeld integrals
-            G = G_quasi_static(analytic 1/rho + images) + G_dynamic(numerical, deformed contour)
-            the 1/rho part is integrated analytically (Wilton et al.), the rest by Gauss quadrature
-Ports     : delta-gap sources on a transverse mesh line + travelling-wave extraction on the
-            feed line (reference-plane de-embedding, multi-state S = B A^-1)
-Geometry  : Manhattan (union of rectangles) so the mesh is a conforming structured triangulation
+mom25d.base - the pieces of the 2.5D planar Method-of-Moments solver its layers share: RWG basis functions on
+triangles, the frequency-independent 1/R moment integrals (the inner integral analytic, Wilton et al.), the
+quadrature rules, the delta-gap port and the travelling-wave fits on a port's feed line.
 
 Time convention exp(+j w t).
 """
 import numpy as np
 from scipy import sparse
-from scipy.special import jv
-from scipy.interpolate import CubicSpline
 
 MU0 = 4e-7 * np.pi
 C0 = 299792458.0
 EPS0 = 1.0 / (MU0 * C0 ** 2)
-
-
-# =============================================================================
-# 1. Layered-media Green's function (source & observation on the air/substrate interface)
-# =============================================================================
-class Stackup:
-    """Grounded dielectric slab: thickness h [m], relative permittivity er, loss tangent tand."""
-    def __init__(self, h, er, tand=0.0):
-        self.h, self.er, self.tand = h, er, tand
-
-    @property
-    def er_c(self):
-        return self.er * (1 - 1j * self.tand)
-
-
-def sommerfeld_dynamic(k0, h, er_c, rho, K, nq=8):
-    """
-    Numerical part of the Sommerfeld integrals:
-        G_dyn(rho) = 1/(2 pi) * Int [ G~(kr) - G~_qs(kr) ] J0(kr rho) kr dkr
-    along a contour pushed into the upper-half kr plane (stays clear of the surface-wave
-    poles and the k0 branch point).  Returns (G_A_dyn, G_q_dyn) on the rho grid.
-    """
-    w = k0 * C0
-    kd = k0 * np.sqrt(er_c)
-    t1 = 1.5 * kd.real
-    alpha = min(0.5 * k0, 4.0 / rho.max())
-    wid1 = min(0.3 * k0, 0.8 * alpha)
-    wid2 = 2 * np.pi / rho.max()
-    b1 = np.linspace(0, t1, int(np.ceil(t1 / wid1)) + 1)
-    b2 = np.append(np.arange(t1, K, wid2), K)
-    br = np.concatenate([b1, b2[1:]])
-    xg, wg = np.polynomial.legendre.leggauss(nq)
-    a, b = br[:-1, None], br[1:, None]
-    t = (0.5 * (b - a) * xg[None, :] + 0.5 * (a + b)).ravel()
-    wt = (0.5 * (b - a) * wg[None, :]).ravel()
-    s = np.where(t < t1, alpha * np.sin(np.pi * t / t1), 0.0)
-    ds = np.where(t < t1, alpha * np.pi / t1 * np.cos(np.pi * t / t1), 0.0)
-    kr = t + 1j * s
-    dk = wt * (1 + 1j * ds)
-
-    kz0 = -1j * np.sqrt(kr ** 2 - k0 ** 2)          # Im(kz) <= 0 sheet
-    kz1 = -1j * np.sqrt(kr ** 2 - kd ** 2)
-    cot = 1.0 / np.tan(kz1 * h)
-    GA = MU0 / (1j * kz0 + kz1 * cot)                                       # TE
-    Ve = 1j * kz0 * kz1 / (w * EPS0 * (er_c * kz0 * cot + 1j * kz1))        # TM
-    Gq = 1j * w * (Ve - 1j * w * GA) / kr ** 2
-    GA_qs = MU0 * (1 - np.exp(-2 * kr * h)) / (2 * kr)                      # kr -> inf limits
-    Gq_qs = 1.0 / (EPS0 * kr * (1 + er_c / np.tanh(kr * h)))
-
-    J = jv(0, rho[:, None] * kr[None, :])
-    dA = J @ ((GA - GA_qs) * kr * dk) / (2 * np.pi)
-    dQ = J @ ((Gq - Gq_qs) * kr * dk) / (2 * np.pi)
-    return dA, dQ
-
-
-class GreenTable:
-    """
-    G_A(rho) = cA / rho + A_rest(rho),   G_q(rho) = cq / rho + Q_rest(rho)
-    A_rest / Q_rest are smooth (no singularity) and tabulated on a fine uniform grid.
-    """
-    def __init__(self, f, st, rho_max, nrho=260, nfine=8192, K=None, nimg=None):
-        w = 2 * np.pi * f
-        k0 = w / C0
-        er_c, h = st.er_c, st.h
-        K = K or (1e5 + 40 * k0 * np.sqrt(st.er))
-        u = np.linspace(0, 1, nrho)
-        rho = rho_max * u ** 2
-        dA, dQ = sommerfeld_dynamic(k0, h, er_c, rho, K)
-        fine = np.linspace(0, rho_max, nfine)
-        Kc = (er_c - 1) / (er_c + 1)
-        if nimg is None:
-            nimg = int(min(400, max(10, np.ceil(np.log(1e-10) / np.log(abs(Kc) + 1e-12)))))
-        n = np.arange(1, nimg + 1)
-        img = ((-Kc) ** (n - 1))[None, :] / np.sqrt(fine[:, None] ** 2 + (2 * n * h)[None, :] ** 2)
-        self.cA = MU0 / (4 * np.pi)
-        self.cq = 1.0 / (2 * np.pi * EPS0 * (1 + er_c))
-        self.rho = fine
-        self.A_rest = CubicSpline(rho, dA)(fine) - self.cA / np.sqrt(fine ** 2 + 4 * h ** 2)
-        self.Q_rest = CubicSpline(rho, dQ)(fine) - self.cq * (1 + Kc) * img.sum(1)
-
-    def A(self, r):
-        return np.interp(r, self.rho, self.A_rest.real) + 1j * np.interp(r, self.rho, self.A_rest.imag)
-
-    def Q(self, r):
-        return np.interp(r, self.rho, self.Q_rest.real) + 1j * np.interp(r, self.rho, self.Q_rest.imag)
-
-
-# =============================================================================
-# 2. Mesh: Manhattan layout -> conforming structured triangulation, RWG edges
-# =============================================================================
-def _axis_lines(vals, dmax):
-    v = np.unique(np.round(np.asarray(vals, float), 10))
-    out = [v[0]]
-    for a, b in zip(v[:-1], v[1:]):
-        n = max(1, int(np.ceil((b - a) / dmax - 1e-9)))
-        out.extend(np.linspace(a, b, n + 1)[1:])
-    return np.array(out)
-
-
-def make_mesh(rects, dx, dy, xlines=(), ylines=()):
-    xs = [r[0] for r in rects] + [r[2] for r in rects] + list(xlines)
-    ys = [r[1] for r in rects] + [r[3] for r in rects] + list(ylines)
-    X, Y = _axis_lines(xs, dx), _axis_lines(ys, dy)
-    cx, cy = 0.5 * (X[:-1] + X[1:]), 0.5 * (Y[:-1] + Y[1:])
-    inside = np.zeros((len(cx), len(cy)), bool)
-    for x0, y0, x1, y1 in rects:
-        inside |= ((cx[:, None] > x0) & (cx[:, None] < x1) & (cy[None, :] > y0) & (cy[None, :] < y1))
-    ids, pts, tris = {}, [], []
-
-    def nid(i, j):
-        if (i, j) not in ids:
-            ids[(i, j)] = len(pts)
-            pts.append((X[i], Y[j]))
-        return ids[(i, j)]
-
-    for i, j in zip(*np.nonzero(inside)):
-        n0, n1, n2, n3 = nid(i, j), nid(i + 1, j), nid(i + 1, j + 1), nid(i, j + 1)
-        if (i + j) % 2 == 0:
-            tris += [(n0, n1, n2), (n0, n2, n3)]
-        else:
-            tris += [(n0, n1, n3), (n1, n2, n3)]
-    return np.array(pts), np.array(tris)
 
 
 class RWG:
@@ -207,7 +76,7 @@ def combine(rwg, Mrr, Mrx, Mry, M0):
 
 
 # =============================================================================
-# 3. Integrals
+# 2. Integrals
 # =============================================================================
 # 6-point degree-4 rule (weights sum to 1) for the analytic-inner / numerical-outer integrals
 _a1, _a2 = 0.445948490915965, 0.091576213509771
@@ -262,32 +131,6 @@ def singular_moments(rwg, nb=16):
     return M0, Mr, Mrr
 
 
-def smooth_moments(rwg, gt, nb=40):
-    """Gauss-quadrature moments of the smooth remainder kernels (A and q)."""
-    Ar = rwg.area
-    Nt = len(Ar)
-    P = quad_pts(rwg, _BAR3)
-    A0 = np.zeros((Nt, Nt), complex); Arx = np.zeros_like(A0); Ary = np.zeros_like(A0)
-    Arr = np.zeros_like(A0); Q0 = np.zeros_like(A0)
-    AA = Ar[:, None] * Ar[None, :] / 9.0
-    for p0 in range(0, Nt, nb):
-        sl = slice(p0, min(Nt, p0 + nb))
-        pa = P[sl][:, None, :, None, :]
-        pb = P[None, :, None, :, :]
-        diff = pa - pb
-        rho = np.sqrt((diff ** 2).sum(-1))                       # (nb,Nt,3,3)
-        GA, GQ = gt.A(rho), gt.Q(rho)
-        dot = (pa * pb).sum(-1)
-        w = AA[sl]
-        A0[sl] = w * GA.sum((2, 3))
-        Q0[sl] = w * GQ.sum((2, 3))
-        Gb = GA.sum(3)                                           # (nb,Nt,3)
-        Arx[sl] = w * (Gb * P[sl][:, None, :, 0]).sum(2)
-        Ary[sl] = w * (Gb * P[sl][:, None, :, 1]).sum(2)
-        Arr[sl] = w * (dot * GA).sum((2, 3))
-    return A0, Arx, Ary, Arr, Q0
-
-
 def gram_matrix(rwg):
     """int f_m . f_n dS  (for a surface-impedance term Zs * Gram)."""
     Ar = rwg.area
@@ -299,7 +142,7 @@ def gram_matrix(rwg):
 
 
 # =============================================================================
-# 4. Ports and the solver
+# 3. Ports and the wave fits
 # =============================================================================
 class Port:
     """
@@ -323,157 +166,20 @@ class Port:
         return np.array([self.dir, 0.0]) if self.axis == 'x' else np.array([0.0, self.dir])
 
 
-class PlanarMoM:
-    def __init__(self, stack, rects, ports, dx, dy, verbose=True):
-        self.st, self.ports, self.verbose = stack, ports, verbose
-        xl, yl = [], []
-        self.samples = []
-        for p in ports:
-            step = p.step or (dx if p.axis == 'x' else dy)
-            s0 = p.s0 if p.s0 is not None else 2 * step
-            n = int(np.floor((p.ref - s0) / step + 1e-9)) + 1
-            s = p.ref - step * np.arange(n)[::-1]            # uniform, ends on the reference plane
-            self.samples.append(s)
-            cuts = list(p.pos + p.dir * np.append(s, 0.0))
-            (xl if p.axis == 'x' else yl).extend(cuts)
-        nodes, tris = make_mesh(rects, dx, dy, xl, yl)
-        self.rwg = RWG(nodes, tris)
-        r = self.rwg
-        if verbose:
-            print(f"mesh: {len(tris)} triangles, {r.Ne} RWG unknowns")
-        ext = nodes.max(0) - nodes.min(0)
-        self.rho_max = 1.05 * np.hypot(*ext) + 1e-4
-        M0, Mr, Mrr = singular_moments(r)
-        sym = lambda M: 0.5 * (M + M.T)
-        self.SA = combine(r, sym(Mrr), Mr[..., 0], Mr[..., 1], sym(M0))
-        self.SA = 0.5 * (self.SA + self.SA.T)
-        self.SQ = qform(r.D, sym(M0), r.D)
-        self.SQ = 0.5 * (self.SQ + self.SQ.T)
-        self._gram = None
-        self._edge_sets()
-
-    # ---- port bookkeeping -------------------------------------------------
-    def _line_edges(self, p, c):
-        r, tol = self.rwg, 1e-9
-        k = 0 if p.axis == 'x' else 1
-        t = 1 - k
-        on = (np.abs(r.ends[:, 0, k] - c) < tol) & (np.abs(r.ends[:, 1, k] - c) < tol)
-        on &= (r.mid[:, t] > p.span[0] - tol) & (r.mid[:, t] < p.span[1] + tol)
-        idx = np.nonzero(on)[0]
-        sig = np.sign(r.nrm[idx] @ p.dvec)
-        return idx, sig
-
-    def _edge_sets(self):
-        self.gap, self.cuts = [], []
-        for p, s in zip(self.ports, self.samples):
-            self.gap.append(self._line_edges(p, p.pos))
-            self.cuts.append([self._line_edges(p, p.pos + p.dir * x) for x in s])
-            assert len(self.gap[-1][0]) > 0, f"port {p.name}: no mesh edges on gap line"
-
-    # ---- solve ----------------------------------------------------------------
-    def impedance(self, f, zs=0.0):
-        w = 2 * np.pi * f
-        gt = GreenTable(f, self.st, self.rho_max)
-        A0, Arx, Ary, Arr, Q0 = smooth_moments(self.rwg, gt)
-        sym = lambda M: 0.5 * (M + M.T)
-        r = self.rwg
-        ZA = gt.cA * self.SA + combine(r, sym(Arr), Arx, Ary, sym(A0))
-        ZQ = gt.cq * self.SQ + qform(r.D, sym(Q0), r.D)
-        Z = 1j * w * ZA + ZQ / (1j * w)
-        if zs != 0:
-            if self._gram is None:
-                self._gram = gram_matrix(r)
-            Z = Z + zs * self._gram
-        return 0.5 * (Z + Z.T)
-
-    def excitation(self, which=None):
-        r = self.rwg
-        ids = range(len(self.ports)) if which is None else which
-        V = np.zeros((r.Ne, len(list(ids))), complex)
-        for col, i in enumerate(ids):
-            idx, sig = self.gap[i]
-            V[idx, col] = sig * r.l[idx]                  # 1 V delta-gap, EMF along +dvec
-        return V
-
-    def cut_current(self, I, i):
-        """Current along the feed direction through each sample cut: (K, n_excitations)."""
-        out = []
-        l = self.rwg.l
-        for idx, sig in self.cuts[i]:                       # RWG coefficient is A/m -> times edge length
-            out.append(((sig * l[idx])[:, None] * I[idx]).sum(0))
-        return np.array(out)
-
-    # ---- wave extraction --------------------------------------------------
-    @staticmethod
-    def fit_gamma(Ik, step):
-        """Propagation constant from uniformly spaced samples of a 2-exponential current."""
-        num = den = 0.0
-        for col in range(Ik.shape[1]):
-            v = Ik[:, col]
-            num += np.sum((v[:-2] + v[2:]) * np.conj(v[1:-1]))
-            den += 2 * np.sum(np.abs(v[1:-1]) ** 2)
-        c = num / den
-        g = np.arccosh(c + 0j) / step
-        return abs(g.real) + 1j * abs(g.imag)
-
-    @staticmethod
-    def fit_waves(Ik, s, gamma):
-        """I(s) = a e^{-g s} + b e^{+g s}  ->  (a, b) per excitation."""
-        M = np.stack([np.exp(-gamma * s), np.exp(gamma * s)], 1)
-        coef, *_ = np.linalg.lstsq(M, Ik, rcond=None)
-        return coef[0], coef[1]
-
-    def sparams(self, f, zs=0.0, gamma_out=False):
-        """N-port S-parameters at the port reference planes (reference impedance = port.zc)."""
-        Z = self.impedance(f, zs)
-        V = self.excitation()
-        I = np.linalg.solve(Z, V)
-        n = len(self.ports)
-        Am, Bm, gam = np.zeros((n, n), complex), np.zeros((n, n), complex), []
-        for i, p in enumerate(self.ports):
-            step = abs(self.samples[i][1] - self.samples[i][0]) if len(self.samples[i]) > 1 else 1.0
-            Ik = self.cut_current(I, i)
-            g = self.fit_gamma(Ik, step)
-            gam.append(g)
-            Am[i], Bm[i] = self.fit_waves(Ik, self.samples[i] - p.ref, g)
-        zc = np.array([p.zc for p in self.ports], float)
-        S = -np.diag(np.sqrt(zc)) @ Bm @ np.linalg.inv(Am) @ np.diag(1 / np.sqrt(zc))
-        return (S, gam) if gamma_out else S
+def fit_gamma(Ik, step):
+    """Propagation constant from uniformly spaced samples of a 2-exponential current."""
+    num = den = 0.0
+    for col in range(Ik.shape[1]):
+        v = Ik[:, col]
+        num += np.sum((v[:-2] + v[2:]) * np.conj(v[1:-1]))
+        den += 2 * np.sum(np.abs(v[1:-1]) ** 2)
+    c = num / den
+    g = np.arccosh(c + 0j) / step
+    return abs(g.real) + 1j * abs(g.imag)
 
 
-def line_characterization(stack, w, freqs, length=20e-3, dx=0.5e-3, dy=None, zs_fn=None, verbose=False):
-    """
-    Characteristic impedance and propagation constant of a uniform line of width w from a
-    centre-fed MoM run (gap in the middle of a long line, travelling-wave fits both sides).
-    Returns arrays (gamma, Zc).
-    """
-    dy = dy or w / 4
-    L2 = length / 2
-    margin = 2.0e-3
-    pR = Port('x', 0.0, (-w / 2, w / 2), +1, L2 - margin, s0=1.0e-3, name='R')
-    pL = Port('x', 0.0, (-w / 2, w / 2), -1, L2 - margin, s0=1.0e-3, name='L')
-    sim = PlanarMoM(stack, [(-L2, -w / 2, L2, w / 2)], [pR, pL], dx, dy, verbose=verbose)
-    gam_o, zc_o = [], []
-    for f in freqs:
-        zs = zs_fn(f) if zs_fn else 0.0
-        Z = sim.impedance(f, zs)
-        I = np.linalg.solve(Z, sim.excitation([0]))           # 1 V on the right-facing gap edges
-        IR, IL = sim.cut_current(I, 0), sim.cut_current(I, 1)
-        step = dx
-        g = sim.fit_gamma(np.hstack([IR, IL]), step)
-        A, B = sim.fit_waves(IR, sim.samples[0], g)
-        Cp, Dp = sim.fit_waves(IL, sim.samples[1], g)
-        zc = 1.0 / ((A[0] - B[0]) - (Cp[0] - Dp[0]))
-        gam_o.append(g); zc_o.append(zc)
-    return np.array(gam_o), np.array(zc_o)
-
-
-def renormalize(S, zc, zref=50.0):
-    """Convert S (reference impedances zc[i]) to a common real reference zref."""
-    n = S.shape[0]
-    zc = np.asarray(zc, float)
-    I = np.eye(n)
-    Zn = I * 0 + (I + S) @ np.linalg.inv(I - S)             # normalised impedance matrix
-    Z = np.diag(np.sqrt(zc)) @ Zn @ np.diag(np.sqrt(zc))
-    z = Z / zref
-    return (z - I) @ np.linalg.inv(z + I)
+def fit_waves(Ik, s, gamma):
+    """I(s) = a e^{-g s} + b e^{+g s}  ->  (a, b) per excitation."""
+    M = np.stack([np.exp(-gamma * s), np.exp(gamma * s)], 1)
+    coef, *_ = np.linalg.lstsq(M, Ik, rcond=None)
+    return coef[0], coef[1]

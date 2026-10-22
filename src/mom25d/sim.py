@@ -25,7 +25,7 @@ FIT_SPAN = 0.4             # rad: a wave port's cuts must span this much to fit 
 import shapely
 
 from .base import MU0, EPS0, RWG, qform, combine, singular_moments, quad_pts, gram_matrix, \
-    _BAR3, _W3, _BAR6, _W6, PlanarMoM
+    _BAR3, _W3, _BAR6, _W6, fit_gamma, fit_waves
 from .multilayer import RunLog, GreenTableML, make_mesh_ml, MLPort
 from .geo import LinePort, port_from_axis, to_geometry, is_manhattan_rects, mesh_polygons
 from .via import ViaKernels
@@ -874,8 +874,8 @@ class Simulation:
                 # the characterised gamma at a span made S jump, which the adaptive sweep chased (38 solves)
                 gk = getattr(p, 'gamma_fn', None)
                 p.known_gamma = gk is not None
-                g = gk(f) if p.known_gamma else PlanarMoM.fit_gamma(Ik, abs(s[1] - s[0]))
-                a, b = PlanarMoM.fit_waves(Ik, s - p.ref, g)
+                g = gk(f) if p.known_gamma else fit_gamma(Ik, abs(s[1] - s[0]))
+                a, b = fit_waves(Ik, s - p.ref, g)
                 M = np.stack([np.exp(-g * (s - p.ref)), np.exp(g * (s - p.ref))], 1)
                 # residual relative to the largest response of this port over all excitations (a mode
                 # that is barely excited by some column, e.g. differential under common drive, would
@@ -961,9 +961,9 @@ def line_char_xs(stack, layer, w, freqs, planes=None, coplanar=None, via_pitch=1
     for f in freqs:
         I = sim.currents(f, sim.excitation()[:, [0]])
         IR, IL = sim.cut_current(I, 0), sim.cut_current(I, 1)
-        g = PlanarMoM.fit_gamma(np.hstack([IR, IL]), step)
-        A, B = PlanarMoM.fit_waves(IR, sim.samples[0], g)
-        Cp, Dp = PlanarMoM.fit_waves(IL, sim.samples[1], g)
+        g = fit_gamma(np.hstack([IR, IL]), step)
+        A, B = fit_waves(IR, sim.samples[0], g)
+        Cp, Dp = fit_waves(IL, sim.samples[1], g)
         gam.append(g); zc.append(1.0 / ((A[0] - B[0]) - (Cp[0] - Dp[0])))
     return np.array(gam), np.array(zc)
 
@@ -992,9 +992,9 @@ def line_char_pair(stack, layer, w, gap, freqs, planes=None, length=16e-3, dmax=
         I = sim.currents(f, V)
         for c, m in ((0, 'e'), (1, 'o')):
             IR, IL = sim.cut_current(I, 0)[:, c], sim.cut_current(I, 1)[:, c]     # line + only
-            g = PlanarMoM.fit_gamma(np.stack([IR, IL], 1), step)
-            A, B = PlanarMoM.fit_waves(IR[:, None], sim.samples[0], g)
-            Cp, Dp = PlanarMoM.fit_waves(IL[:, None], sim.samples[1], g)
+            g = fit_gamma(np.stack([IR, IL], 1), step)
+            A, B = fit_waves(IR[:, None], sim.samples[0], g)
+            Cp, Dp = fit_waves(IL[:, None], sim.samples[1], g)
             out[m][0].append(g); out[m][1].append(1.0 / ((A[0] - B[0]) - (Cp[0] - Dp[0])))
     return (np.array(out['e'][0]), np.array(out['e'][1]), np.array(out['o'][0]), np.array(out['o'][1]))
 

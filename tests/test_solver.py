@@ -7,11 +7,11 @@ import pytest
 from scipy.integrate import quad
 
 from mom25d.base import C0, MU0, EPS0
-from mom25d.multilayer import Layer, LayerStack, line_char_ml
+from mom25d.multilayer import Layer, LayerStack
 from mom25d.via import ViaKernels
 from mom25d.sing import offplane_pairs
 from mom25d.geo import mesh_polygons, LinePort
-from mom25d.sim import Simulation, SeriesLumped, Via, ViaPort
+from mom25d.sim import Simulation, SeriesLumped, Via, ViaPort, line_char_xs
 from mom25d.afs import aaa
 
 
@@ -43,7 +43,8 @@ def test_via_via_table_matches_the_direct_transform():
 
 
 def test_offplane_reduces_to_inplane_and_converges():
-    from mom25d.base import make_mesh, RWG, singular_moments
+    from mom25d.base import RWG, singular_moments
+    from mom25d_reference import make_mesh
     nodes, tris = make_mesh([(0, 0, 0.3e-3, 0.06e-3)], 0.15e-3, 0.03e-3)
     M0, _, _ = singular_moments(RWG(nodes, tris))
     m0, *_ = offplane_pairs(nodes, tris, [0, 0], [0, 3], 0.0)
@@ -70,7 +71,7 @@ def test_mesher_t_junction_port_lines():
 def test_series_resistor_matches_circuit_theory():
     w, h = 0.35e-3, 0.2e-3
     st = LayerStack([Layer(h, 4.3)])
-    g, zc = line_char_ml(st, 1, w, [5e9]); z = zc[0].real
+    g, zc = line_char_xs(st, 1, w, [5e9]); z = zc[0].real
     L = 12e-3
     p1 = LinePort(1, (-L / 2 + 0.5e-3, 0), (1, 0), w, 4e-3, s0=1.5e-3, step=0.7e-3, zc=z)
     p2 = LinePort(1, (L / 2 - 0.5e-3, 0), (-1, 0), w, 4e-3, s0=1.5e-3, step=0.7e-3, zc=z)
@@ -335,7 +336,7 @@ def test_quad_cells_match_triangles_with_fewer_unknowns():
     merged currents carry the same charge density on both triangles of a quad."""
     w, W, h = 0.35e-3, 1.5e-3, 0.2e-3
     st = LayerStack([Layer(h, 4.3)])
-    g, zc = line_char_ml(st, 1, w, [6e9]); z = zc[0].real
+    g, zc = line_char_xs(st, 1, w, [6e9]); z = zc[0].real
     L, Lw = 16e-3, 5e-3
     rects = [(-L / 2, -w / 2, L / 2, w / 2), (-Lw / 2, -W / 2, Lw / 2, W / 2)]
     out = {}
@@ -362,7 +363,7 @@ def test_signal_zone_coarsens_away_from_the_signal():
     from mom25d.sim import _simplify_outside
     w, h, L = 0.35e-3, 0.2e-3, 10e-3
     st = LayerStack([Layer(h, 4.3)])
-    g, zc = line_char_ml(st, 1, w, [5e9]); z = zc[0].real
+    g, zc = line_char_xs(st, 1, w, [5e9]); z = zc[0].real
     xs = np.arange(-3.5e-3, 3.6e-3, 1.0e-3)
     pads = [Point(x, y).buffer(0.3e-3) for x in xs for y in (-1.2e-3, 1.2e-3)]
     out = {}

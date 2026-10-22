@@ -1,9 +1,8 @@
 """
-mom25d.multilayer - Stage 2 (part 1) of the 2.5D planar MoM solver: multilayer stackups.
+mom25d.multilayer - multilayer stackups for the 2.5D planar MoM solver (sim.Simulation):
 
   * Arbitrary stack of dielectric layers above a PEC ground, open (air) or PEC top cover
     (microstrip, embedded microstrip, stripline, offset/broadside stripline ...)
-  * Metal (zero-thickness sheets) on any number of dielectric interfaces
   * Layered-media Green's functions from a transmission-line network in the spectral domain,
     for source and observation on the same or different interfaces (MPIE "formulation C",
     exact for horizontal currents):
@@ -11,22 +10,18 @@ mom25d.multilayer - Stage 2 (part 1) of the 2.5D planar MoM solver: multilayer s
     same interface: the 1/rho singular part (coefficients cA, cq) is subtracted spectrally and
     integrated analytically; the remainder is tabulated per frequency.
   * Non-uniform tensor mesh: n cells across narrow strips, dmax along them
-  * Layer-aware ports, run log (timings), and diagnostics (wave-fit residual, reciprocity,
-    passivity).
+  * Layer-aware ports and the run log (timings and notes).
 
-Not yet: vias / vertical currents (stage 2, part 2), conductor thickness, lumped components.
 Time convention exp(+j w t).
 """
 import time
 from contextlib import contextmanager
-from types import SimpleNamespace
 
 import numpy as np
 from scipy.special import ellipk
 from scipy.interpolate import CubicSpline
 
-from .base import (MU0, C0, EPS0, RWG, qform, combine, singular_moments, quad_pts,
-                    _BAR3, _W3, _BAR6, _W6, Port, PlanarMoM)
+from .base import MU0, C0, EPS0, Port
 
 
 # =============================================================================
@@ -320,10 +315,7 @@ def make_mesh_ml(rects, dmax, ncross, narrow, xlines=(), ylines=(), grade=1.0):
 
 
 # =============================================================================
-# Integrals between triangle sets (smooth kernels)
-# =============================================================================
-# =============================================================================
-# Solver
+# Ports
 # =============================================================================
 class MLPort(Port):
     """Port (see mom25d.Port) on metal interface `layer`."""
@@ -332,238 +324,9 @@ class MLPort(Port):
         self.layer = layer
 
 
-class MultiLayerMoM:
-    """
-    shapes : {interface index: [ (x0, y0, x1, y1), ... ]}   union of rectangles per metal layer
-    ports  : list of MLPort
-    dmax   : max cell size along conductors; ncross: cells across strips narrower than `narrow`
-    grade  : 0 = uniform cells across narrow strips, 1 = cosine-graded toward the edges (default)
-    near_fac: near/far threshold for the smooth-kernel quadrature (in cell sizes); larger = slower, safer
-    """
-    def __init__(self, stack, shapes, ports, dmax, ncross=6, narrow=None, grade=1.0, near_fac=5.0,
-                 verbose=True, title=''):
-        self.st, self.shapes, self.ports, self.title = stack, shapes, ports, title
-        self.log = RunLog(verbose)
-        self.dmax, self.ncross, self.grade = dmax, ncross, grade
-        narrow = narrow or 1.5 * dmax
-        for k in shapes:
-            assert k in stack.metal_interfaces, f"interface {k} cannot carry metal in this stack"
-        self.layers = sorted(shapes)
-        self.samples, lines = [], {k: ([], []) for k in self.layers}
-        for p in ports:
-            step = p.step or dmax
-            s0 = p.s0 if p.s0 is not None else 2 * step
-            n = int(np.floor((p.ref - s0) / step + 1e-9)) + 1
-            s = p.ref - step * np.arange(n)[::-1]
-            self.samples.append(s)
-            lines[p.layer][0 if p.axis == 'x' else 1].extend(p.pos + p.dir * np.append(s, 0.0))
-
-        with self.log.timer('mesh'):
-            nodes, tris, tl, off = [], [], [], 0
-            for k in self.layers:
-                nd, tr = make_mesh_ml(shapes[k], dmax, ncross, narrow, *lines[k], grade=grade)
-                nodes.append(nd); tris.append(tr + off); tl.append(np.full(len(tr), k)); off += len(nd)
-            self.rwg = RWG(np.vstack(nodes), np.vstack(tris))
-            self.tri_layer = np.concatenate(tl)
-            self.edge_layer = self.tri_layer[self.rwg.tp]
-        r = self.rwg
-        self.tri_idx = {k: np.nonzero(self.tri_layer == k)[0] for k in self.layers}
-        Nt = len(r.tris)
-        self.log.note(f"mesh: {Nt} triangles, {r.Ne} unknowns  ("
-                      + ", ".join(f"M{k}: {len(self.tri_idx[k])} tri" for k in self.layers) + ")")
-
-        with self.log.timer('singular integrals (static, once)'):
-            M0, Mrr = np.zeros((Nt, Nt)), np.zeros((Nt, Nt))
-            Mr = np.zeros((Nt, Nt, 2)); Q0 = np.zeros((Nt, Nt), complex)
-            for k in self.layers:
-                idx = self.tri_idx[k]
-                m0, mr, mrr = singular_moments(SimpleNamespace(nodes=r.nodes, tris=r.tris[idx], area=r.area[idx]))
-                ix = np.ix_(idx, idx)
-                M0[ix] = 0.5 * (m0 + m0.T); Mrr[ix] = 0.5 * (mrr + mrr.T); Mr[ix] = mr
-                Q0[ix] = M0[ix] / (2 * np.pi * EPS0 * stack.eps_sum(k))
-            SA = MU0 / (4 * np.pi) * combine(r, Mrr, Mr[..., 0], Mr[..., 1], M0)
-            self.SA = 0.5 * (SA + SA.T)
-            SQ = qform(r.D, Q0, r.D)
-            self.SQ = 0.5 * (SQ + SQ.T)
-            del M0, Mrr, Mr, Q0
-        V = r.nodes[r.tris]
-        self.tri_size = np.linalg.norm(V - np.roll(V, 1, axis=1), axis=2).max(1)
-        self.near_fac = near_fac
-        self.P3, self.W3 = quad_pts(r, _BAR3), r.area[:, None] * _W3[None, :]
-        self.P6, self.W6 = quad_pts(r, _BAR6), r.area[:, None] * _W6[None, :]
-        ext = r.nodes.max(0) - r.nodes.min(0)
-        self.rho_max = 1.05 * np.hypot(*ext) + 1e-4
-        self._edge_sets()
-        self.tables, self.last = {}, None
-
-    # ---- ports ----------------------------------------------------------------
-    def _line_edges(self, p, c):
-        r, tol = self.rwg, 1e-9
-        k = 0 if p.axis == 'x' else 1
-        t = 1 - k
-        on = (np.abs(r.ends[:, 0, k] - c) < tol) & (np.abs(r.ends[:, 1, k] - c) < tol)
-        on &= (r.mid[:, t] > p.span[0] - tol) & (r.mid[:, t] < p.span[1] + tol)
-        on &= self.edge_layer == p.layer
-        idx = np.nonzero(on)[0]
-        return idx, np.sign(r.nrm[idx] @ p.dvec)
-
-    def _edge_sets(self):
-        self.gap, self.cuts = [], []
-        for p, s in zip(self.ports, self.samples):
-            self.gap.append(self._line_edges(p, p.pos))
-            self.cuts.append([self._line_edges(p, p.pos + p.dir * x) for x in s])
-            assert len(self.gap[-1][0]) > 0, f"port {p.name}: no mesh edges on gap line"
-            assert all(len(c[0]) for c in self.cuts[-1]), f"port {p.name}: sample cut off the conductor"
-
-    def excitation(self, which=None):
-        r = self.rwg
-        ids = list(range(len(self.ports))) if which is None else list(which)
-        V = np.zeros((r.Ne, len(ids)), complex)
-        for col, i in enumerate(ids):
-            idx, sig = self.gap[i]
-            V[idx, col] = sig * r.l[idx]
-        return V
-
-    def cut_current(self, I, i):
-        l = self.rwg.l
-        return np.array([((sig * l[idx])[:, None] * I[idx]).sum(0) for idx, sig in self.cuts[i]])
-
-    # ---- matrix fill ----------------------------------------------------------
-    def impedance(self, f):
-        w = 2 * np.pi * f
-        r = self.rwg
-        Nt = len(r.tris)
-        A0, Axo, Ayo, Arr, Q0 = (np.zeros((Nt, Nt), complex) for _ in range(5))
-        self.tables = {}
-        for i, a in enumerate(self.layers):
-            for b in self.layers[i:]:
-                with self.log.timer('Green tables', f"M{a}-M{b} @ {f / 1e9:.2f} GHz"):
-                    gt = GreenTableML(f, self.st, a, b, self.rho_max)
-                self.tables[(a, b)] = gt
-                ia, ib = self.tri_idx[a], self.tri_idx[b]
-                with self.log.timer('smooth-kernel fill'):
-                    a0, axo, ayo, axs, ays, arr, q0 = self._block(ia, ib, a, b, gt)
-                ix = np.ix_(ia, ib)
-                A0[ix], Axo[ix], Ayo[ix], Arr[ix], Q0[ix] = a0, axo, ayo, arr, q0
-                if a != b:
-                    jx = np.ix_(ib, ia)
-                    A0[jx], Axo[jx], Ayo[jx], Arr[jx], Q0[jx] = a0.T, axs.T, ays.T, arr.T, q0.T
-        with self.log.timer('assemble'):
-            sym = lambda M: 0.5 * (M + M.T)
-            ZA = self.SA + combine(r, sym(Arr), Axo, Ayo, sym(A0))
-            ZQ = self.SQ + qform(r.D, sym(Q0), r.D)
-            Z = 1j * w * ZA + ZQ / (1j * w)
-        return 0.5 * (Z + Z.T)
-
-    def _block(self, ia, ib, a, b, gt):
-        """
-        Smooth-kernel moments between triangle sets ia (on M{a}) and ib (on M{b}).
-        Far pairs: 1-point (centroid) rule.  Near pairs - where the kernel varies on the scale of
-        a cell, i.e. sqrt(rho^2 + Ls^2) < near_fac * cell size with Ls = |dz| (cross-layer) or the
-        distance to the nearest ground/dielectric boundary (same layer) - are redone with the
-        3-point (same layer) or 6-point (cross-layer) rule.
-        """
-        r = self.rwg
-        ca, cb, aa, ab = r.cent[ia], r.cent[ib], r.area[ia], r.area[ib]
-        rho = np.sqrt(((ca[:, None, :] - cb[None, :, :]) ** 2).sum(-1))
-        GA, GQ = gt.AQ(rho)
-        w = aa[:, None] * ab[None, :]
-        A0 = GA * w
-        out = [A0, A0 * ca[:, None, 0], A0 * ca[:, None, 1], A0 * cb[None, :, 0], A0 * cb[None, :, 1],
-               A0 * (ca @ cb.T), GQ * w]
-        st = self.st
-        Ls = abs(st.z[a] - st.z[b]) if a != b else min(st.z[a], (st.z[-1] - st.z[a]) if st.top == 'pec'
-                                                         else st.layers[a - 1].h) * 2
-        size = np.maximum(self.tri_size[ia][:, None], self.tri_size[ib][None, :])
-        p, q = np.nonzero(rho ** 2 + Ls ** 2 < (self.near_fac * size) ** 2)
-        self._near_count = getattr(self, '_near_count', 0) + len(p)
-        P, W = (self.P3, self.W3) if a == b else (self.P6, self.W6)
-        for c0 in range(0, len(p), 20000):
-            pp, qq = ia[p[c0:c0 + 20000]], ib[q[c0:c0 + 20000]]
-            pa, pb = P[pp][:, :, None, :], P[qq][:, None, :, :]
-            Wt = W[pp][:, :, None] * W[qq][:, None, :]
-            ga, gq = gt.AQ(np.sqrt(((pa - pb) ** 2).sum(-1)))
-            ga, gq = ga * Wt, gq * Wt
-            vals = [ga.sum((1, 2)), (ga * pa[..., 0]).sum((1, 2)), (ga * pa[..., 1]).sum((1, 2)),
-                    (ga * pb[..., 0]).sum((1, 2)), (ga * pb[..., 1]).sum((1, 2)),
-                    (ga * (pa * pb).sum(-1)).sum((1, 2)), gq.sum((1, 2))]
-            for M, v in zip(out, vals):
-                M[p[c0:c0 + 20000], q[c0:c0 + 20000]] = v
-        return out
-
-    # ---- solve & extract ------------------------------------------------------
-    def sparams(self, f, keep=False):
-        Z = self.impedance(f)
-        with self.log.timer('LU solve', f"N={Z.shape[0]}"):
-            I = np.linalg.solve(Z, self.excitation())
-        n = len(self.ports)
-        Am, Bm = np.zeros((n, n), complex), np.zeros((n, n), complex)
-        gam, resid = [], []
-        for i, p in enumerate(self.ports):
-            s = self.samples[i]
-            Ik = self.cut_current(I, i)
-            g = PlanarMoM.fit_gamma(Ik, abs(s[1] - s[0]))
-            a, b = PlanarMoM.fit_waves(Ik, s - p.ref, g)
-            M = np.stack([np.exp(-g * (s - p.ref)), np.exp(g * (s - p.ref))], 1)
-            resid.append(np.max(np.linalg.norm(Ik - M @ np.vstack([a, b]), axis=0)
-                                / np.linalg.norm(Ik, axis=0)))
-            Am[i], Bm[i] = a, b
-            gam.append(g)
-        zc = np.array([p.zc for p in self.ports], float)
-        S = -np.diag(np.sqrt(zc)) @ Bm @ np.linalg.inv(Am) @ np.diag(1 / np.sqrt(zc))
-        self.last = dict(f=f, I=I if keep else None, gamma=np.array(gam), resid=np.array(resid))
-        return S
-
-    def sweep(self, freqs, zc=None, currents_at=None):
-        """zc: None (use port.zc) or callable f -> list of reference impedances."""
-        out = SimpleNamespace(f=np.asarray(freqs), S=[], gamma=[], resid=[], recip=[], passiv=[],
-                              I=None, fI=None)
-        fI = None if currents_at is None else freqs[np.argmin(abs(np.asarray(freqs) - currents_at))]
-        for f in freqs:
-            if zc is not None:
-                for p, z in zip(self.ports, zc(f)):
-                    p.zc = z
-            S = self.sparams(f, keep=(f == fI))
-            out.S.append(S); out.gamma.append(self.last['gamma']); out.resid.append(self.last['resid'])
-            out.recip.append(np.max(np.abs(S - S.T)))
-            out.passiv.append(np.max(np.linalg.svd(S, compute_uv=False)))
-            if f == fI:
-                out.I, out.fI = self.last['I'], f
-            if self.log.verbose:
-                print(f"    {f / 1e9:6.2f} GHz  fit residual {out.resid[-1].max():.1e}  "
-                      f"max sv(S) {out.passiv[-1]:.4f}")
-        for k in ('S', 'gamma', 'resid', 'recip', 'passiv'):
-            setattr(out, k, np.array(getattr(out, k)))
-        return out
-
-    def current_density(self, I):
-        """Surface current density (Jx, Jy) [A/m] at triangle centroids."""
-        r = self.rwg
-        a = r.Aal @ I
-        return r.cent[:, 0] * a - r.Bx @ I, r.cent[:, 1] * a - r.By @ I
-
-
 # =============================================================================
 # Utilities
 # =============================================================================
-def line_char_ml(stack, layer, w, freqs, length=20e-3, dmax=0.5e-3, ncross=6, grade=1.0, verbose=False):
-    """Zc and gamma of a uniform strip of width w on interface `layer` (centre-fed long line)."""
-    L2, margin = length / 2, 2e-3
-    pR = MLPort(layer, 'x', 0.0, (-w / 2, w / 2), +1, L2 - margin, s0=1e-3, name='R')
-    pL = MLPort(layer, 'x', 0.0, (-w / 2, w / 2), -1, L2 - margin, s0=1e-3, name='L')
-    sim = MultiLayerMoM(stack, {layer: [(-L2, -w / 2, L2, w / 2)]}, [pR, pL], dmax, ncross,
-                        narrow=max(w, 1.5 * dmax) * 1.01, grade=grade, verbose=verbose)
-    gam, zc = [], []
-    for f in freqs:
-        I = np.linalg.solve(sim.impedance(f), sim.excitation([0]))
-        IR, IL = sim.cut_current(I, 0), sim.cut_current(I, 1)
-        g = PlanarMoM.fit_gamma(np.hstack([IR, IL]), dmax)
-        A, B = PlanarMoM.fit_waves(IR, sim.samples[0], g)
-        Cp, Dp = PlanarMoM.fit_waves(IL, sim.samples[1], g)
-        gam.append(g); zc.append(1.0 / ((A[0] - B[0]) - (Cp[0] - Dp[0])))
-    return np.array(gam), np.array(zc)
-
-
 def stripline_z0_cohn(w, b, er):
     """Exact Z0 of a zero-thickness strip centred between ground planes spaced b."""
     k = 1 / np.cosh(np.pi * w / (2 * b))
