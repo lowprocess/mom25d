@@ -1,0 +1,10 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+# the compiled core (python -m mom25d.core.build)
+*.so
+*.pyd
+tools/*.npy

@@ -419,15 +419,3 @@ def test_line_functions_on_a_straight_run():
     qi = s1.quad_info
     assert qi['runs'] == 1 and qi['functions'] < qi['edges_replaced'] / 6
     assert np.abs(S1 - S0).max() < 0.003
-
-
-def test_mixed_connect_cascades_lines():
-    """kicad2ems.solvers.mixed.connect: two line pieces joined by a third through their inner ports equal one
-    line of the total length (mismatched Zc, so reflections are in play)."""
-    from kicad2ems.solvers.mixed import connect, line_S
-    g, zc, z0 = 0.5 + 180j, 37.0, 50.0
-    A, B, C = line_S(g, zc, 3e-3, z0), line_S(g, zc, 5e-3, z0), line_S(g, zc, 7e-3, z0)
-    S = np.zeros((4, 4), complex)
-    S[:2, :2], S[2:, 2:] = A, B
-    out = connect(S, [(1, 2)], [C])
-    assert np.allclose(out, line_S(g, zc, 15e-3, z0), atol=1e-12)

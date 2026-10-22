@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mom25d"
+dynamic = ["version"]
+description = "2.5D Method-of-Moments solver for PCB structures: a kicad2ems board file in, S-parameters out"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "GPL-3.0-or-later"}
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+authors = [{ name = "Claude", email = "noreply@anthropic.com" }]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "shapely>=2.0",
+    "triangle>=20230923",          # the surface mesher
+]
+
+[project.optional-dependencies]
+core = ["pybind11>=2.10"]          # python -m mom25d.core.build: the C++ / OpenMP kernels (~5x faster)
+# the GPU LU: the CuPy wheel built for your GPU stack, one of these extras (they conflict: install one);
+# PyTorch (its ROCm / CUDA build from pytorch.org) is the other backend
+gpu-cuda12 = ["cupy-cuda12x>=14"]   # NVIDIA, CUDA 12.x driver
+gpu-cuda13 = ["cupy-cuda13x>=14"]   # NVIDIA, CUDA 13.x driver
+gpu-rocm7 = ["cupy-rocm-7-0>=14"]   # AMD, ROCm 7.0
+test = ["pytest>=7"]
+
+[tool.setuptools.dynamic]
+version = {attr = "mom25d.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mom25d = ["core/*.cpp", "*.so", "*.pyd"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
