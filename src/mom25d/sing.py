@@ -8,7 +8,7 @@ in-plane formulas used by mom25d.singular_moments.
 """
 import numpy as np
 
-from .base import _BAR6, _W6
+from .base import _BAR6, _W6, edge_frames
 
 
 def offplane_pairs(nodes, tris, p_idx, q_idx, d, chunk=4000):
@@ -23,10 +23,7 @@ def offplane_pairs(nodes, tris, p_idx, q_idx, d, chunk=4000):
     n = len(p_idx)
     m0 = np.zeros(n); mro = np.zeros((n, 2)); mrs = np.zeros((n, 2)); mrr = np.zeros(n)
     V = nodes[tris]
-    e = np.roll(V, -1, axis=1) - V
-    L = np.linalg.norm(e, axis=2)
-    tau = e / L[..., None]
-    un = np.stack([tau[..., 1], -tau[..., 0]], -1)
+    e, L, tau, un = edge_frames(V)
     Ar = 0.5 * np.abs(e[:, 0, 0] * (-e[:, 2, 1]) - e[:, 0, 1] * (-e[:, 2, 0]))
     P = np.einsum('qk,tkc->tqc', _BAR6, V)
     ad = abs(d)
@@ -56,3 +53,9 @@ def offplane_pairs(nodes, tris, p_idx, q_idx, d, chunk=4000):
         mrs[sl] = (wq[..., None] * W).sum(1)
         mrr[sl] = (wq * (r * W).sum(-1)).sum(1)
     return m0, mro, mrs, mrr
+
+
+def offplane_moments(cA, cq, m):
+    """The seven moments (base.moments7's order) of the extracted cA / R, cq / R from offplane_pairs' result m."""
+    m0, mro, mrs, mrr = m
+    return [cA * m0, cA * mro[:, 0], cA * mro[:, 1], cA * mrs[:, 0], cA * mrs[:, 1], cA * mrr, cq * m0]

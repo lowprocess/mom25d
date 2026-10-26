@@ -18,6 +18,14 @@ import numpy as np
 from scipy import sparse
 
 
+def excluded(rwg, exclude_tris=(), exclude_edges=()):
+    """Boolean masks (triangles, edges) of the triangles and edges that must stay as they are."""
+    bad_t, bad_e = np.zeros(len(rwg.tris), bool), np.zeros(rwg.Ne, bool)
+    bad_t[np.asarray(list(exclude_tris), int)] = True
+    bad_e[np.asarray(list(exclude_edges), int)] = True
+    return bad_t, bad_e
+
+
 def _quad_quality(nodes, a, u, b, v):
     """Largest deviation (degrees) of the interior angles of the quad a-u-b-v from 90; inf if not convex."""
     P = nodes[[a, u, b, v]]
@@ -40,13 +48,9 @@ def quad_subspace(rwg, n_total, exclude_tris=(), exclude_edges=(), tol_deg=25.0)
     triangles (via fans: the via's charge is spread over them); exclude_edges: edges that must stay unknowns
     (port gaps, sample cuts, lumped elements)."""
     Ne, tris, nodes = rwg.Ne, rwg.tris, rwg.nodes
-    bad_t = np.zeros(len(tris), bool)
-    bad_t[np.asarray(list(exclude_tris), int)] = True
-    bad_e = np.zeros(Ne, bool)
-    bad_e[np.asarray(list(exclude_edges), int)] = True
+    bad_t, bad_e = excluded(rwg, exclude_tris, exclude_edges)
     # the edges of each triangle (RWG index or -1 on the boundary)
-    tri_edges = -np.ones((len(tris), 3), int)
-    fill = np.zeros(len(tris), int)
+    tri_edges, fill = -np.ones((len(tris), 3), int), np.zeros(len(tris), int)
     for e in range(Ne):
         for t in (rwg.tp[e], rwg.tm[e]):
             tri_edges[t, fill[t]] = e
@@ -56,24 +60,19 @@ def quad_subspace(rwg, n_total, exclude_tris=(), exclude_edges=(), tol_deg=25.0)
         t1, t2 = rwg.tp[d], rwg.tm[d]
         if bad_e[d] or bad_t[t1] or bad_t[t2]:
             continue
-        a = _opposite(tris[t1], rwg.ends[d], nodes)
-        b = _opposite(tris[t2], rwg.ends[d], nodes)
-        uu, vv = _edge_nodes(tris[t1], a)             # t1 = (a, uu, vv) counter-clockwise: quad a-uu-b-vv
-        q = _quad_quality(nodes, a, uu, b, vv)
+        a, b = _opposite(tris[t1], rwg.ends[d], nodes), _opposite(tris[t2], rwg.ends[d], nodes)
+        i = list(tris[t1]).index(a)                   # t1 = (a, uu, vv) counter-clockwise: quad a-uu-b-vv
+        q = _quad_quality(nodes, a, tris[t1][(i + 1) % 3], b, tris[t1][(i + 2) % 3])
         if q <= tol_deg:
             cand.append((q, d))
-    cand.sort()
-    used = np.zeros(len(tris), bool)
-    elim = []
-    for q, d in cand:
+    used, elim = np.zeros(len(tris), bool), []
+    for q, d in sorted(cand):
         t1, t2 = rwg.tp[d], rwg.tm[d]
-        if used[t1] or used[t2]:
-            continue
-        used[t1] = used[t2] = True
-        elim.append(d)
+        if not (used[t1] or used[t2]):
+            used[t1] = used[t2] = True
+            elim.append(d)
     elim = np.array(sorted(elim), int)
-    keep = np.setdiff1d(np.arange(n_total), elim)
-    col = -np.ones(n_total, int)
+    keep, col = np.setdiff1d(np.arange(n_total), elim), -np.ones(n_total, int)
     col[keep] = np.arange(len(keep))
     rows, cols, vals = list(keep), list(col[keep]), [1.0] * len(keep)
     D = rwg.D.tocsc()                                  # Nt x Ne: +l/A on T+, -l/A on T-
@@ -89,9 +88,8 @@ def quad_subspace(rwg, n_total, exclude_tris=(), exclude_edges=(), tol_deg=25.0)
                 assert col[k] >= 0, "an eliminated diagonal depends on another one"
                 rows.append(d); cols.append(col[k]); vals.append(c)
     T = sparse.csc_matrix((vals, (rows, cols)), shape=(n_total, len(keep)))
-    info = dict(quads=len(elim), tris_merged=2 * len(elim), tris=len(tris), edges=Ne, reduced=len(keep),
-                full=n_total, keep=keep, elim=elim)
-    return T, info
+    return T, dict(quads=len(elim), tris_merged=2 * len(elim), tris=len(tris), edges=Ne, reduced=len(keep),
+                   full=n_total, keep=keep, elim=elim)
 
 
 def _opposite(tri, ends, nodes):
@@ -100,12 +98,6 @@ def _opposite(tri, ends, nodes):
         if min(np.abs(nodes[n] - ends[0]).sum(), np.abs(nodes[n] - ends[1]).sum()) > 0:
             return n
     raise ValueError("degenerate triangle")
-
-
-def _edge_nodes(tri, a):
-    """The two vertices of `tri` other than a, in the triangle's (counter-clockwise) order after a."""
-    i = list(tri).index(a)
-    return tri[(i + 1) % 3], tri[(i + 2) % 3]
 
 
 def project(Z, keep, elim, C):

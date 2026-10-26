@@ -6,8 +6,8 @@ mom25d.farfield - the far field of the surface currents of a solve: patterns, di
 
 Every metal interface radiates into the half-space above the stack (the top medium, top_er): its current
 J(x, y), Fourier transformed at k_rho = k_top sin(theta), gives the tangential E on the top interface through
-the stack's TM / TE transmission-line voltages (Michalski: E_u = -V^e J_u, E_v = -V^h J_v, u along k_rho),
-and that E the far field (exact for the half-space above a plane, by stationary phase):
+the stack's TM / TE transmission-line voltages (LayerStack.voltage; Michalski: E_u = -V^e J_u, E_v = -V^h J_v,
+u along k_rho), and that E the far field (exact for the half-space above a plane, by stationary phase):
 
     r E_theta = j k_top / (2 pi) E_u,   r E_phi = j k_top cos(theta) / (2 pi) E_v      (e^{-j k r} dropped)
 
@@ -24,18 +24,10 @@ from .base import C0, MU0, EPS0
 ETA0 = np.sqrt(MU0 / EPS0)
 
 
-def _tl_voltage(stack, kr, w, o, s, mode):
-    """Voltage at interface o for a unit shunt current source at interface s, in the TM ('e') or TE ('h')
-    transmission-line network of the stack (LayerStack.spectral's network)."""
-    Y0, tn, sc, Yd, Yu = stack._network(kr, w, mode)
-    v = 1.0 / (Yu[s] + Yd[s])
-    if o > s:
-        for k in range(s + 1, o + 1):
-            v = v * sc[k] / (1 + 1j * (Yu[k] / Y0[k]) * tn[k])
-    elif o < s:
-        for k in range(s, o, -1):
-            v = v * sc[k] / (1 + 1j * (Yd[k - 1] / Y0[k]) * tn[k])
-    return v
+def _surface_E(st, kr, w, k, Jx, Jy, c, s):
+    """E_u, E_v on the top interface from the current spectrum (Jx, Jy) on interface k (u along k_rho, at angle
+    cos c, sin s from x)."""
+    return (-st.voltage(kr, w, st.N, k, 'e') * (Jx * c + Jy * s), -st.voltage(kr, w, st.N, k, 'h') * (-Jx * s + Jy * c))
 
 
 def far_field(sim, I, f, theta, phi):
@@ -51,23 +43,17 @@ def far_field(sim, I, f, theta, phi):
     kr = k_top * np.sin(TH).ravel() + 1e-9 * k_top                      # k_rho = 0 at broadside: just off it
     kx, ky = kr * np.cos(PH).ravel(), kr * np.sin(PH).ravel()
     jx, jy = sim.current_density(I)                                      # per triangle (A/m)
-    r = sim.rwg
-    cen, area = r.cent[:, :2], r.area
-    Eu = np.zeros(kr.shape, complex)
-    Ev = np.zeros(kr.shape, complex)
+    cen, area = sim.rwg.cent[:, :2], sim.rwg.area
+    Eu, Ev = np.zeros(kr.shape, complex), np.zeros(kr.shape, complex)
     cphi, sphi = np.cos(PH).ravel(), np.sin(PH).ravel()
     for k, idx in sim.tri_idx.items():
         if not len(idx):
             continue
         ph_ = np.exp(1j * (np.outer(kx, cen[idx, 0]) + np.outer(ky, cen[idx, 1])))   # e^{j k.rho}
-        Jx, Jy = ph_ @ (jx[idx] * area[idx]), ph_ @ (jy[idx] * area[idx])
-        Ju, Jv = Jx * cphi + Jy * sphi, -Jx * sphi + Jy * cphi
-        Eu += -_tl_voltage(st, kr, w, st.N, k, 'e') * Ju
-        Ev += -_tl_voltage(st, kr, w, st.N, k, 'h') * Jv
+        eu, ev = _surface_E(st, kr, w, k, ph_ @ (jx[idx] * area[idx]), ph_ @ (jy[idx] * area[idx]), cphi, sphi)
+        Eu, Ev = Eu + eu, Ev + ev
     c = 1j * k_top / (2 * np.pi)
-    Eth = (c * Eu).reshape(TH.shape)
-    Eph = (c * np.cos(TH).ravel() * Ev).reshape(TH.shape)
-    return Eth, Eph
+    return (c * Eu).reshape(TH.shape), (c * np.cos(TH).ravel() * Ev).reshape(TH.shape)
 
 
 def radiated(Eth, Eph, theta, phi, eta=ETA0):
@@ -90,8 +76,7 @@ def near_field(sim, layers_J, x, y, f, height, pad=2):
     to the top surface (as far_field), then up by e^{-j kz height}; E_z from the divergence. The FFT is
     periodic: the currents are zero-padded to `pad` x the grid (a port's strong field otherwise reappeared on
     the far side of a 10 mm margin) and the result cropped back."""
-    st = sim.st
-    w = 2 * np.pi * f
+    st, w = sim.st, 2 * np.pi * f
     k_top = w / C0 * np.sqrt(complex(st.top_er)).real
     nx0, ny0 = len(x), len(y)
     nx, ny = pad * nx0, pad * ny0
@@ -101,11 +86,8 @@ def near_field(sim, layers_J, x, y, f, height, pad=2):
     cu, su = KX / kr, KY / kr
     Ex, Ey = np.zeros((nx, ny), complex), np.zeros((nx, ny), complex)
     for k, (Jx, Jy) in layers_J.items():
-        Jxk, Jyk = np.fft.fft2(Jx, s=(nx, ny)) * dx * dy, np.fft.fft2(Jy, s=(nx, ny)) * dx * dy
-        Ju, Jv = Jxk * cu + Jyk * su, -Jxk * su + Jyk * cu
-        Ve = _tl_voltage(st, kr.ravel(), w, st.N, k, 'e').reshape(kr.shape)
-        Vh = _tl_voltage(st, kr.ravel(), w, st.N, k, 'h').reshape(kr.shape)
-        Eu, Ev = -Ve * Ju, -Vh * Jv
+        Eu, Ev = _surface_E(st, kr, w, k, np.fft.fft2(Jx, s=(nx, ny)) * dx * dy, np.fft.fft2(Jy, s=(nx, ny)) * dx * dy,
+                            cu, su)
         Ex += Eu * cu - Ev * su
         Ey += Eu * su + Ev * cu
     kz = -1j * np.sqrt(kr ** 2 - k_top ** 2 + 0j)                     # e^{-j kz z}: decaying when evanescent
@@ -121,36 +103,16 @@ def current_on_grid(sim, I, x, y, k):
     from matplotlib.tri import Triangulation
     r = sim.rwg
     I = np.asarray(I)[:r.Ne]
-    Nt = len(r.tris)
-    a = np.zeros(Nt, complex)
-    b = np.zeros((Nt, 2), complex)
-    ap, am = r.l / (2 * r.area[r.tp]), -r.l / (2 * r.area[r.tm])
-    vp, vm = _free_vertices(r)
-    np.add.at(a, r.tp, I * ap)
-    np.add.at(a, r.tm, I * am)
-    np.add.at(b, r.tp, -(I * ap)[:, None] * vp)
-    np.add.at(b, r.tm, -(I * am)[:, None] * vm)
+    a, b = np.zeros(len(r.tris), complex), np.zeros((len(r.tris), 2), complex)
+    for t, alpha, v in ((r.tp, r.l / (2 * r.area[r.tp]), r.vp), (r.tm, -r.l / (2 * r.area[r.tm]), r.vm)):
+        np.add.at(a, t, I * alpha)
+        np.add.at(b, t, -(I * alpha)[:, None] * v)
     idx = sim.tri_idx[k]
-    nodes = r.nodes[:, :2]
-    used = np.unique(r.tris[idx])
-    remap = -np.ones(len(nodes), int)
-    remap[used] = np.arange(len(used))
+    used, local = np.unique(r.tris[idx], return_inverse=True)        # the layer's nodes, its triangles in them
     X, Y = np.meshgrid(x, y, indexing='ij')
-    hit = Triangulation(nodes[used, 0], nodes[used, 1], remap[r.tris[idx]]).get_trifinder()(X, Y)
+    hit = Triangulation(r.nodes[used, 0], r.nodes[used, 1], local.reshape(-1, 3)).get_trifinder()(X, Y)
     t = idx[np.clip(hit, 0, None)]
     on = hit >= 0
-    Jx = np.where(on, a[t] * X + b[t, 0], 0)
-    Jy = np.where(on, a[t] * Y + b[t, 1], 0)
+    Jx, Jy = np.where(on, a[t] * X + b[t, 0], 0), np.where(on, a[t] * Y + b[t, 1], 0)
     return Jx, Jy, hit
 
-
-def _free_vertices(r):
-    """The free vertex of each edge's T+ and T- triangles (RWG.__init__ keeps them only on the instance it
-    built as vp / vm in some versions): recomputed from the edge ends."""
-    if hasattr(r, 'vp') and hasattr(r, 'vm'):
-        return r.vp, r.vm
-    def free(t):
-        V = r.nodes[r.tris[t]][:, :, :2]                              # (Ne, 3, 2)
-        d = np.minimum(np.linalg.norm(V - r.ends[:, None, 0], axis=2), np.linalg.norm(V - r.ends[:, None, 1], axis=2))
-        return V[np.arange(len(t)), np.argmax(d, axis=1)]
-    return free(r.tp), free(r.tm)

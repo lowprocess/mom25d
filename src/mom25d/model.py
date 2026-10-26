@@ -25,6 +25,13 @@ MM = 1e-3
 KNOWN_SPAN = 0.1          # rad: the least span of a wave port's cuts at the lowest frequency, gamma known
 
 
+def _cross(g, p, d, half):
+    """The pieces of copper g on the line through p across direction d, `half` each side of p."""
+    t = np.array([-d[1], d[0]])
+    seg = LineString([p - t * half, p + t * half]).intersection(g)
+    return [seg] if seg.geom_type == 'LineString' else list(getattr(seg, 'geoms', []))
+
+
 def _smooth(fs, v):
     """f -> v, the polynomial through the characterised values (held beyond the ends): smooth, where linear
     interpolation's kinks cost the adaptive sweep solves."""
@@ -53,36 +60,22 @@ class PlanarModel:
         return "\n".join(L + self.notes)
 
     # ---- ports ----------------------------------------------------------------------------------------
-    def _copper_at(self, k):
-        return unary_union(self.shapes[k]) if k in self.shapes else None
-
     def _feed(self, g, c, d, step):
         """Width of the copper strip through c across direction d, and straight length along d."""
-        t = np.array([-d[1], d[0]])
-
         def width(s):
             p = c + d * s
-            seg = LineString([p - t * 5e-3, p + t * 5e-3]).intersection(g)
-            parts = [seg] if seg.geom_type == 'LineString' else list(getattr(seg, 'geoms', []))
-            for q in parts:
-                if q.distance(Point(*p)) < 1e-9:
-                    return q.length, q
-            return 0.0, None
-        w0, _ = width(step / 2)
+            return next((q.length for q in _cross(g, p, d, 5e-3) if q.distance(Point(*p)) < 1e-9), 0.0)
+        w0, s = width(step / 2), step / 2
         if w0 == 0:
             return 0.0, 0.0
-        s = step / 2
-        while True:
-            w, _ = width(s + step)
-            if abs(w - w0) > 0.02 * w0 or s > 0.2:
-                break
+        while abs(width(s + step) - w0) <= 0.02 * w0 and s <= 0.2:
             s += step
         return w0, s
 
     def _port_geom(self, sp):
         """(centre, direction, interface, copper there) of a port definition, checked to be on that copper."""
         c, k = np.asarray(sp['c'], float), sp['k']
-        g = self._copper_at(k)
+        g = unary_union(self.shapes[k]) if k in self.shapes else None
         if g is None or not g.buffer(1e-6).contains(Point(*c)):
             raise ValueError(f"{sp['name']} at ({c[0] / MM:.3f}, {-c[1] / MM:.3f}) mm (KiCad) is not on the copper of "
                              f"interface M{k}")
@@ -101,26 +94,23 @@ class PlanarModel:
     def ports(self, step=None, dmax=0.3e-3, fmin=None):
         from .geo import LinePort
         from .sim import ViaPort, GapPort, Via, DiffPort
-        step = step or dmax
-        out = []
+        step, out = step or dmax, []
+        # a wave port of width w on the feed from c along d, in the window (gap offset, first / last cut, spacing)
+        wave = lambda k, c, d, w, win, **kw: LinePort(k, c + d * win[0], d, w, -win[0], s0=win[1] - win[0],
+                                                     s1=win[2] - win[0], step=win[3], **kw)
         for sp in self.port_specs:
             name = sp['name']
             if 'legs' in sp:                                              # differential pair
-                legs = {}
-                for sgn in ('+', '-'):
-                    c, d, k, g = self._port_geom(sp['legs'][sgn])
-                    w, L = self._feed(g, c, d, step)
-                    legs[sgn] = (c, d, k, w, L)
-                (cp, dp_, kp, wp, Lp), (cn, dn, kn, wn, Ln) = legs['+'], legs['-']
+                legs = [(c, d, k, *self._feed(g, c, d, step)) for c, d, k, g in
+                        (self._port_geom(sp['legs'][sgn]) for sgn in ('+', '-'))]
+                (cp, dp_, kp, wp, Lp), (cn, dn, kn, wn, Ln) = legs
                 if kp != kn or not np.allclose(dp_, dn, atol=1e-6):
                     raise ValueError(f"{name}: + and - legs must be on the same layer with the same direction")
                 win, need = self._wave_window(max(wp, wn), min(Lp, Ln), step)
                 if win is None:
                     raise ValueError(f"{name}: straight coupled feed too short for a differential wave port "
                                      f"({min(Lp, Ln) * 1e3:.2f} mm, need {need * 1e3:.2f} mm)")
-                g0, s0, s1, pstep = win
-                mk = lambda c, w: LinePort(kp, c + dp_ * g0, dp_, w, -g0, s0=s0 - g0, s1=s1 - g0, step=pstep)
-                out.append(DiffPort(mk(cp, wp), mk(cn, wn), 100.0, 25.0, name=name))
+                out.append(DiffPort(wave(kp, cp, dp_, wp, win), wave(kp, cn, dp_, wn, win), 100.0, 25.0, name=name))
                 continue
             c, d, k, g = self._port_geom(sp)
             kind, z0 = sp.get('kind', 'auto'), sp['z0']
@@ -136,8 +126,7 @@ class PlanarModel:
                         need = max(need, L - (win[2] - win[1]) + KNOWN_SPAN / beta)
                         win = None
                 if win is not None:
-                    g0, s0, s1, pstep = win
-                    out.append(LinePort(k, c + d * g0, d, w, -g0, s0=s0 - g0, s1=s1 - g0, step=pstep, zc=z0, name=name))
+                    out.append(wave(k, c, d, w, win, zc=z0, name=name))
                     continue
                 if kind == 'wave':
                     raise ValueError(f"{name}: straight feed too short for a wave port ({L * 1e3:.2f} mm, need {need * 1e3:.2f} mm)")
@@ -156,18 +145,13 @@ class PlanarModel:
     def _planes_at(self, layer, pt, d, w):
         """Metal on other layers covering point pt (reference planes), with its width across d (capped)."""
         planes = {}
-        t = np.array([-d[1], d[0]])
         for k, gs in self.shapes.items():
-            if k == layer:
+            if k == layer or not (g := unary_union(gs)).buffer(1e-9).contains(pt):
                 continue
-            g = unary_union(gs)
-            if g.buffer(1e-9).contains(pt):
-                p0 = np.array(pt.coords[0])
-                seg = LineString([p0 - t * 0.05, p0 + t * 0.05]).intersection(g)
-                dz = abs(self.stack.z[layer] - self.stack.z[k])
-                W = min(getattr(seg, 'length', 0.0), max(16 * dz + 2 * w, 20 * w, 2e-3))
-                if W > 2 * w:
-                    planes[k] = W
+            dz = abs(self.stack.z[layer] - self.stack.z[k])
+            W = min(sum(q.length for q in _cross(g, np.array(pt.coords[0]), d, 0.05)), max(16 * dz + 2 * w, 20 * w, 2e-3))
+            if W > 2 * w:
+                planes[k] = W
         return planes
 
     def _coplanar_at(self, layer, pt, d, w, max_gap=None):
@@ -175,18 +159,12 @@ class PlanarModel:
         across the line (trace centred at 0), widths capped; gaps wider than max_gap are ignored."""
         h = self.stack.z[layer] if layer < len(self.stack.z) else self.stack.z[-1]
         max_gap = max_gap or max(5 * h, 3 * w)
-        t = np.array([-d[1], d[0]])
-        p0 = np.array(pt.coords[0])
-        g = unary_union(self.shapes.get(layer, []))
-        span = 0.05
-        seg = LineString([p0 - t * span, p0 + t * span]).intersection(g)
-        parts = [seg] if seg.geom_type == 'LineString' else list(getattr(seg, 'geoms', []))
-        iv = sorted(tuple(sorted(((np.array(c) - p0) @ t) for c in (q.coords[0], q.coords[-1]))) for q in parts
-                    if q.length > 0)
-        own = [i for i, (a, b) in enumerate(iv) if a <= 1e-9 <= b or a <= -1e-9 <= b]
-        if not own:
+        t, p0 = np.array([-d[1], d[0]]), np.array(pt.coords[0])
+        iv = sorted(tuple(sorted(((np.array(c) - p0) @ t) for c in (q.coords[0], q.coords[-1])))
+                    for q in _cross(unary_union(self.shapes.get(layer, [])), p0, d, 0.05) if q.length > 0)
+        i = next((i for i, (a, b) in enumerate(iv) if a <= 1e-9 <= b or a <= -1e-9 <= b), None)   # the trace
+        if i is None:
             return []
-        i = own[0]
         out = []
         if i + 1 < len(iv) and iv[i + 1][0] - iv[i][1] <= max_gap:            # right side
             a, b = iv[i + 1]
@@ -217,8 +195,7 @@ class PlanarModel:
         for p in ports:
             if isinstance(p, DiffPort):
                 a, b = p.pos, p.neg
-                mid = 0.5 * (a.s0 + a.s1)
-                pt = Point(*(0.5 * (a.c + b.c) + a.d * mid))
+                pt = Point(*(0.5 * (a.c + b.c) + a.d * 0.5 * (a.s0 + a.s1)))
                 gap = abs((a.c - b.c) @ a.t) - 0.5 * (a.w + b.w)
                 planes = narrow(self._planes_at(a.layer, pt, a.d, a.w), a.w + b.w + gap)
                 ge, ze, go, zo = line_char_pair(self.stack, a.layer, 0.5 * (a.w + b.w), gap, fs, planes=planes, dmax=dmax,
@@ -249,11 +226,9 @@ class PlanarModel:
                                  + [f"coplanar GND, gap {gp * 1e3:.3f} mm" for gp in gaps]) or "ground only")
                     + ": Zc = " + ", ".join(f"{v:.2f}" for v in z.real) + " ohm")
             zz, gg = cache[key]
-            p.zc_fn = _smooth(fs, zz)
-            p.zc = float(zz[len(zz) // 2])
+            p.zc_fn, p.zc = _smooth(fs, zz), float(zz[len(zz) // 2])
             # gamma / f is nearly flat; the wave fit takes it at every frequency (sim.sparams)
-            gf = _smooth(fs, gg / fs)
-            p.gamma_fn = (lambda f, gf=gf: f * gf(f))
+            p.gamma_fn = (lambda f, gf=_smooth(fs, gg / fs): f * gf(f))
 
     def simulation(self, dmax=0.3e-3, step=None, fmin=1e9, fmax=10e9, characterize=True, wave_down_to=None, **kw):
         """The Simulation of this model. wave_down_to (Hz): 'auto' ports become wave ports only where the feed
@@ -270,13 +245,9 @@ class PlanarModel:
         zone = kw.pop('zone', None)
         if zone is not None and zone != 'off':
             # (experimental) mesh detail only near the signal copper: zone = the distance (m) around it
-            sig = getattr(self, 'signal', None)
+            sig, kw['zone'] = getattr(self, 'signal', None), None
             if sig is not None:
                 d = max(ZONE_DIST, ZONE_H * getattr(self, 'h_max', 0.0)) if zone == 'auto' else float(zone)
-                from shapely.geometry import Point
-                from shapely.ops import unary_union
                 kw['zone'] = unary_union([sig.buffer(d)] + [Point(x, y).buffer(ZONE_VIA)
                                                             for x, y in getattr(self, 'signal_vias', [])])
-            else:
-                kw['zone'] = None
         return Simulation(self.stack, self.shapes, ports, vias=self.vias, dmax=dmax, **kw)

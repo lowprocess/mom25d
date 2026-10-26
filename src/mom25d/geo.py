@@ -14,11 +14,14 @@ import shapely
 from shapely.geometry import (Polygon, LineString, Point, box)
 from shapely.ops import unary_union
 import triangle as tr
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
+
+from .base import graded
 
 
-# =============================================================================
-# Ports in arbitrary directions
-# =============================================================================
+# ---- Ports in arbitrary directions ------------------------------------------
 class LinePort:
     """
     Wave port on a straight feed line.
@@ -38,16 +41,10 @@ class LinePort:
                  s1=None):
         self.s1 = s1
         self.layer = layer
-        self.c = np.asarray(center, float)
         d = np.asarray(direction, float)
-        self.d = d / np.linalg.norm(d)
+        self.c, self.d = np.asarray(center, float), d / np.linalg.norm(d)
         self.t = np.array([-self.d[1], self.d[0]])
         self.w, self.ref, self.s0, self.step, self.zc, self.name = width, ref_dist, s0, step, zc, name
-
-    # compatibility with the axis-aligned Port API used by the plotting code
-    @property
-    def dvec(self):
-        return self.d
 
     def line(self, s):
         """End points of the transverse line at distance s from the gap (s=0: the gap)."""
@@ -59,60 +56,35 @@ class LinePort:
         return abs(self.d[0]) < 1e-12 or abs(self.d[1]) < 1e-12
 
 
-def port_from_axis(p):
-    """Convert a legacy mom25d.Port / MLPort (axis, pos, span, dir) into a LinePort."""
-    tmid = 0.5 * (p.span[0] + p.span[1])
-    w = p.span[1] - p.span[0]
-    if p.axis == 'x':
-        c, d = (p.pos, tmid), (p.dir, 0.0)
-    else:
-        c, d = (tmid, p.pos), (0.0, p.dir)
-    lp = LinePort(p.layer, c, d, w, p.ref, s0=p.s0, step=p.step, zc=p.zc, name=p.name)
-    return lp
+# ---- Geometry ---------------------------------------------------------------
+def _is_rect(s):
+    return isinstance(s, (tuple, list)) and len(s) == 4 and np.isscalar(s[0])
 
 
-# =============================================================================
-# Geometry
-# =============================================================================
 def to_geometry(shapes):
     """List of rectangles (x0,y0,x1,y1) and/or shapely geometries -> cleaned (Multi)Polygon."""
-    gs = []
-    for s in shapes:
-        if isinstance(s, (tuple, list)) and len(s) == 4 and np.isscalar(s[0]):
-            gs.append(box(*s))
-        else:
-            gs.append(s)
-    g = unary_union(gs).buffer(0)
-    return g
+    return unary_union([box(*s) if _is_rect(s) else s for s in shapes]).buffer(0)
 
 
 def is_manhattan_rects(shapes):
-    return all(isinstance(s, (tuple, list)) and len(s) == 4 and np.isscalar(s[0]) for s in shapes)
+    return all(_is_rect(s) for s in shapes)
+
+
+def ngon(x, y, R, n, closed=False):
+    """Vertices (n, 2) of the regular n-gon of circumradius R about (x, y), a flat side at the bottom (closed:
+    the first vertex repeated at the end)."""
+    a = 2 * np.pi * np.arange(n) / n + np.pi / n
+    P = np.c_[x + R * np.cos(a), y + R * np.sin(a)]
+    return np.vstack([P, P[:1]]) if closed else P
 
 
 def _rings(g):
-    polys = [g] if isinstance(g, Polygon) else list(getattr(g, 'geoms', []))
-    out = []
-    for p in polys:
-        if p.is_empty or not isinstance(p, Polygon):
-            continue
-        out.append(LineString(p.exterior.coords))
-        out += [LineString(r.coords) for r in p.interiors]
-    return out
+    polys = [p for p in ([g] if isinstance(g, Polygon) else getattr(g, 'geoms', []))
+             if isinstance(p, Polygon) and not p.is_empty]
+    return [LineString(r.coords) for p in polys for r in [p.exterior, *p.interiors]]
 
 
-def edge_offsets(w_ref, ncross, grade=1.0):
-    """Inward offsets mimicking the tensor mesher's graded cells across a strip of width w_ref."""
-    k = np.arange(1, ncross)
-    u = k / ncross
-    u = (1 - grade) * u + grade * (1 - np.cos(np.pi * u)) / 2
-    d = w_ref * u
-    return [x for x in d if x < 0.5 * w_ref - 1e-12]
-
-
-# =============================================================================
-# Mesher
-# =============================================================================
+# ---- Mesher -----------------------------------------------------------------
 def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), amax=None,
                   max_offset_frac=0.45, tol=1e-9, fine=None, dmax_fine=None, edge_zone=None, split_chains=False):
     """
@@ -131,34 +103,24 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
     if geom.is_empty:
         return np.zeros((0, 2)), np.zeros((0, 3), int), []
     linework = _rings(geom)
-    for d in edge_offsets(w_ref, ncross, grade):
-        inner = geom.buffer(-d, join_style='mitre', mitre_limit=2.0)
-        if not inner.is_empty:
-            rings = _rings(inner)
-            if edge_zone is not None:
-                rings = [r.intersection(edge_zone) for r in rings]
-            linework += rings
-    for p0, p1 in lines:
-        seg = LineString([p0, p1]).intersection(geom)
-        if not seg.is_empty:
-            linework.append(seg)
+    offsets = w_ref * graded(np.arange(1, ncross) / ncross, grade)      # inward rings: the tensor mesher's grading
+    for d in offsets[offsets < 0.5 * w_ref - 1e-12]:
+        linework += [r if edge_zone is None else r.intersection(edge_zone)
+                     for r in _rings(geom.buffer(-d, join_style='mitre', mitre_limit=2.0))]
+    linework += [LineString([p0, p1]).intersection(geom) for p0, p1 in lines]
     fine_parts = []
     if fine is not None and dmax_fine:
         fg = fine.intersection(geom).buffer(0)
         fine_parts = [q for q in getattr(fg, 'geoms', [fg]) if q.geom_type == 'Polygon' and q.area > (2 * dmax_fine) ** 2]
-        for q in fine_parts:                                  # region boundaries as constraints
-            linework += _rings(q)
+        linework += [r for q in fine_parts for r in _rings(q)]          # region boundaries as constraints
     vpts = []
     for via in vias:
         x, y, r = via[:3]
         vpts.append((x, y))
-        if r > 0:
-            if len(via) > 3:                                     # (x, y, r, n): a regular n-gon
-                n = int(via[3]); a = 2 * np.pi * np.arange(n + 1) / n + np.pi / n
-                ring = LineString(np.c_[x + r * np.cos(a), y + r * np.sin(a)])
-            else:
-                ring = Point(x, y).buffer(r, quad_segs=2).exterior   # octagon
-            linework.append(LineString(ring.coords).intersection(geom))
+        if r > 0:                                                # (x, y, r, n): a regular n-gon, else an octagon
+            ring = ngon(x, y, r, int(via[3]), closed=True) if len(via) > 3 else \
+                Point(x, y).buffer(r, quad_segs=2).exterior.coords
+            linework.append(LineString(ring).intersection(geom))
     # snap-rounding noding: T-junctions (port lines ending on edges) must split the edge exactly
     noded = shapely.unary_union([g for g in linework if not g.is_empty], grid_size=tol)
     pieces = list(getattr(noded, 'geoms', [noded]))
@@ -179,29 +141,19 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
         dm = dmax_fine if inside else dmax
         chains.append(np.asarray(shapely.segmentize(pc, dm).coords)[:, :2])
     allp = np.vstack(chains + [np.array(vpts).reshape(-1, 2)]) if vpts else np.vstack(chains)
-    # merge near-coincident vertices (noding round-off would otherwise create sliver triangles)
-    from scipy.spatial import cKDTree
-    snap = max(10 * tol, 1e-4 * dmax)
-    rep = np.arange(len(allp))
-    for i, j in sorted(cKDTree(allp).query_pairs(snap)):
-        ri, rj = rep[i], rep[j]
-        while rep[ri] != ri: ri = rep[ri]
-        while rep[rj] != rj: rj = rep[rj]
-        if ri != rj:
-            rep[max(ri, rj)] = min(ri, rj)
-    for i in range(len(rep)):
-        r_ = rep[i]
-        while rep[r_] != r_: r_ = rep[r_]
-        rep[i] = r_
-    uniq, inv = np.unique(rep, return_inverse=True)
+    # merge near-coincident vertices (noding round-off would otherwise create sliver triangles): each cluster of
+    # vertices closer than `snap` becomes its lowest-numbered one
+    n = len(allp)
+    pairs = cKDTree(allp).query_pairs(max(10 * tol, 1e-4 * dmax), output_type='ndarray')
+    _, lab = connected_components(coo_matrix((np.ones(len(pairs)), pairs.T), shape=(n, n)), directed=False)
+    first = np.full(lab.max() + 1, n)
+    np.minimum.at(first, lab, np.arange(n))
+    uniq, inv = np.unique(first[lab], return_inverse=True)
     verts = allp[uniq]
     segs, off = set(), 0
     for ch in chains:
-        ids = inv[off:off + len(ch)]
-        off += len(ch)
-        for a, b in zip(ids[:-1], ids[1:]):
-            if a != b:
-                segs.add((min(a, b), max(a, b)))
+        ids, off = inv[off:off + len(ch)], off + len(ch)
+        segs |= {(min(a, b), max(a, b)) for a, b in zip(ids[:-1], ids[1:]) if a != b}
     via_ids = list(inv[off:off + len(vpts)])
     segs = np.array(sorted(segs))
     # Triangle's switch parser cannot read exponents ('e' is a switch), so work in units of dmax
@@ -222,8 +174,7 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
         T = tr.triangulate(A, f"pQa{amax:.8f}")
     nodes, tris = T['vertices'] * dmax + org, T['triangles']
     cent = nodes[tris].mean(1)
-    keep = shapely.contains_xy(geom.buffer(tol), cent[:, 0], cent[:, 1])
-    tris = tris[keep]
+    tris = tris[shapely.contains_xy(geom.buffer(tol), cent[:, 0], cent[:, 1])]
     # drop unused nodes, fix orientation
     used = np.unique(tris)
     remap = -np.ones(len(nodes), int)
@@ -232,7 +183,5 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
     via_ids = [int(remap[i]) if i < len(remap) and remap[i] >= 0 else -1 for i in via_ids]
     V = nodes[tris]
     ar = (V[:, 1, 0] - V[:, 0, 0]) * (V[:, 2, 1] - V[:, 0, 1]) - (V[:, 1, 1] - V[:, 0, 1]) * (V[:, 2, 0] - V[:, 0, 0])
-    flip = ar < 0
-    tris[flip] = tris[flip][:, [0, 2, 1]]
-    good = np.abs(ar) > 1e-30
-    return nodes, tris[good], via_ids
+    tris[ar < 0] = tris[ar < 0][:, [0, 2, 1]]
+    return nodes, tris[np.abs(ar) > 1e-30], via_ids

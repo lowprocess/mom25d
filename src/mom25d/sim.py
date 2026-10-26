@@ -8,7 +8,6 @@ shapes  : {interface: [rect (x0,y0,x1,y1) | shapely Polygon/MultiPolygon, ...]}
 ports   : LinePort (wave port, de-embedded to a reference plane, any direction)
           GapPort  (lumped port across a strip, reference plane at the gap)
           ViaPort  (lumped port in a via, e.g. pad-to-ground)
-          legacy MLPort objects are accepted and converted
 vias    : Via(x, y, k_bot, k_top, radius)   k = 0 is the bottom ground, k = N a PEC cover
 lumped  : SeriesLumped (element across a strip); Via(..., Z=...) puts an element inside a via
 metal   : Metal(sigma, t) -> surface impedance on strips, wall loss on vias (optional)
@@ -20,23 +19,26 @@ fan-distributed and enter through the same G_q interaction as the strip charges.
 from types import SimpleNamespace
 
 import numpy as np
-from .model import KNOWN_SPAN
-FIT_SPAN = 0.4             # rad: a wave port's cuts must span this much to fit gamma (a port without a characterised one)
 import shapely
 
+from .model import KNOWN_SPAN
 from .base import MU0, EPS0, RWG, qform, combine, singular_moments, quad_pts, gram_matrix, \
-    _BAR3, _W3, _BAR6, _W6, fit_gamma, fit_waves
-from .multilayer import RunLog, GreenTableML, make_mesh_ml, MLPort
-from .geo import LinePort, port_from_axis, to_geometry, is_manhattan_rects, mesh_polygons
+    _BAR3, _W3, _BAR6, _W6, fit_gamma, fit_waves, moments7, quad_moments
+from .multilayer import RunLog, GreenTableML, make_mesh_ml
+from .geo import LinePort, to_geometry, is_manhattan_rects, mesh_polygons, ngon
 from .via import ViaKernels
-from .sing import offplane_pairs
+from .sing import offplane_pairs, offplane_moments
+
+FIT_SPAN = 0.4             # rad: a wave port's cuts must span this much to fit gamma (a port without a characterised one)
 
 
-# =============================================================================
-# Components
-# =============================================================================
+# ---- Components -------------------------------------------------------------
 def _ls(layer):
     return list(layer) if isinstance(layer, tuple) else [layer]
+
+
+def _sym(M):
+    return 0.5 * (M + M.T)
 
 
 def _zfun(Z):
@@ -48,22 +50,17 @@ def rlc(R=0.0, L=0.0, C=None, parallel=False):
     def Z(f):
         w = 2 * np.pi * f
         if not parallel:
-            z = R + 1j * w * L
-            return z + (1 / (1j * w * C) if C else 0)
-        y = (1 / R if R else 0) + (1 / (1j * w * L) if L else 0) + (1j * w * C if C else 0)
-        return 1 / y
+            return R + 1j * w * L + (1 / (1j * w * C) if C else 0)
+        return 1 / ((1 / R if R else 0) + (1 / (1j * w * L) if L else 0) + (1j * w * C if C else 0))
     return Z
 
 
 def available_memory():
     """Bytes of memory available to this process: MemAvailable, capped by a cgroup limit."""
-    avail = None
     try:
-        for line in open('/proc/meminfo'):
-            if line.startswith('MemAvailable:'):
-                avail = int(line.split()[1]) * 1024
+        avail = next((int(l.split()[1]) * 1024 for l in open('/proc/meminfo') if l.startswith('MemAvailable:')), None)
     except OSError:
-        pass
+        avail = None
     for lim, use in (('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory.current'),
                      ('/sys/fs/cgroup/memory/memory.limit_in_bytes', '/sys/fs/cgroup/memory/memory.usage_in_bytes')):
         try:
@@ -100,13 +97,11 @@ def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver
     work = 3 * 8.0 * n * block + 0.5e9                                          # fast.FastOperator._tiled_work
     can_tile = tiled != 'off' and has_core and name in ('cupy', 'emulate') and work <= 0.9 * free
     if precision == 'auto':
-        precision = 'double' if (not has_core or 18.0 * n * n + 0.9e9 <= 0.5 * avail) else 'mixed'
-        if has_core and precision == 'double' and n > MIXED_MIN_N:
-            # complex64 LU + GMRES refinement on the CPU too: half the LU flops and 10 N^2 bytes instead of 18
-            # (demo transition cropped, 8.4k unknowns, 2 cores: 14.0 s a solve against 18.0 s, |dS| <= 7e-6 over
-            # 1-8 GHz); where the refinement stalls, fast.solve_direct redoes it in double and stays in double
-            # up to MIXED_RETRY x that frequency
-            precision = 'mixed'
+        # mixed where double does not fit, and above MIXED_MIN_N: complex64 LU + GMRES refinement on the CPU too,
+        # half the LU flops and 10 N^2 bytes instead of 18 (demo transition cropped, 8.4k unknowns, 2 cores: 14.0 s
+        # a solve against 18.0 s, |dS| <= 7e-6 over 1-8 GHz); where the refinement stalls, fast.solve_direct redoes
+        # it in double and stays in double up to MIXED_RETRY x that frequency
+        precision = 'mixed' if n > MIXED_MIN_N or 18.0 * n * n + 0.9e9 > 0.5 * avail else 'double'
     if precision == 'mixed' and not has_core:
         precision = 'double'
     hybrid = precision == 'mixed' and gpu_fits and 24.0 * n * n + 0.9e9 <= 0.8 * avail
@@ -149,14 +144,9 @@ class GapPort:
         self.lp = LinePort(layer, center, direction, width, 0.0)
         self.layer, self.zc, self.name = layer, z0, name
 
-    @property
-    def c(self): return self.lp.c
-
-    @property
-    def d(self): return self.lp.d
-
-    @property
-    def w(self): return self.lp.w
+    c = property(lambda self: self.lp.c)
+    d = property(lambda self: self.lp.d)
+    w = property(lambda self: self.lp.w)
 
     def line(self, s=0.0): return self.lp.line(s)
 
@@ -166,8 +156,7 @@ class ViaPort:
     kind = 'via'
 
     def __init__(self, via, z0=50.0, name=''):
-        self.via, self.zc, self.name = via, z0, name
-        self.layer = None
+        self.via, self.zc, self.name, self.layer = via, z0, name, None
 
 
 class DiffPort:
@@ -194,12 +183,9 @@ class ModePort(LinePort):
         p = parent.pos
         super().__init__(p.layer, p.c, p.d, p.w, p.ref, s0=p.s0, step=p.step, s1=p.s1,
                          zc=parent.zdiff if mode == 'd' else parent.zcomm, name=parent.name + mode)
-        self.parent, self.mode = parent, mode
-        self.lp_n = parent.neg
-        self.sign_n = -1.0 if mode == 'd' else 1.0
-        self.cscale = 1.0 if mode == 'd' else 2.0          # Id = (I+ - I-)/2,  Ic = I+ + I-
-        fn = parent.zd_fn if mode == 'd' else parent.zc_fn
-        if fn is not None:
+        self.parent, self.mode, self.lp_n = parent, mode, parent.neg
+        self.sign_n, self.cscale = (-1.0, 1.0) if mode == 'd' else (1.0, 2.0)   # Id = (I+ - I-)/2,  Ic = I+ + I-
+        if (fn := parent.zd_fn if mode == 'd' else parent.zc_fn) is not None:
             self.zc_fn = fn
 
 
@@ -216,23 +202,23 @@ class Metal:
         self.sigma, self.t = sigma, t
 
     def zs(self, f):
-        w = 2 * np.pi * f
-        g = (1 + 1j) * np.sqrt(w * MU0 * self.sigma / 2)
+        g = (1 + 1j) * np.sqrt(2 * np.pi * f * MU0 * self.sigma / 2)
         return g / self.sigma / np.tanh(g * self.t)
+
+
+def _same_area(x, y, area, sides):
+    """The regular `sides`-gon of the given area about (x, y)."""
+    return shapely.Polygon(ngon(x, y, np.sqrt(2 * area / (sides * np.sin(2 * np.pi / sides))), sides))
 
 
 def _simplify_outside(geom, zone, max_area=1.0e-6, sides=4):
     """Small pieces of copper wholly outside `zone` (pads of stitching vias, a few hundred um across) as regular
     `sides`-gons of the same area about their centroid: their outline carries next to no current, and a round pad
     costs one unknown per side (the spokes of the via's fan)."""
-    parts = list(getattr(geom, 'geoms', [geom]))
     out = []
-    for p in parts:
+    for p in getattr(geom, 'geoms', [geom]):
         if p.area < max_area and not p.intersects(zone) and not p.interiors:
-            c = p.centroid
-            R = np.sqrt(2 * p.area / (sides * np.sin(2 * np.pi / sides)))
-            a = 2 * np.pi * np.arange(sides) / sides + np.pi / sides
-            q = shapely.Polygon(np.c_[c.x + R * np.cos(a), c.y + R * np.sin(a)])
+            q = _same_area(p.centroid.x, p.centroid.y, p.area, sides)
             p = q if q.is_valid and q.buffer(1e-9).contains(p.centroid) else p
         out.append(p)
     return shapely.unary_union(out)
@@ -246,25 +232,20 @@ def _square_vias(geom, pts, sides=4):
     edges and its via an octagon, each a spoke of the fan; a square, 4. A pad on its own becomes a square of the
     same area; one joined to a trace becomes the square around it (it keeps the joint), and a round hole (an
     antipad) around a via that does not attach here a square hole of the same area."""
-    def sq(c, R):
-        a = 2 * np.pi * np.arange(sides) / sides + np.pi / sides
-        return shapely.Polygon(np.c_[c[0] + R * np.cos(a), c[1] + R * np.sin(a)])
-    eq = lambda area: np.sqrt(2 * area / (sides * np.sin(2 * np.pi / sides)))       # same-area circumradius
     for x, y in pts:
         P = shapely.Point(x, y)
         parts = list(getattr(geom, 'geoms', [geom]))
         hit = [i for i, p in enumerate(parts) if p.buffer(1e-9).contains(P)]
         if hit:
             p = parts[hit[0]]
-            r = p.exterior.distance(P) if not p.interiors else min([p.exterior.distance(P)] +
-                                                                    [h.distance(P) for h in p.interiors])
+            r = min([p.exterior.distance(P)] + [h.distance(P) for h in p.interiors])
             ring_ = P.buffer(1.6 * r).difference(P.buffer(r))
             if r <= 0 or r > PAD_MAX or p.intersection(ring_).area > 0.4 * ring_.area:
                 continue        # a via in a pour (near its edge or a hole) or on a trace: the vertex is enough
             if p.area < 1.2 * np.pi * r * r:              # a pad by itself
-                q = sq((x, y), eq(p.area))
+                q = _same_area(x, y, p.area, sides)
             else:                                         # a pad on a trace: the square that holds the round pad
-                q = p.union(sq((x, y), r / np.cos(np.pi / sides)))
+                q = p.union(shapely.Polygon(ngon(x, y, r / np.cos(np.pi / sides), sides)))
             if q.is_valid and q.buffer(1e-9).contains(P):
                 parts[hit[0]] = q
         else:
@@ -274,7 +255,7 @@ def _square_vias(geom, pts, sides=4):
                 if j is None or shapely.Polygon(ins[j]).area > np.pi * PAD_MAX ** 2:
                     continue
                 new = shapely.Polygon(p.exterior, ins[:j] + ins[j + 1:] +
-                                      [sq((x, y), eq(shapely.Polygon(ins[j]).area)).exterior])
+                                      [_same_area(x, y, shapely.Polygon(ins[j]).area, sides).exterior])
                 if new.is_valid:
                     parts[i] = new
                 break
@@ -282,9 +263,7 @@ def _square_vias(geom, pts, sides=4):
     return geom
 
 
-# =============================================================================
-# Simulation
-# =============================================================================
+# ---- Simulation -------------------------------------------------------------
 class Simulation:
     def __init__(self, stack, shapes, ports=(), vias=(), lumped=(), dmax=0.3e-3, dmax_layer=None,
                  w_ref=None, ncross=6, grade=1.0, near_fac=5.0, mesher='auto', metal=None,
@@ -293,24 +272,17 @@ class Simulation:
                  signal_vias='round', stitching_vias='auto', signal=None, via_barrel=True, line_basis=None,
                  line_w_max=2.0e-3, line_step=2.0):
         # mesh_only: stop once the mesh and the unknowns (Ne, Nv) are known (a cost estimate; nothing to solve with)
-        self.st, self.title, self.metal = stack, title, metal
-        self.solver = solver
+        self.st, self.title, self.metal, self.solver, self.log = stack, title, metal, solver, RunLog(verbose)
         self.gpu = gpu                      # 'auto' | 'cupy' | 'torch' | 'off' (mixed direct solver LU)
         self.precision = precision          # 'auto' | 'double' | 'mixed' (direct: complex64 Z + refinement)
         self.tiled = tiled                  # 'auto' | 'on' | 'off': mixed precision as L L^T tiles on the GPU (memory_plan)
         self.core_mode = core               # 'compiled': the compiled core's direct solver for small boards too
         self.blr_tol, self.blr_tile, self.blr_eta = 1e-3, 512, 0.7   # solver='blr' preconditioner settings
-        self.log = RunLog(verbose)
         self.dmax, self.ncross, self.grade, self.near_fac = dmax, ncross, grade, near_fac
         self.user_ports = list(ports)
-        self.ports = []
-        for p in ports:
-            p = port_from_axis(p) if isinstance(p, MLPort) else p
-            self.ports += p.modes() if isinstance(p, DiffPort) else [p]
+        self.ports = [m for p in ports for m in (p.modes() if isinstance(p, DiffPort) else [p])]
         self.vias, self.lumped = list(vias), list(lumped)
-        for p in self.ports:
-            if isinstance(p, ViaPort) and p.via not in self.vias:
-                self.vias.append(p.via)
+        self.vias += [p.via for p in self.ports if isinstance(p, ViaPort) and p.via not in self.vias]
         self.layers = sorted(shapes)
         for k in self.layers:
             assert k in stack.metal_interfaces, f"interface {k} cannot carry metal in this stack"
@@ -324,25 +296,17 @@ class Simulation:
         # how each via is meshed: 'round' (its pad and antipad as drawn, an octagon of the via radius) or n sides
         # ('square' = 4): pad and antipad as n-gons, the barrel an n-gon of the via radius (via_barrel) or a single
         # vertex; stitching 'auto': square outside the zone
-        def sides_of(m):
-            if m in ('round', 'auto'):
-                return m
-            n = 4 if m == 'square' else int(m)
-            assert n >= 3, f"a via needs at least 3 sides, not {m!r}"
-            return n
-        signal_vias, stitching_vias = sides_of(signal_vias), sides_of(stitching_vias)
-        assert signal_vias != 'auto'
+        signal_vias, stitching_vias = (m if m in ('round', 'auto') else 4 if m == 'square' else int(m)
+                                       for m in (signal_vias, stitching_vias))
+        assert signal_vias != 'auto' and all(m in ('round', 'auto') or m >= 3 for m in (signal_vias, stitching_vias)), \
+            "a via is 'round', 'square' or n >= 3 sides (stitching vias also 'auto')"
+
         def via_mode(v):
-            kind = getattr(v, 'kind', None)
-            if kind == 'signal':
-                return signal_vias
-            if kind == 'stitching':
-                if stitching_vias == 'auto':
-                    return 4 if zone is not None and not zone.contains(shapely.Point(v.x, v.y)) else 'round'
-                return stitching_vias
-            return 'round'                                    # port vias, vias of hand-built models
-        self.via_mode = {id(v): via_mode(v) for v in self.vias}
-        self.via_barrel = via_barrel
+            kind = getattr(v, 'kind', None)                   # None: port vias, vias of hand-built models
+            if kind == 'stitching' and stitching_vias == 'auto':
+                return 4 if zone is not None and not zone.contains(shapely.Point(v.x, v.y)) else 'round'
+            return {'signal': signal_vias, 'stitching': stitching_vias}.get(kind, 'round')
+        self.via_mode, self.via_barrel = {id(v): via_mode(v) for v in self.vias}, via_barrel
         for n in sorted({m for m in self.via_mode.values() if m != 'round'}):
             vs = [v for v in self.vias if self.via_mode[id(v)] == n]
             geoms = {k: _square_vias(g, [(v.x, v.y) for v in vs if v.k_bot <= k <= v.k_top], sides=n)
@@ -354,66 +318,51 @@ class Simulation:
         self.chains = []                  # (via, k_bot, k_top)
         self.via_attach = []              # per via: list of metal interfaces it attaches to
         for v in self.vias:
-            att = [v.k_bot]
-            for k in range(v.k_bot + 1, v.k_top):
-                if k in geoms and geoms[k].buffer(1e-9).contains(shapely.Point(v.x, v.y)):
-                    att.append(k)
-            att.append(v.k_top)
+            on = lambda k: k in geoms and geoms[k].buffer(1e-9).contains(shapely.Point(v.x, v.y))
             for k in (v.k_bot, v.k_top):
-                pec = k == 0 or (stack.top == 'pec' and k == stack.N)
-                if not pec:
-                    assert k in geoms and geoms[k].buffer(1e-9).contains(shapely.Point(v.x, v.y)), \
-                        f"via {v.name} ends on M{k} where there is no metal"
+                assert k == 0 or (stack.top == 'pec' and k == stack.N) or on(k), \
+                    f"via {v.name} ends on M{k} where there is no metal"
+            att = [v.k_bot] + [k for k in range(v.k_bot + 1, v.k_top) if on(k)] + [v.k_top]
             self.via_attach.append([k for k in att if k in geoms])
-            for a, b in zip(att[:-1], att[1:]):
-                self.chains.append((v, a, b))
+            self.chains += [(v, a, b) for a, b in zip(att[:-1], att[1:])]
 
         # ---- port sample positions and constraint lines -----------------------------------
-        self.samples = []
-        lines = {k: [] for k in self.layers}
+        self.samples, lines = [], {k: [] for k in self.layers}
+        add = lambda lp, xs: [lines[k].append((lp, x)) for k in _ls(lp.layer) for x in xs]
         for p in self.ports:
             if isinstance(p, LinePort):
                 step = p.step or dmax
-                s0 = p.s0 if p.s0 is not None else 2 * step
-                s1 = p.s1 if p.s1 is not None else p.ref
-                n = int(np.floor((s1 - s0) / step + 1e-9)) + 1
-                s = s1 - step * np.arange(n)[::-1]
+                s0, s1 = p.s0 if p.s0 is not None else 2 * step, p.s1 if p.s1 is not None else p.ref
+                s = s1 - step * np.arange(int(np.floor((s1 - s0) / step + 1e-9)) + 1)[::-1]
                 self.samples.append(s)
-                for L_ in _ls(p.layer):
-                    lines[L_] += [(p, x) for x in np.append(s, 0.0)]
-                if isinstance(p, ModePort):
-                    for L_ in _ls(p.lp_n.layer):
-                        lines[L_] += [(p.lp_n, x) for x in np.append(s, 0.0)]
+                for lp in [p] + ([p.lp_n] if isinstance(p, ModePort) else []):
+                    add(lp, np.append(s, 0.0))
             else:
                 self.samples.append(None)
                 if isinstance(p, GapPort):
-                    for L_ in _ls(p.layer):
-                        lines[L_].append((p.lp, 0.0))
+                    add(p.lp, [0.0])
         for el in self.lumped:
-            for L_ in _ls(el.layer):
-                lines[L_].append((el.lp, 0.0))
+            add(el.lp, [0.0])
 
         # ---- mesh ---------------------------------------------------------------------------
         with self.log.timer('mesh'):
             nodes, tris, tl, off, self.mesher_used = [], [], [], 0, {}
             via_vertex = {}
             for k in self.layers:
-                dm = dmax_layer.get(k, dmax)
-                lp_here = [lp for lp, _ in lines[k]]
+                dm, lp_here = dmax_layer.get(k, dmax), [lp for lp, _ in lines[k]]
                 vias_here = [(i, v) for i, v in enumerate(self.vias) if k in self.via_attach[i]]
                 use_tensor = (mesher == 'tensor' or (mesher == 'auto' and is_manhattan_rects(shapes[k])
                               and not vias_here and all(lp.axis_aligned for lp in lp_here)))
+                wr = w_ref.get(k) if isinstance(w_ref, dict) else w_ref
                 if use_tensor:
                     xl, yl = [], []
                     for lp, s in lines[k]:
-                        pt = lp.c + lp.d * s
-                        (xl if abs(lp.d[0]) > 0.5 else yl).append(pt[0] if abs(lp.d[0]) > 0.5 else pt[1])
-                    wr = w_ref.get(k) if isinstance(w_ref, dict) else w_ref
-                    narrow = 1.01 * max(wr or 0, 1.5 * dm)
-                    nd, tr = make_mesh_ml(shapes[k], dm, ncross, narrow, xl, yl, grade=grade)
+                        x = abs(lp.d[0]) > 0.5
+                        (xl if x else yl).append((lp.c + lp.d * s)[0 if x else 1])
+                    nd, tr = make_mesh_ml(shapes[k], dm, ncross, 1.01 * max(wr or 0, 1.5 * dm), xl, yl, grade=grade)
                     vids = []
                 else:
-                    wr = (w_ref.get(k) if isinstance(w_ref, dict) else w_ref) or self._guess_wref(geoms[k], lp_here)
+                    wr = wr or self._guess_wref(geoms[k], lp_here)
                     seg = [lp.line(s) for lp, s in lines[k]]
                     def vpt(v):
                         m = self.via_mode[id(v)]
@@ -422,8 +371,7 @@ class Simulation:
                         # an n-sided via: its barrel as an n-gon (signal vias, via_barrel) or a single vertex
                         barrel = v.ring and getattr(v, 'kind', None) == 'signal' and via_barrel
                         return (v.x, v.y, v.a, m) if barrel else (v.x, v.y, 0.0)
-                    vpts = [vpt(v) for _, v in vias_here]
-                    fine = None
+                    vpts, fine = [vpt(v) for _, v in vias_here], None
                     if refine and dm > 1.2 * dmax:
                         # resolve return currents under/over metal on nearby layers
                         near = [(geoms[j] if zone is None else geoms[j].intersection(zone))
@@ -446,8 +394,7 @@ class Simulation:
                     via_vertex[(i, k)] = vid + off
                 self.mesher_used[k] = 'tensor' if use_tensor else 'polygon'
                 nodes.append(nd); tris.append(tr + off); tl.append(np.full(len(tr), k)); off += len(nd)
-            self.rwg = RWG(np.vstack(nodes), np.vstack(tris))
-            self.tri_layer = np.concatenate(tl)
+            self.rwg, self.tri_layer = RWG(np.vstack(nodes), np.vstack(tris)), np.concatenate(tl)
             self.edge_layer = self.tri_layer[self.rwg.tp]
         r = self.rwg
         self.Ne, self.Nv = r.Ne, len(self.chains)
@@ -457,21 +404,16 @@ class Simulation:
         Nt = len(r.tris)
 
         # ---- via fans and extended divergence ---------------------------------------------
-        self.fan = {}
-        for (i, k), vid in via_vertex.items():
-            self.fan[(i, k)] = np.nonzero((r.tris == vid).any(1))[0]
-        F = sorted({t for v in self.fan.values() for t in v})
-        self.F = np.array(F, int)
-        fpos = {t: j for j, t in enumerate(F)}
-        self.dF = np.zeros((len(F), self.Nv))
+        self.fan = {key: np.nonzero((r.tris == vid).any(1))[0] for key, vid in via_vertex.items()}
+        self.F = np.array(sorted({t for v in self.fan.values() for t in v}), int)
+        fpos = {t: j for j, t in enumerate(self.F)}
+        self.dF = np.zeros((len(self.F), self.Nv))
         for n, (v, kb, kt) in enumerate(self.chains):
             i = self.vias.index(v)
             for k, div in ((kb, +1.0), (kt, -1.0)):
                 if (i, k) in self.fan:
                     ts = self.fan[(i, k)]
-                    A = r.area[ts].sum()
-                    for t in ts:
-                        self.dF[fpos[t], n] += div / A
+                    self.dF[[fpos[t] for t in ts], n] += div / r.area[ts].sum()
         self.log.note(f"mesh: {Nt} triangles, {r.Ne} edge + {self.Nv} via unknowns  ("
                       + ", ".join(f"M{k}: {len(self.tri_idx[k])} tri ({self.mesher_used[k]})"
                                   for k in self.layers) + ")")
@@ -480,20 +422,18 @@ class Simulation:
         self.tri_size = np.linalg.norm(V - np.roll(V, 1, axis=1), axis=2).max(1)
         self.P3, self.W3 = quad_pts(r, _BAR3), r.area[:, None] * _W3[None, :]
         self.P6, self.W6 = quad_pts(r, _BAR6), r.area[:, None] * _W6[None, :]
-        ext = r.nodes.max(0) - r.nodes.min(0)
-        self.rho_max = 1.05 * np.hypot(*ext) + 1e-4
-        self._gram = None
-        self._xcache = {}
+        self.rho_max = 1.05 * np.hypot(*(r.nodes.max(0) - r.nodes.min(0))) + 1e-4
+        self._gram, self._xcache, self.qT = None, {}, None
         self._edge_sets()
-        self.qT = None
+        # port gaps, sample cuts and lumped elements keep their edges as unknowns (line functions, quad cells)
+        keep_e = [i for g in self.gap if g is not None for i in g[0]]
+        keep_e += [i for c in self.cuts if c is not None for idx, _ in c for i in idx]
+        keep_e += [i for e in self.lumped_edges for i in e[0]]
         if line_basis and line_basis != 'off':
             # (experimental) line basis functions on straight runs of trace (line.py): per column along a run, a
             # few functions with the edge-peaked shape across it, in place of the RWG unknowns inside the run
             from .line import find_runs, line_subspace
             prof = {'even': ('maxwell',), 'on': ('maxwell', 'odd'), 'full': ('maxwell', 'uniform', 'odd')}[line_basis]
-            keep_e = [i for g in self.gap if g is not None for i in g[0]]
-            keep_e += [i for c in self.cuts if c is not None for idx, _ in c for i in idx]
-            keep_e += [i for e in self.lumped_edges for i in e[0]]
             # the columns' length along the runs: at least 2 cells - tents a cell long interpolate onto the triangles
             # badly (their kinks fall inside cells: the GCPW at 2 GHz 0.17 off, the differential via all wrong)
             h_of = {k: max(line_step, 2.0) * dmax for k in self.layers}
@@ -507,28 +447,18 @@ class Simulation:
             if quads:
                 self.log.note("quads: not with line functions yet - ignored")
                 quads = False
-            if solver not in ('dense', 'direct', 'auto'):
-                self.log.note(f"lines: not with solver {solver} yet - ignored")
-                self.qT = None
         if quads:
             # (experimental) near-rectangular triangle pairs as quad cells: their diagonal is no longer an
             # unknown (quads.py); the matrix is filled on the triangles and projected before the LU
             from .quads import quad_subspace
-            keep_e = [i for g in self.gap if g is not None for i in g[0]]
-            keep_e += [i for c in self.cuts if c is not None for idx, _ in c for i in idx]
-            keep_e += [i for e in self.lumped_edges for i in e[0]]
             excl = self.F
             if quads == 'centre':
                 # only in the middle of the lines: no triangle with a corner on the copper outline (the edge strips
                 # stay triangles) and, where the signal copper is known (BoardModel), none off it (pours, pads)
-                cnt = {}
-                for a, b, c in r.tris:
-                    for e in ((a, b), (b, c), (c, a)):
-                        e = (min(e), max(e)); cnt[e] = cnt.get(e, 0) + 1
+                edges, count = np.unique(np.sort(r.tris[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), 1), axis=0,
+                                         return_counts=True)
                 bnode = np.zeros(len(r.nodes), bool)
-                for (a, b), n_ in cnt.items():
-                    if n_ == 1:
-                        bnode[[a, b]] = True
+                bnode[edges[count == 1].ravel()] = True                     # the nodes on the copper outline
                 off_ = bnode[r.tris].any(1)
                 if signal is not None:
                     off_ |= ~shapely.contains_xy(signal, r.cent[:, 0], r.cent[:, 1])
@@ -539,9 +469,10 @@ class Simulation:
             self.quad_info = qi
             self.log.note(f"quads: {qi['quads']} quad cells ({qi['tris_merged']} of {qi['tris']} triangles), "
                           f"{qi['full']} -> {qi['reduced']} unknowns")
-            if solver not in ('dense', 'direct', 'auto'):
-                self.log.note(f"quads: not with solver {solver} yet - ignored")
-                self.qT = None
+        if self.qT is not None and solver not in ('dense', 'direct', 'auto'):
+            self.log.note(f"{'lines' if line_basis and line_basis != 'off' else 'quads'}: not with solver {solver} "
+                          f"yet - ignored")
+            self.qT = None
         self.tables, self.last = {}, None
         for p in self.ports:
             if isinstance(p, LinePort) and not isinstance(p, ModePort) and getattr(p, 'zc_fn', None) is None and p.zc == 50.0:
@@ -558,15 +489,13 @@ class Simulation:
         # the via transition, 13.5k unknowns, RX 7800 XT) or on the CPU (about 1.3x faster than double). The
         # complex64 preconditioner can stall (fine meshes, low frequency, many via chains; docs/mom.md): that
         # solve is redone in double, and the frequencies up to MIXED_RETRY x it stay in double
-        g = None
-        if has_core and gpu != 'off' and (precision == 'mixed' or (precision == 'auto' and n > 3500)):
-            from .gpu import get_backend
-            b = get_backend(gpu)
-            g = (b.name, b.mem_free()) if b is not None else None
+        from .gpu import get_backend
+        want_gpu = has_core and gpu != 'off' and (precision == 'mixed' or (precision == 'auto' and n > 3500))
+        b = get_backend(gpu) if want_gpu else None
+        g = (b.name, b.mem_free()) if b is not None else None
         avail = available_memory()
         plan = memory_plan(n, has_core, avail, g, precision, solver, self.tiled)
-        self.precision = precision = plan['precision']
-        self.plan = plan
+        self.plan, self.precision, precision = plan, plan['precision'], plan['precision']
         if solver in ('auto', 'direct'):
             self.log.note(f"memory: direct solver needs ~{plan['host'] / 1e9:.1f} GB ({precision} precision, "
                           f"{plan['path']}" + (f", {plan['gpu'] / 1e9:.1f} GB on the GPU" if plan['gpu'] else '')
@@ -577,11 +506,10 @@ class Simulation:
                     plan = memory_plan(n, has_core, avail, g, precision, 'direct', self.tiled)
                     self.precision, self.plan, solver = plan['precision'], plan, plan['solver']
             elif not plan['fits']:
-                alt = 'blr' if has_core else 'aca'
+                solver = 'blr' if has_core else 'aca'
                 self.log.note(f"WARNING: direct solver would need ~{plan['host'] / 1e9:.1f} GB but only "
-                              f"{avail / 1e9:.1f} GB is available - switching to {alt}. Coarser dmax / "
+                              f"{avail / 1e9:.1f} GB is available - switching to {solver}. Coarser dmax / "
                               f"dmax_layer, a smaller region, or an inner-layer ground reduce N.")
-                solver = alt
             self.solver = solver
             if self.qT is not None and solver not in ('dense', 'direct'):
                 self.log.note(f"quads: not with solver {solver} yet - ignored")
@@ -594,40 +522,32 @@ class Simulation:
 
         # ---- static singular parts ------------------------------------------------------------
         with self.log.timer('singular integrals (static, once)'):
-            M0, Mrr = np.zeros((Nt, Nt)), np.zeros((Nt, Nt))
-            Mr = np.zeros((Nt, Nt, 2)); Qs = np.zeros((Nt, Nt), complex)
+            M0, Mrr, Mr, Qs = np.zeros((Nt, Nt)), np.zeros((Nt, Nt)), np.zeros((Nt, Nt, 2)), np.zeros((Nt, Nt), complex)
             for k in self.layers:
                 idx = self.tri_idx[k]
                 m0, mr, mrr = singular_moments(SimpleNamespace(nodes=r.nodes, tris=r.tris[idx], area=r.area[idx]))
                 ix = np.ix_(idx, idx)
-                M0[ix] = 0.5 * (m0 + m0.T); Mrr[ix] = 0.5 * (mrr + mrr.T); Mr[ix] = mr
+                M0[ix], Mrr[ix], Mr[ix] = _sym(m0), _sym(mrr), mr
                 Qs[ix] = M0[ix] / (2 * np.pi * EPS0 * stack.eps_sum(k))
-            SA = MU0 / (4 * np.pi) * combine(r, Mrr, Mr[..., 0], Mr[..., 1], M0)
-            self.SA = 0.5 * (SA + SA.T)
-            SQ = qform(r.D, Qs, r.D)
-            self.SQ = 0.5 * (SQ + SQ.T)
-            self.Qs_F = Qs[:, self.F].copy()
-            del M0, Mrr, Mr, Qs
+            self.SA = _sym(MU0 / (4 * np.pi) * combine(r, Mrr, Mr[..., 0], Mr[..., 1], M0))
+            self.SQ, self.Qs_F = _sym(qform(r.D, Qs, r.D)), Qs[:, self.F].copy()
 
     @staticmethod
     def _guess_wref(g, lps):
         ws = [lp.w for lp in lps if lp.w > 0]
         if ws:
             return min(ws)
-        b = g.bounds
-        cap = 0.25 * min(b[2] - b[0], b[3] - b[1])
         # no line ports here: the narrowest conductor, 2 A / P per piece (= w for a strip, larger for pads/planes)
-        pieces = [q for q in getattr(g, 'geoms', [g]) if q.geom_type == 'Polygon' and q.length > 0]
-        return min([cap] + [2 * q.area / q.length for q in pieces])
+        x0, y0, x1, y1 = g.bounds
+        return min([0.25 * min(x1 - x0, y1 - y0)] + [2 * q.area / q.length for q in getattr(g, 'geoms', [g])
+                                                      if q.geom_type == 'Polygon' and q.length > 0])
 
     # ---- edges on lines --------------------------------------------------------------------
     def _line_edges(self, lp, s, tol=1e-8):
         r = self.rwg
-        c = lp.c + lp.d * s
-        e0, e1 = r.ends[:, 0] - c, r.ends[:, 1] - c
-        on = (np.abs(e0 @ lp.d) < tol) & (np.abs(e1 @ lp.d) < tol)
+        e0, e1 = r.ends[:, 0] - (lp.c + lp.d * s), r.ends[:, 1] - (lp.c + lp.d * s)
+        on = (np.abs(e0 @ lp.d) < tol) & (np.abs(e1 @ lp.d) < tol) & np.isin(self.edge_layer, _ls(lp.layer))
         on &= (np.abs(e0 @ lp.t) <= lp.w / 2 + tol) & (np.abs(e1 @ lp.t) <= lp.w / 2 + tol)
-        on &= np.isin(self.edge_layer, list(lp.layer) if isinstance(lp.layer, tuple) else [lp.layer])
         idx = np.nonzero(on)[0]
         return idx, np.sign(r.nrm[idx] @ lp.d)
 
@@ -635,64 +555,59 @@ class Simulation:
         self.gap, self.cuts = [], []
         for p, s in zip(self.ports, self.samples):
             if isinstance(p, ModePort):
-                def both(x, half):
-                    ip, sp = self._line_edges(p, x)
-                    i_n, sn = self._line_edges(p.lp_n, x)
-                    k = 0.5 if half else 1.0
+                def cut(x, k=0.5):
+                    (ip, sp), (i_n, sn) = self._line_edges(p, x), self._line_edges(p.lp_n, x)
                     return np.concatenate([ip, i_n]), np.concatenate([k * sp, k * p.sign_n * sn])
-                self.gap.append(both(0.0, False))
-                self.cuts.append([both(x, True) for x in s])
-                assert all(len(c[0]) for c in self.cuts[-1]), f"port {p.name}: sample cut off the conductor"
+                gap = cut(0.0, 1.0)
             elif isinstance(p, LinePort):
-                self.gap.append(self._line_edges(p, 0.0))
-                self.cuts.append([self._line_edges(p, x) for x in s])
-                assert all(len(c[0]) for c in self.cuts[-1]), f"port {p.name}: sample cut off the conductor"
-            elif isinstance(p, GapPort):
-                self.gap.append(self._line_edges(p.lp, 0.0)); self.cuts.append(None)
+                cut = lambda x: self._line_edges(p, x)
+                gap = cut(0.0)
             else:
-                self.gap.append(None); self.cuts.append(None)
-            if self.gap[-1] is not None:
-                assert len(self.gap[-1][0]) > 0, f"port {p.name}: no mesh edges on the gap line"
-        self.lumped_edges = []
-        for el in self.lumped:
-            e = self._line_edges(el.lp, 0.0)
+                gap, s = (self._line_edges(p.lp, 0.0) if isinstance(p, GapPort) else None), None
+            self.gap.append(gap)
+            self.cuts.append(None if s is None else [cut(x) for x in s])
+            assert gap is None or len(gap[0]), f"port {p.name}: no mesh edges on the gap line"
+            assert s is None or all(len(c[0]) for c in self.cuts[-1]), f"port {p.name}: sample cut off the conductor"
+        self.lumped_edges = [self._line_edges(el.lp, 0.0) for el in self.lumped]
+        for el, e in zip(self.lumped, self.lumped_edges):
             assert len(e[0]) > 0, f"lumped element {el.name}: no mesh edges on its line"
-            self.lumped_edges.append(e)
 
     def _port_chain(self, p):
         """Index of the lowest chain of the via of a ViaPort."""
         return next(n for n, (v, _, _) in enumerate(self.chains) if v is p.via)
 
     # ---- matrix --------------------------------------------------------------------------------
+    def green_tables(self, f):
+        """The layered-media tables of every pair of metal interfaces at f: {(a, b): GreenTableML}, a <= b."""
+        self.tables = {}
+        for i, a in enumerate(self.layers):
+            for b in self.layers[i:]:
+                xs = a != b and abs(self.st.z[a] - self.st.z[b]) < 3 * self.dmax
+                im = a == b and self.st.nearest_discontinuity(a) < 1.5 * self.dmax
+                with self.log.timer('Green tables', f"M{a}-M{b} @ {f / 1e9:.2f} GHz"):
+                    self.tables[(a, b)] = GreenTableML(f, self.st, a, b, self.rho_max, cross_sing=xs, image_sing=im)
+        return self.tables
+
     def impedance(self, f):
         w = 2 * np.pi * f
         r = self.rwg
         Nt = len(r.tris)
         A0, Axo, Ayo, Arr, Q0 = (np.zeros((Nt, Nt), complex) for _ in range(5))
-        self.tables = {}
-        for i, a in enumerate(self.layers):
-            for b in self.layers[i:]:
-                xs = a != b and abs(self.st.z[a] - self.st.z[b]) < 3 * self.dmax
-                im = a == b and self._near_layer(a) < 1.5 * self.dmax
-                with self.log.timer('Green tables', f"M{a}-M{b} @ {f / 1e9:.2f} GHz"):
-                    gt = GreenTableML(f, self.st, a, b, self.rho_max, cross_sing=xs, image_sing=im)
-                self.tables[(a, b)] = gt
-                ia, ib = self.tri_idx[a], self.tri_idx[b]
-                with self.log.timer('smooth-kernel fill'):
-                    a0, axo, ayo, axs, ays, arr, q0 = self._block(ia, ib, a, b, gt)
-                ix = np.ix_(ia, ib)
-                A0[ix], Axo[ix], Ayo[ix], Arr[ix], Q0[ix] = a0, axo, ayo, arr, q0
-                if a != b:
-                    jx = np.ix_(ib, ia)
-                    A0[jx], Axo[jx], Ayo[jx], Arr[jx], Q0[jx] = a0.T, axs.T, ays.T, arr.T, q0.T
+        for (a, b), gt in self.green_tables(f).items():
+            ia, ib = self.tri_idx[a], self.tri_idx[b]
+            with self.log.timer('smooth-kernel fill'):
+                a0, axo, ayo, axs, ays, arr, q0 = self._block(ia, ib, a, b, gt)
+            ix = np.ix_(ia, ib)
+            A0[ix], Axo[ix], Ayo[ix], Arr[ix], Q0[ix] = a0, axo, ayo, arr, q0
+            if a != b:
+                jx = np.ix_(ib, ia)
+                A0[jx], Axo[jx], Ayo[jx], Arr[jx], Q0[jx] = a0.T, axs.T, ays.T, arr.T, q0.T
         N = self.Ne + self.Nv
         Z = np.zeros((N, N), complex)
         with self.log.timer('assemble'):
-            sym = lambda M: 0.5 * (M + M.T)
-            ZA = self.SA + combine(r, sym(Arr), Axo, Ayo, sym(A0))
-            Q0 = sym(Q0)
-            ZQ = self.SQ + qform(r.D, Q0, r.D)
-            Z[:self.Ne, :self.Ne] = 1j * w * ZA + ZQ / (1j * w)
+            Q0 = _sym(Q0)
+            Z[:self.Ne, :self.Ne] = (1j * w * (self.SA + combine(r, _sym(Arr), Axo, Ayo, _sym(A0)))
+                                     + (self.SQ + qform(r.D, Q0, r.D)) / (1j * w))
         if self.Nv:
             with self.log.timer('via kernels', f"{self.Nv} chains"):
                 B, C = self._via_blocks(f, Q0[:, self.F] + self.Qs_F)
@@ -703,22 +618,17 @@ class Simulation:
             u = np.zeros(N); u[idx] = sig * r.l[idx]
             Z += el.Z(f) * np.outer(u, u)
         if self.metal is not None:
-            if self._gram is None:
-                self._gram = gram_matrix(r)
-            zs = self.metal.zs(f)
-            Z[:self.Ne, :self.Ne] += zs * self._gram
-        return 0.5 * (Z + Z.T)
+            self._gram = gram_matrix(r) if self._gram is None else self._gram
+            Z[:self.Ne, :self.Ne] += self.metal.zs(f) * self._gram
+        return _sym(Z)
 
     VIA_TABLE_PAIRS = 64                 # via pairs of one span pair above which R comes from a table
 
     def _via_blocks(self, f, QF):
         """Via rows/columns: B (Ne x Nv) strip-via coupling, C (Nv x Nv) via-via (incl. elements in vias)."""
-        w = 2 * np.pi * f
-        r = self.rwg
-        B = np.zeros((self.Ne, self.Nv), complex)
-        C = np.zeros((self.Nv, self.Nv), complex)
-        spans = [(kb, kt) for _, kb, kt in self.chains]
-        vk = ViaKernels(f, self.st, spans, self.layers, self.rho_max)
+        w, r = 2 * np.pi * f, self.rwg
+        B, C = np.zeros((self.Ne, self.Nv), complex), np.zeros((self.Nv, self.Nv), complex)
+        vk = ViaKernels(f, self.st, [(kb, kt) for _, kb, kt in self.chains], self.layers, self.rho_max)
         # fan-distributed end charges (G_q between triangles, same machinery as strips)
         if len(self.F):
             T = QF @ self.dF                                   # (Nt, Nv) potential of fan charges
@@ -735,33 +645,27 @@ class Simulation:
         # via-via: group all pairs by (span_m, span_n) and evaluate each group's Hankel transform once
         groups = {}
         for m, (vm, am, bm) in enumerate(self.chains):
-            for n, (vn, an, bn) in enumerate(self.chains):
-                if n < m:
-                    continue
+            for n, (vn, an, bn) in enumerate(self.chains[m:], m):
                 d = vm.a if vm is vn else max(np.hypot(vm.x - vn.x, vm.y - vn.y), 0.5 * (vm.a + vn.a))
                 groups.setdefault(((am, bm), (an, bn)), []).append((m, n, d))
         for (sm, sn), lst in groups.items():
-            dd = np.array([d for _, _, d in lst])
+            m, n, dd = (np.array(a) for a in zip(*lst))
             # many pairs: the smooth remainder from a table (the SMA launch's 143k pairs took 24.6 s a solve of
             # 26.8 for its via blocks); a few: exactly
-            rv = vk.R_table(sm, sn)(dd) if len(dd) > self.VIA_TABLE_PAIRS else vk.R(sm, sn, dd)
-            vals = rv + vk.homog(sm, sn, dd)
-            for (m, n, _), val in zip(lst, vals):
-                C[m, n] += val
-                if n != m:
-                    C[n, m] += val
+            vals = (vk.R_table(sm, sn)(dd) if len(dd) > self.VIA_TABLE_PAIRS else vk.R(sm, sn, dd)) + vk.homog(sm, sn, dd)
+            C[m, n] += vals                                            # each pair once, in one group
+            C[n[m != n], m[m != n]] += vals[m != n]
+        seen, zs = set(), self.metal.zs(f) if self.metal is not None else 0.0
         for n, (v, kb, kt) in enumerate(self.chains):
-            if v.Z is not None and n == self.chains.index(next(c for c in self.chains if c[0] is v)):
+            if v.Z is not None and id(v) not in seen:             # an element in a via: in its lowest chain
                 C[n, n] += v.Z(f)
-        if self.metal is not None:
-            zs = self.metal.zs(f)
-            for n, (v, kb, kt) in enumerate(self.chains):
-                C[n, n] += zs * (self.st.z[kt] - self.st.z[kb]) / (2 * np.pi * v.a)
+            seen.add(id(v))
+            C[n, n] += zs * (self.st.z[kt] - self.st.z[kb]) / (2 * np.pi * v.a)     # wall loss
         return B, C
 
     def _block(self, ia, ib, a, b, gt):
-        r = self.rwg
-        ca, cb, aa, ab = r.cent[ia], r.cent[ib], r.area[ia], r.area[ib]
+        r, st = self.rwg, self.st
+        ca, cb = r.cent[ia], r.cent[ib]
         rho = np.sqrt(((ca[:, None, :] - cb[None, :, :]) ** 2).sum(-1))
         GA, GQ = gt.AQ(rho)
         xs = a != b and gt.cA != 0                       # near-singular cross-layer part extracted
@@ -771,54 +675,34 @@ class Simulation:
             GA, GQ = GA + gt.cA / R3, GQ + gt.cq / R3
         # (the extracted image is integrated analytically for ALL pairs below, consistent with the
         #  exact 1/R part: far from a source over ground they nearly cancel - a dipole field)
-        wgt = aa[:, None] * ab[None, :]
-        A0 = GA * wgt
-        out = [A0, A0 * ca[:, None, 0], A0 * ca[:, None, 1], A0 * cb[None, :, 0], A0 * cb[None, :, 1],
-               A0 * (ca @ cb.T), GQ * wgt]
-        st = self.st
+        wgt = r.area[ia][:, None] * r.area[ib][None, :]
+        out = moments7(GA * wgt, GQ * wgt, ca[:, None], cb[None])
         Ls = abs(st.z[a] - st.z[b]) if a != b else 2 * min(
             st.layers[a - 1].h, (st.layers[a].h if a < st.N else np.inf))
         size = np.maximum(self.tri_size[ia][:, None], self.tri_size[ib][None, :])
         p, q = np.nonzero(rho ** 2 + Ls ** 2 < (self.near_fac * size) ** 2)
-        P, W = (self.P3, self.W3) if a == b else (self.P6, self.W6)
-        for c0 in range(0, len(p), 20000):
-            pp, qq = ia[p[c0:c0 + 20000]], ib[q[c0:c0 + 20000]]
-            pa, pb = P[pp][:, :, None, :], P[qq][:, None, :, :]
-            Wt = W[pp][:, :, None] * W[qq][:, None, :]
-            ga, gq = gt.AQ(np.sqrt(((pa - pb) ** 2).sum(-1)))
-            ga, gq = ga * Wt, gq * Wt
-            vals = [ga.sum((1, 2)), (ga * pa[..., 0]).sum((1, 2)), (ga * pa[..., 1]).sum((1, 2)),
-                    (ga * pb[..., 0]).sum((1, 2)), (ga * pb[..., 1]).sum((1, 2)),
-                    (ga * (pa * pb).sum(-1)).sum((1, 2)), gq.sum((1, 2))]
-            for M, v in zip(out, vals):
-                M[p[c0:c0 + 20000], q[c0:c0 + 20000]] = v
+        for M, v in zip(out, quad_moments(*((self.P3, self.W3) if a == b else (self.P6, self.W6)), ia[p], ib[q], gt)):
+            M[p, q] = v
         for flag, dd, cA, cq, allp in ((xs, gt.d, gt.cA, gt.cq, False), (im, gt.dimg, gt.cAi, gt.cqi, True)):
             if not flag:
                 continue
             pp, qq = (np.repeat(np.arange(len(ia)), len(ib)), np.tile(np.arange(len(ib)), len(ia))) \
                 if allp else (p, q)
-            key = (a, b, dd)
-            if key not in self._xcache:                    # geometry only: cache across frequencies
-                self._xcache[key] = offplane_pairs(r.nodes, r.tris, ia[pp], ib[qq], dd)
-            m0, mro, mrs, mrr = self._xcache[key]
-            for M, v in zip(out, [cA * m0, cA * mro[:, 0], cA * mro[:, 1], cA * mrs[:, 0],
-                                  cA * mrs[:, 1], cA * mrr, cq * m0]):
+            if (a, b, dd) not in self._xcache:             # geometry only: cache across frequencies
+                self._xcache[(a, b, dd)] = offplane_pairs(r.nodes, r.tris, ia[pp], ib[qq], dd)
+            for M, v in zip(out, offplane_moments(cA, cq, self._xcache[(a, b, dd)])):
                 M[pp, qq] += v
         return out
 
-    def _near_layer(self, k):
-        return self.st.nearest_discontinuity(k)
-
     # ---- excitation and port quantities -------------------------------------------------
     def excitation(self):
-        r = self.rwg
         E = np.zeros((self.Ne + self.Nv, len(self.ports)), complex)
         for j, p in enumerate(self.ports):
             if isinstance(p, ViaPort):
                 E[self.Ne + self._port_chain(p), j] = 1.0
             else:
                 idx, sig = self.gap[j]
-                E[idx, j] = sig * r.l[idx]
+                E[idx, j] = sig * self.rwg.l[idx]
         return E
 
     def port_current(self, I, j):
@@ -847,28 +731,26 @@ class Simulation:
             return self.fast.solve_blr(f, E, tol=self.blr_tol, tile=self.blr_tile, eta=self.blr_eta)
         if self.qT is not None:
             T = self.qT
-            Z = self.impedance(f)
-            return T @ self.solve(np.asarray(T.T @ (T.T @ Z.T).T), np.asarray(T.T @ E))
+            return T @ self.solve(np.asarray(T.T @ (T.T @ self.impedance(f).T).T), np.asarray(T.T @ E))
         return self.solve(self.impedance(f), E)
 
     def sparams(self, f, keep=False):
         for p in self.ports:                          # frequency-dependent reference impedance
             if getattr(p, 'zc_fn', None) is not None:
                 p.zc = float(p.zc_fn(f))
-        I = self.currents(f, self.excitation())
-        n = len(self.ports)
+        I, n = self.currents(f, self.excitation()), len(self.ports)
         Ap, Bp = np.zeros((n, n), complex), np.zeros((n, n), complex)
         gam, resid = np.full(n, np.nan + 0j), np.zeros(n)
+        self.low_span = []
         for i, p in enumerate(self.ports):
             if isinstance(p, LinePort):
-                s = self.samples[i]
-                Ik = self.cut_current(I, i)
+                s, Ik = self.samples[i], self.cut_current(I, i)
                 # gamma from the line characterisation where there is one: fitted on a short feed with a strong
                 # standing wave it came out 2-10x low (radial stub, |S11| 1.19), and switching between the fit and
                 # the characterised gamma at a span made S jump, which the adaptive sweep chased (38 solves)
                 gk = getattr(p, 'gamma_fn', None)
                 p.known_gamma = gk is not None
-                g = gk(f) if p.known_gamma else fit_gamma(Ik, abs(s[1] - s[0]))
+                g = gam[i] = gk(f) if p.known_gamma else fit_gamma(Ik, abs(s[1] - s[0]))
                 a, b = fit_waves(Ik, s - p.ref, g)
                 M = np.stack([np.exp(-g * (s - p.ref)), np.exp(g * (s - p.ref))], 1)
                 # residual relative to the largest response of this port over all excitations (a mode
@@ -877,22 +759,15 @@ class Simulation:
                 resid[i] = np.max(np.linalg.norm(Ik - M @ np.vstack([a, b]), axis=0)) / np.max(np.linalg.norm(Ik, axis=0))
                 cs = getattr(p, 'cscale', 1.0)                 # modal current definition (diff ports)
                 Ap[i], Bp[i] = np.sqrt(p.zc) * cs * a, -np.sqrt(p.zc) * cs * b
-                gam[i] = g
-            else:
-                Vp = np.eye(n)[i]                     # port voltage = applied EMF
-                Ip = self.port_current(I, i)
-                Ap[i] = (Vp + p.zc * Ip) / (2 * np.sqrt(p.zc))
-                Bp[i] = (Vp - p.zc * Ip) / (2 * np.sqrt(p.zc))
-        S = Bp @ np.linalg.inv(Ap)
-        self.low_span = []
-        for i, p in enumerate(self.ports):
-            if isinstance(p, LinePort):
-                span = abs(self.samples[i][-1] - self.samples[i][0])
-                if abs(gam[i].imag) * span < (KNOWN_SPAN if getattr(p, 'known_gamma', False) else FIT_SPAN):
+                span = abs(gam[i].imag) * abs(s[-1] - s[0])
+                if span < (KNOWN_SPAN if p.known_gamma else FIT_SPAN):
                     self.low_span.append(p.name)
-                    self.log.note(f"WARNING {f / 1e9:.2f} GHz port {p.name}: feed samples span only "
-                                  f"{abs(gam[i].imag) * span:.2f} rad - wave separation unreliable "
-                                  f"(lengthen the straight feed or use a via/gap port)")
+                    self.log.note(f"WARNING {f / 1e9:.2f} GHz port {p.name}: feed samples span only {span:.2f} rad - "
+                                  f"wave separation unreliable (lengthen the straight feed or use a via/gap port)")
+            else:
+                Vp, Ip = np.eye(n)[i], self.port_current(I, i)          # port voltage = applied EMF
+                Ap[i], Bp[i] = (Vp + p.zc * Ip) / (2 * np.sqrt(p.zc)), (Vp - p.zc * Ip) / (2 * np.sqrt(p.zc))
+        S = Bp @ np.linalg.inv(Ap)
         for i in np.nonzero(resid > 1e-2)[0]:
             self.log.note(f"WARNING {f / 1e9:.2f} GHz port {self.ports[i].name}: wave-fit residual "
                           f"{resid[i]:.1e} - sample cuts too close to a discontinuity (use s1) "
@@ -920,10 +795,16 @@ class Simulation:
         return out
 
     def current_density(self, I):
-        r = self.rwg
-        I = I[:self.Ne]
+        r, I = self.rwg, I[:self.Ne]
         a = r.Aal @ I
         return r.cent[:, 0] * a - r.Bx @ I, r.cent[:, 1] * a - r.By @ I
+
+
+def _line_fit(sim, IR, IL, step):
+    """gamma and Zc of a centre-fed line from the currents (n x 1) on its two halves' sample cuts (ports 0, 1)."""
+    g = fit_gamma(np.hstack([IR, IL]), step)
+    (A, B), (C, D) = fit_waves(IR, sim.samples[0], g), fit_waves(IL, sim.samples[1], g)
+    return g, 1.0 / ((A[0] - B[0]) - (C[0] - D[0]))
 
 
 def line_char_xs(stack, layer, w, freqs, planes=None, coplanar=None, via_pitch=1e-3, via_r=0.15e-3,
@@ -935,9 +816,7 @@ def line_char_xs(stack, layer, w, freqs, planes=None, coplanar=None, via_pitch=1
     a via row every via_pitch near their inner edge. Centre-fed long line, travelling-wave fit.
     """
     L2, margin = length / 2, 2e-3
-    shapes = {layer: [(-L2, -w / 2, L2, w / 2)]}
-    for k, W in (planes or {}).items():
-        shapes[k] = [(-L2, -W / 2, L2, W / 2)]
+    shapes = {layer: [(-L2, -w / 2, L2, w / 2)], **{k: [(-L2, -W / 2, L2, W / 2)] for k, W in (planes or {}).items()}}
     vias = []
     for y0, y1 in (coplanar or []):
         shapes[layer].append((-L2, y0, L2, y1))
@@ -946,20 +825,15 @@ def line_char_xs(stack, layer, w, freqs, planes=None, coplanar=None, via_pitch=1
         vias += [Via(x, yv, 0, layer, radius=via_r, name='fence')
                  for x in np.arange(-L2 + via_pitch / 2, L2, via_pitch)]
     step = max(dmax, (L2 - margin - 1e-3) / 8)          # well-conditioned fit at low frequency
-    pR = LinePort(layer, (0, 0), (1, 0), w, L2 - margin, s0=1e-3, step=step, name='R')
-    pL = LinePort(layer, (0, 0), (-1, 0), w, L2 - margin, s0=1e-3, step=step, name='L')
-    wr = {k: (w if k == layer else min(W, 2e-3)) for k, W in [(layer, w)] + list((planes or {}).items())}
-    sim = Simulation(stack, shapes, [pR, pL], vias=vias, dmax=dmax, w_ref=wr, ncross=ncross, verbose=verbose,
+    ports = [LinePort(layer, (0, 0), (d, 0), w, L2 - margin, s0=1e-3, step=step, name=n) for d, n in ((1, 'R'), (-1, 'L'))]
+    wr = {layer: w, **{k: min(W, 2e-3) for k, W in (planes or {}).items() if k != layer}}
+    sim = Simulation(stack, shapes, ports, vias=vias, dmax=dmax, w_ref=wr, ncross=ncross, verbose=verbose,
                      refine=0, solver='auto')
-    gam, zc = [], []
+    out = []
     for f in freqs:
         I = sim.currents(f, sim.excitation()[:, [0]])
-        IR, IL = sim.cut_current(I, 0), sim.cut_current(I, 1)
-        g = fit_gamma(np.hstack([IR, IL]), step)
-        A, B = fit_waves(IR, sim.samples[0], g)
-        Cp, Dp = fit_waves(IL, sim.samples[1], g)
-        gam.append(g); zc.append(1.0 / ((A[0] - B[0]) - (Cp[0] - Dp[0])))
-    return np.array(gam), np.array(zc)
+        out.append(_line_fit(sim, sim.cut_current(I, 0), sim.cut_current(I, 1), step))
+    return tuple(np.array(out).T)                                   # gamma, Zc
 
 
 def line_char_pair(stack, layer, w, gap, freqs, planes=None, length=16e-3, dmax=0.4e-3, ncross=4, verbose=False):
@@ -970,27 +844,21 @@ def line_char_pair(stack, layer, w, gap, freqs, planes=None, length=16e-3, dmax=
     """
     L2, margin = length / 2, 2e-3
     yc = (w + gap) / 2
-    shapes = {layer: [(-L2, yc - w / 2, L2, yc + w / 2), (-L2, -yc - w / 2, L2, -yc + w / 2)]}
-    for k, W in (planes or {}).items():
-        shapes[k] = [(-L2, -W / 2, L2, W / 2)]
+    shapes = {layer: [(-L2, yc - w / 2, L2, yc + w / 2), (-L2, -yc - w / 2, L2, -yc + w / 2)],
+              **{k: [(-L2, -W / 2, L2, W / 2)] for k, W in (planes or {}).items()}}
     step = max(dmax, (L2 - margin - 1e-3) / 8)
     ps = [LinePort(layer, (0, s * yc), (d, 0), w, L2 - margin, s0=1e-3, step=step, name=f"{s}{d}")
           for s in (1, -1) for d in (1, -1)]                       # (+,R) (+,L) (-,R) (-,L)
     wr = {layer: w, **{k: min(W, 2e-3) for k, W in (planes or {}).items()}}
     sim = Simulation(stack, shapes, ps, dmax=dmax, w_ref=wr, ncross=ncross, verbose=verbose, refine=0,
                      solver='auto')
-    out = {'e': ([], []), 'o': ([], [])}
+    out = []
     for f in freqs:
         E = sim.excitation()
-        V = np.stack([E[:, 0] + E[:, 2], E[:, 0] - E[:, 2]], 1)       # even / odd drive at x = 0
-        I = sim.currents(f, V)
-        for c, m in ((0, 'e'), (1, 'o')):
-            IR, IL = sim.cut_current(I, 0)[:, c], sim.cut_current(I, 1)[:, c]     # line + only
-            g = fit_gamma(np.stack([IR, IL], 1), step)
-            A, B = fit_waves(IR[:, None], sim.samples[0], g)
-            Cp, Dp = fit_waves(IL[:, None], sim.samples[1], g)
-            out[m][0].append(g); out[m][1].append(1.0 / ((A[0] - B[0]) - (Cp[0] - Dp[0])))
-    return (np.array(out['e'][0]), np.array(out['e'][1]), np.array(out['o'][0]), np.array(out['o'][1]))
+        I = sim.currents(f, np.stack([E[:, 0] + E[:, 2], E[:, 0] - E[:, 2]], 1))      # even / odd drive at x = 0
+        IR, IL = sim.cut_current(I, 0), sim.cut_current(I, 1)                          # line + only
+        out.append([*_line_fit(sim, IR[:, [0]], IL[:, [0]], step), *_line_fit(sim, IR[:, [1]], IL[:, [1]], step)])
+    return tuple(np.array(out).T)                                   # gamma_e, Z_even, gamma_o, Z_odd
 
 
 def coupled_stripline_cohn(w, s, b, er):

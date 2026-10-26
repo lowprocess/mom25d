@@ -1,7 +1,7 @@
 """
 mom25d.base - the pieces of the 2.5D planar Method-of-Moments solver its layers share: RWG basis functions on
 triangles, the frequency-independent 1/R moment integrals (the inner integral analytic, Wilton et al.), the
-quadrature rules, the delta-gap port and the travelling-wave fits on a port's feed line.
+quadrature rules and the travelling-wave fits on a port's feed line.
 
 Time convention exp(+j w t).
 """
@@ -27,57 +27,39 @@ class RWG:
             for i, (u, v) in enumerate(((a, b), (b, c), (c, a))):
                 d.setdefault((min(u, v), max(u, v)), []).append((t, i))
         E = [(k, v) for k, v in d.items() if len(v) == 2]
-        Ne = len(E)
-        self.Ne = Ne
-        tp = np.zeros(Ne, int); tm = np.zeros(Ne, int)
-        vp = np.zeros((Ne, 2)); vm = np.zeros((Ne, 2))
-        l = np.zeros(Ne); mid = np.zeros((Ne, 2)); nrm = np.zeros((Ne, 2)); ends = np.zeros((Ne, 2, 2))
-        for e, ((u, v), ((t1, i1), (t2, i2))) in enumerate(E):
-            tp[e], tm[e] = t1, t2
-            vp[e] = nodes[tris[t1][(i1 + 2) % 3]]
-            vm[e] = nodes[tris[t2][(i2 + 2) % 3]]
-            pu, pv = nodes[u], nodes[v]
-            l[e] = np.linalg.norm(pv - pu)
-            mid[e] = 0.5 * (pu + pv)
-            ends[e] = (pu, pv)
-            tau = (pv - pu) / l[e]
-            n = np.array([tau[1], -tau[0]])
-            if n @ (self.cent[t2] - self.cent[t1]) < 0:
-                n = -n
-            nrm[e] = n                       # direction of positive current (T+ -> T-)
-        self.tp, self.tm, self.l, self.mid, self.nrm, self.ends = tp, tm, l, mid, nrm, ends
-        ap = l / (2 * self.area[tp])
-        am = -l / (2 * self.area[tm])
-        rows = np.concatenate([tp, tm]); cols = np.concatenate([np.arange(Ne)] * 2)
-        Nt = len(tris)
-
-        def sp(vals):
-            return sparse.csr_matrix((vals, (rows, cols)), shape=(Nt, Ne))
-        alpha = np.concatenate([ap, am])
-        vv = np.vstack([vp, vm])
+        self.Ne = Ne = len(E)
+        u, v = np.array([k for k, _ in E], int).reshape(-1, 2).T                       # the edge's end nodes
+        (t1, i1), (t2, i2) = np.array([s for _, s in E], int).reshape(-1, 2, 2).transpose(1, 2, 0)   # T+, T-
+        self.tp, self.tm = t1, t2
+        self.vp, self.vm = nodes[tris[t1, (i1 + 2) % 3]], nodes[tris[t2, (i2 + 2) % 3]]   # the free vertices
+        pu, pv = nodes[u], nodes[v]
+        self.l = np.linalg.norm(pv - pu, axis=1)
+        self.mid, self.ends = 0.5 * (pu + pv), np.stack([pu, pv], 1)
+        tau = (pv - pu) / self.l[:, None]
+        n = np.c_[tau[:, 1], -tau[:, 0]]
+        n[((self.cent[t2] - self.cent[t1]) * n).sum(1) < 0] *= -1
+        self.nrm = n                         # direction of positive current (T+ -> T-)
+        alpha = np.concatenate([self.l / (2 * self.area[t1]), -self.l / (2 * self.area[t2])])
+        vv = np.vstack([self.vp, self.vm])
+        sp = lambda vals: sparse.csr_matrix((vals, (np.r_[t1, t2], np.r_[np.arange(Ne), np.arange(Ne)])),
+                                            shape=(len(tris), Ne))
         self.Aal, self.Bx, self.By = sp(alpha), sp(alpha * vv[:, 0]), sp(alpha * vv[:, 1])
         self.D = sp(2 * alpha)               # divergence: +l/A on T+, -l/A on T-
 
 
 def qform(S1, M, S2):
     """S1^T M S2 for sparse S1,S2 (Nt x Ne) and dense M (Nt x Nt)."""
-    X = S1.T @ M
-    return (S2.T @ X.T).T
+    return (S2.T @ (S1.T @ M).T).T
 
 
 def combine(rwg, Mrr, Mrx, Mry, M0):
     """Assemble the Ne x Ne matrix of  int int f_m . f_n K  from triangle-pair moments."""
     A, Bx, By = rwg.Aal, rwg.Bx, rwg.By
-    Z = qform(A, Mrr, A)
-    Z = Z - qform(A, Mrx, Bx) - qform(A, Mry, By)
-    Z = Z - qform(Bx, Mrx.T, A) - qform(By, Mry.T, A)
-    Z = Z + qform(Bx, M0, Bx) + qform(By, M0, By)
-    return Z
+    return (qform(A, Mrr, A) - qform(A, Mrx, Bx) - qform(A, Mry, By) - qform(Bx, Mrx.T, A) - qform(By, Mry.T, A)
+            + qform(Bx, M0, Bx) + qform(By, M0, By))
 
 
-# =============================================================================
-# 2. Integrals
-# =============================================================================
+# ---- Integrals --------------------------------------------------------------
 # 6-point degree-4 rule (weights sum to 1) for the analytic-inner / numerical-outer integrals
 _a1, _a2 = 0.445948490915965, 0.091576213509771
 _BAR6 = np.array([[1 - 2 * _a1, _a1, _a1], [_a1, 1 - 2 * _a1, _a1], [_a1, _a1, 1 - 2 * _a1],
@@ -88,8 +70,41 @@ _BAR3 = np.array([[2 / 3, 1 / 6, 1 / 6], [1 / 6, 2 / 3, 1 / 6], [1 / 6, 1 / 6, 2
 _W3 = np.ones(3) / 3
 
 
+def graded(u, grade):
+    """u in 0..1 graded toward both ends (cosine) by `grade` (0: uniform): the cells across a strip."""
+    return (1 - grade) * u + grade * (1 - np.cos(np.pi * u)) / 2
+
+
 def quad_pts(rwg, bar):
     return np.einsum('qk,tkc->tqc', bar, rwg.nodes[rwg.tris])
+
+
+def moments7(GA, GQ, ra, rb):
+    """The seven moments of the kernels between points ra (observation) and rb (source), (..., 2) each:
+    G_A x [1, x_a, y_a, x_b, y_b, r_a . r_b] and G_q (combine's triangle-pair moments, unsummed)."""
+    return [GA, GA * ra[..., 0], GA * ra[..., 1], GA * rb[..., 0], GA * rb[..., 1], GA * (ra * rb).sum(-1), GQ]
+
+
+def quad_moments(P, W, p, q, gt, chunk=20000):
+    """(7, len(p)) moments7 of the smooth kernels (gt.AQ) between triangles p and q by quadrature (points P,
+    weights W per triangle)."""
+    out = np.empty((7, len(p)), complex)
+    for c0 in range(0, len(p), chunk):
+        s = slice(c0, c0 + chunk)
+        pa, pb = P[p[s]][:, :, None, :], P[q[s]][:, None, :, :]
+        Wt = W[p[s]][:, :, None] * W[q[s]][:, None, :]
+        ga, gq = gt.AQ(np.sqrt(((pa - pb) ** 2).sum(-1)))
+        out[:, s] = [m.sum((1, 2)) for m in moments7(ga * Wt, gq * Wt, pa, pb)]
+    return out
+
+
+def edge_frames(V):
+    """Per triangle (vertices V, (Nt, 3, 2), counter-clockwise) and edge: vector, length, unit tangent, outward
+    normal."""
+    e = np.roll(V, -1, axis=1) - V
+    L = np.linalg.norm(e, axis=2)
+    tau = e / L[..., None]
+    return e, L, tau, np.stack([tau[..., 1], -tau[..., 0]], -1)
 
 
 def singular_moments(rwg, nb=16):
@@ -101,10 +116,7 @@ def singular_moments(rwg, nb=16):
     nodes, tris, Ar = rwg.nodes, rwg.tris, rwg.area
     Nt = len(tris)
     V = nodes[tris]
-    e = np.roll(V, -1, axis=1) - V
-    L = np.linalg.norm(e, axis=2)
-    tau = e / L[..., None]
-    un = np.stack([tau[..., 1], -tau[..., 0]], -1)          # outward in-plane normal (CCW)
+    _, L, tau, un = edge_frames(V)
     P = quad_pts(rwg, _BAR6)
     M0 = np.zeros((Nt, Nt)); Mr = np.zeros((Nt, Nt, 2)); Mrr = np.zeros((Nt, Nt))
     for p0 in range(0, Nt, nb):
@@ -133,47 +145,15 @@ def singular_moments(rwg, nb=16):
 
 def gram_matrix(rwg):
     """int f_m . f_n dS  (for a surface-impedance term Zs * Gram)."""
-    Ar = rwg.area
-    P = quad_pts(rwg, _BAR3)
-    Mrr = np.diag(Ar * (_W3[None, :] * (P ** 2).sum(-1)).sum(1))
-    Mrx = np.diag(Ar * (_W3[None, :] * P[..., 0]).sum(1))
-    Mry = np.diag(Ar * (_W3[None, :] * P[..., 1]).sum(1))
-    return combine(rwg, Mrr, Mrx, Mry, np.diag(Ar))
+    Ar, P = rwg.area, quad_pts(rwg, _BAR3)
+    m = lambda v: np.diag(Ar * (_W3[None, :] * v).sum(1))
+    return combine(rwg, m((P ** 2).sum(-1)), m(P[..., 0]), m(P[..., 1]), np.diag(Ar))
 
 
-# =============================================================================
-# 3. Ports and the wave fits
-# =============================================================================
-class Port:
-    """
-    Delta-gap port on a transverse mesh line with a straight feed line running toward the device.
-      axis='x' : gap line is x = pos, feed runs along x, transverse extent span=(ymin, ymax)
-      axis='y' : gap line is y = pos, feed runs along y, span=(xmin, xmax)
-      direction: +1 / -1 = sense (along the axis) pointing INTO the device
-      ref_dist : distance from the gap to the reference plane (positive, along the feed)
-      s0       : closest sample distance from the gap (skip the gap's near field)
-      zc       : reference impedance of the feed line
-      step     : spacing of the current-sample cuts (a multiple of the mesh size; default = mesh size).
-                 Needs beta*step of order 0.1-0.5 rad for a well-conditioned wave fit.
-    """
-    def __init__(self, axis, pos, span, direction, ref_dist, s0=None, zc=50.0, name='', step=None):
-        self.step = step
-        self.axis, self.pos, self.span = axis, pos, span
-        self.dir, self.ref, self.s0, self.zc, self.name = direction, ref_dist, s0, zc, name
-
-    @property
-    def dvec(self):
-        return np.array([self.dir, 0.0]) if self.axis == 'x' else np.array([0.0, self.dir])
-
-
+# ---- The wave fits on a port's feed line ------------------------------------
 def fit_gamma(Ik, step):
     """Propagation constant from uniformly spaced samples of a 2-exponential current."""
-    num = den = 0.0
-    for col in range(Ik.shape[1]):
-        v = Ik[:, col]
-        num += np.sum((v[:-2] + v[2:]) * np.conj(v[1:-1]))
-        den += 2 * np.sum(np.abs(v[1:-1]) ** 2)
-    c = num / den
+    c = np.sum((Ik[:-2] + Ik[2:]) * np.conj(Ik[1:-1])) / (2 * np.sum(np.abs(Ik[1:-1]) ** 2))
     g = np.arccosh(c + 0j) / step
     return abs(g.real) + 1j * abs(g.imag)
 

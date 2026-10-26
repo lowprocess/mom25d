@@ -15,10 +15,8 @@ SMALL = 1e-4          # entries below this fraction of the largest are fitted ap
 def aaa(z, F, tol=1e-10, mmax=80):
     """Set-valued AAA (Nakatsukasa, Sete, Trefethen 2018; Lietaert et al. 2022).
     z: (n,) sample points, F: (n, m) values.  Returns r(zz) -> (len(zz), m)."""
-    z = np.asarray(z, complex)
-    F = np.asarray(F, complex)
-    if F.ndim == 1:
-        F = F[:, None]
+    z, F = np.asarray(z, complex), np.asarray(F, complex)
+    F = F[:, None] if F.ndim == 1 else F
     n, m = F.shape
     small = np.abs(F).max(0) < SMALL * np.abs(F).max()
     if small.any() and not small.all():
@@ -34,12 +32,8 @@ def aaa(z, F, tol=1e-10, mmax=80):
             return out
         r.support, r.weights = big_r.support, big_r.weights
         return r
-    scale = np.maximum(np.abs(F).max(0), 1e-300)
-    Fs = F / scale
-    J = np.ones(n, bool)
-    sup = []
-    R = np.tile(Fs.mean(0), (n, 1))
-    w = None
+    Fs = F / np.maximum(np.abs(F).max(0), 1e-300)
+    J, sup, R, w = np.ones(n, bool), [], np.tile(Fs.mean(0), (n, 1)), None
     for _ in range(min(mmax, n)):
         err = np.abs(Fs - R).max(1)
         err[~J] = -1
@@ -55,25 +49,22 @@ def aaa(z, F, tol=1e-10, mmax=80):
             A = np.vstack([A, np.zeros((A.shape[1] - A.shape[0], A.shape[1]))])
         _, _, Vh = np.linalg.svd(A, full_matrices=False)
         w = Vh[-1].conj()
-        D = C @ w
         R = Fs.copy()
-        R[J] = (C @ (w[:, None] * Fsup)) / D[:, None]
+        R[J] = (C @ (w[:, None] * Fsup)) / (C @ w)[:, None]
         if not J.any():
             break
     zs, Fsup = z[sup], F[sup]
 
     def r(zz):
         zz = np.atleast_1d(np.asarray(zz, complex))
-        out = np.empty((len(zz), m), complex)
         with np.errstate(divide='ignore', invalid='ignore'):
             Cz = 1.0 / (zz[:, None] - zs[None, :])
-            out[:] = (Cz @ (w[:, None] * Fsup)) / (Cz @ w)[:, None]
+            out = (Cz @ (w[:, None] * Fsup)) / (Cz @ w)[:, None]
         hit = np.isinf(Cz).any(1) | np.isnan(out).any(1)
         for i in np.nonzero(hit)[0]:
             out[i] = Fsup[np.argmin(np.abs(zs - zz[i]))]
         return out
-    r.support = zs
-    r.weights = w
+    r.support, r.weights = zs, w
     return r
 
 
@@ -87,25 +78,25 @@ def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001,
     grid and the model predicted the newest sample to `tol` before it was solved. (The model change alone can
     be zero while the model is still wrong: a sparse fit that the new sample does not alter.)
     """
-    fs = list(np.linspace(fmin, fmax, n0))
-
     def checked(f):
-        S = solve_raw(f)
+        S = solve(f)
         if not np.isfinite(S).all():                            # the fit would fail on it with an SVD error
             raise FloatingPointError(f"the EM solve at {f / 1e9:.4g} GHz gave non-finite S-parameters (on the GPU: "
                                      f"MOM25D_GPU=off solves on the CPU)")
         return S
 
-    solve_raw, solve = solve, checked
-    Ss = [solve(f) for f in fs]
-    P = Ss[0].shape[0]
-    grid = np.linspace(fmin, fmax, ngrid)
-    sc = 1e9
+    def widest_gap():                                       # the middle of the widest gap between samples
+        fsort = np.sort(fs)
+        i = int(np.argmax(np.diff(fsort)))
+        return fsort[i] + (fsort[i + 1] - fsort[i]) / 2
+
+    fs = list(np.linspace(fmin, fmax, n0))
+    Ss = [checked(f) for f in fs]
+    P, grid, sc = Ss[0].shape[0], np.linspace(fmin, fmax, ngrid), 1e9
     prev, hist, ok, pred_err = None, [], 0, np.inf
     while True:
         o = np.argsort(fs)
-        fz = np.array(fs)[o] / sc
-        Fz = np.array([Ss[i].ravel() for i in o])
+        fz, Fz = np.array(fs)[o] / sc, np.array([Ss[i].ravel() for i in o])
         model = aaa(fz, Fz)
         Mg = model(grid / sc)
         if prev is not None:
@@ -122,18 +113,14 @@ def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001,
                 break
             fnew = grid[k]
         else:
-            gaps = np.diff(np.sort(fs))
-            i = int(np.argmax(gaps))
-            fnew = np.sort(fs)[i] + gaps[i] / 2
-        # keep new samples away from existing ones
-        if min(abs(np.array(fs) - fnew)) < (fmax - fmin) / (4 * ngrid):
-            gaps = np.diff(np.sort(fs)); i = int(np.argmax(gaps)); fnew = np.sort(fs)[i] + gaps[i] / 2
+            fnew = widest_gap()
+        if min(abs(np.array(fs) - fnew)) < (fmax - fmin) / (4 * ngrid):     # keep new samples away from existing ones
+            fnew = widest_gap()
         prev = Mg
         if hist:
             hist[-1]['f_new'] = float(fnew)
-        Snew = solve(fnew)
+        Snew = checked(fnew)
         pred_err = float(np.abs(model(np.array([fnew / sc]))[0] - Snew.ravel()).max())
         fs.append(fnew); Ss.append(Snew)
-    Sg = Mg.reshape(ngrid, P, P)
     o = np.argsort(fs)
-    return grid, Sg, np.array(fs)[o], np.array(Ss)[o], hist
+    return grid, Mg.reshape(ngrid, P, P), np.array(fs)[o], np.array(Ss)[o], hist

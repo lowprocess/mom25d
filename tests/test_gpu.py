@@ -109,7 +109,7 @@ def test_gpu_backends_match_cpu(clean, S_cpu, backend):
     sim = make_sim(backend)
     S = sim.sparams(4e9)
     assert any(r[0] == 'LU factor (GPU)' for r in sim.log.records), "GPU path not taken"
-    assert np.abs(S - S_cpu).max() < 1e-7
+    assert np.abs(S - S_cpu).max() < 1e-6     # both refined to rtol 1e-6: they agree to round-off of that order
     if backend == 'cupy':
         assert calls['inplace'], "CuPy LU must factor the uploaded matrix in place"
 

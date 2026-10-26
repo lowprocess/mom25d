@@ -61,48 +61,38 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     compiled core where built; NumPy's dense solver for small boards), 'compiled' (the core for every size) or
     'python' (NumPy only), fast.use_core."""
     from . import fast
+    from .board import BoardModel
+    from .geo import LinePort
+    from .run import solve_band
     name = os.path.basename(board) if isinstance(board, str) else 'board'
     if isinstance(board, str):
         with open(board) as fh:
             board = json.load(fh)
     freq = np.asarray(freq, float)
     fmin, fmax = float(freq[0]), float(freq[-1])
-    t0 = time.time()
-    prev = fast.use_core(core)
+    t0, prev = time.time(), fast.use_core(core)
     try:
-        return _solve_board(board, freq, name, fmin, fmax, t0, dmax, plane_factor, port, pairs, mesher, metal,
-                            ground, max_solves, afs_tol, log, progress, tiled, on_step, core, quads, zone,
-                            signal_vias, stitching_vias, lines)
+        model = BoardModel(board, ground=ground, port=port, pairs=pairs, log=log)
+        planes = {k: plane_factor * dmax for k, gs in model.shapes.items()
+                  if sum(g.area for g in gs) > 0.5 * model.outline_area}
+        sim = model.simulation(dmax=dmax, dmax_layer=planes, fmin=fmin, fmax=fmax, solver='auto', verbose=False,
+                               wave_down_to=fmin, mesher=mesher, title=name, metal=metal, tiled=tiled, core=core,
+                               quads=quads, signal_vias=signal_vias, stitching_vias=stitching_vias,
+                               **(dict(line_basis=lines, line_step=LINE_STEP) if lines and lines != 'off' else {}),
+                               **(dict(zone=zone, dmax_out=ZONE_OUT * dmax) if zone else {}))
+        f, S, info = solve_band(sim, fmin, fmax, points=len(freq), zref=model.port_z0, max_solves=max_solves,
+                                afs_tol=afs_tol, log=log, progress=progress, on_step=on_step)
+        core_used = fast._core is not None
     finally:
         fast.set_core(prev)
-
-
-def _solve_board(board, freq, name, fmin, fmax, t0, dmax, plane_factor, port, pairs, mesher, metal, ground,
-                 max_solves, afs_tol, log, progress, tiled, on_step, core, quads=False, zone=None,
-                 signal_vias='round', stitching_vias='auto', lines=None):
-    from .board import BoardModel
-    from .fast import _core
-    from .geo import LinePort
-    from .run import solve_band
-    model = BoardModel(board, ground=ground, port=port, pairs=pairs, log=log)
-    planes = {k: plane_factor * dmax for k, gs in model.shapes.items()
-              if sum(g.area for g in gs) > 0.5 * model.outline_area}
-    sim = model.simulation(dmax=dmax, dmax_layer=planes, fmin=fmin, fmax=fmax, solver='auto', verbose=False,
-                           wave_down_to=fmin, mesher=mesher, title=name, metal=metal, tiled=tiled, core=core,
-                           quads=quads, signal_vias=signal_vias, stitching_vias=stitching_vias,
-                           **(dict(line_basis=lines, line_step=LINE_STEP) if lines and lines != 'off' else {}),
-                           **(dict(zone=zone, dmax_out=ZONE_OUT * dmax) if zone else {}))
-    f, S, info = solve_band(sim, fmin, fmax, points=len(freq), zref=model.port_z0, max_solves=max_solves,
-                            afs_tol=afs_tol, log=log, progress=progress, on_step=on_step)
     if len(f) != len(freq) or not np.allclose(f, freq):              # the sweep's grid onto the requested one
-        S = np.stack([np.stack([np.interp(freq, f, S[:, i, j].real) + 1j * np.interp(freq, f, S[:, i, j].imag)
-                                for j in range(S.shape[2])], -1) for i in range(S.shape[1])], 1)
-    ports = [dict(name=p.name, kind='wave' if isinstance(p, LinePort) else 'lumped',
-                  zc=float(getattr(p, 'zc', 0) or 0)) for p in sim.ports]
-    return Result(f=freq, S=S, names=list(info['names']), zref=list(info['zref']), ports=ports,
+        S = np.apply_along_axis(lambda s: np.interp(freq, f, s.real) + 1j * np.interp(freq, f, s.imag), 0, S)
+    return Result(f=freq, S=S, names=list(info['names']), zref=list(info['zref']),
+                  ports=[dict(name=p.name, kind='wave' if isinstance(p, LinePort) else 'lumped',
+                              zc=float(getattr(p, 'zc', 0) or 0)) for p in sim.ports],
                   unknowns=int(sim.qT.shape[1]) if getattr(sim, 'qT', None) is not None else int(sim.Ne + sim.Nv),
                   triangles=int(len(sim.rwg.tris)), solver=sim.solver,
                   precision=getattr(sim, 'precision', 'double'), mesher=mesher, solves=int(info['solves']),
-                  solved=list(info['solved']), seconds=time.time() - t0, core=_core is not None,
+                  solved=list(info['solved']), seconds=time.time() - t0, core=core_used,
                   notes=list(model.notes) + list(sim.log.notes), model=model, sim=sim,
                   afs=list(info.get('afs', [])), afs_tol=info.get('afs_tol'))

@@ -26,23 +26,20 @@ For numerics the point end charges are taken out spectrally:
 and the end charges are put back as fan-distributed charges through the ordinary G_q machinery.
 """
 import numpy as np
-from scipy.special import jv, kv
+from scipy.special import j0, jv, kv
 from scipy.interpolate import CubicSpline
 
 from .base import MU0, C0
 
 
-# =============================================================================
-# Sommerfeld contour (shared with the horizontal kernels)
-# =============================================================================
-def sommerfeld_contour(f, stack, rho_max, K=None, nq=8, hmin=None):
-    w = 2 * np.pi * f
-    k0 = w / C0
+# ---- Sommerfeld contour (shared with the horizontal kernels) ----------------
+def sommerfeld_contour(f, stack, rho_max, K=None, nq=8):
+    """(kr, dkr, K): the nodes and weights of the integration contour, lifted into the upper half plane up to
+    1.5 x the largest wavenumber, to K."""
+    k0 = 2 * np.pi * f / C0
     kmax = k0 * np.sqrt(stack.max_er())
-    hmin = hmin or stack.hmin
-    K = K or (max(1e5, 30.0 / hmin) + 40 * kmax)
-    t1 = 1.5 * kmax
-    alpha = min(0.5 * k0, 4.0 / rho_max)
+    K = K or (max(1e5, 30.0 / stack.hmin) + 40 * kmax)
+    t1, alpha = 1.5 * kmax, min(0.5 * k0, 4.0 / rho_max)
     wid1, wid2 = min(0.3 * k0, 0.8 * alpha), 2 * np.pi / rho_max
     b1 = np.linspace(0, t1, int(np.ceil(t1 / wid1)) + 1)
     b2 = np.append(np.arange(t1, K, wid2), K)
@@ -58,7 +55,6 @@ def sommerfeld_contour(f, stack, rho_max, K=None, nq=8, hmin=None):
 
 def j0_matrix(rho, kr):
     """J0(rho x kr): complex Bessel only on the lifted part of the contour, fast real J0 elsewhere."""
-    from scipy.special import j0
     rho = np.atleast_1d(rho)
     real = np.abs(kr.imag) < 1e-300
     J = np.empty((len(rho), len(kr)), complex)
@@ -90,7 +86,8 @@ def hankel(spec, kr, dk, rho):
 
 
 class Table1D:
-    """Spline-resampled radial kernel on a uniform grid with direct-index linear interpolation."""
+    """Spline-resampled radial kernel(s) (vals: (n,) or (n, m) on rho_coarse) on a uniform grid, with direct-index
+    linear interpolation (no search)."""
     def __init__(self, rho_coarse, vals, rho_max, nfine=8192):
         self.rho = np.linspace(0, rho_max, nfine)
         self.v = CubicSpline(rho_coarse, vals)(self.rho)
@@ -99,32 +96,25 @@ class Table1D:
     def __call__(self, r):
         u = np.minimum(np.asarray(r) / self._dr, len(self.rho) - 1.000001)
         i = u.astype(np.int64)
-        t = u - i
+        t = (u - i).reshape(u.shape + (1,) * (self.v.ndim - 1))      # broadcast over the kernels
         return self.v[i] * (1 - t) + self.v[i + 1] * t
 
 
-# =============================================================================
-# TM network voltages for all source interfaces
-# =============================================================================
+# ---- TM network voltages for all source interfaces --------------------------
 class TMNetwork:
     """V[s][i](kr): TM voltage at interface i (0..N) for a unit shunt current source at interface s."""
     def __init__(self, stack, kr, w):
-        self.st, self.kr, self.w = stack, kr, w
-        N = stack.N
-        k0 = w / C0
+        self.st, self.kr, self.w, N = stack, kr, w, stack.N
         Y0, tn, sc, Yd, Yu = stack._network(kr, w, 'e')
-        self.kz2 = [None] + [k0 ** 2 * stack.eps(j) - kr ** 2 for j in range(1, N + 1)]
-        self.k2 = [None] + [k0 ** 2 * stack.eps(j) for j in range(1, N + 1)]
+        self.k2 = [None] + [(w / C0) ** 2 * stack.eps(j) for j in range(1, N + 1)]
+        self.kz2 = [None] + [k2 - kr ** 2 for k2 in self.k2[1:]]
         self.V = {}
-        srcs = range(1, N + 1) if stack.top == 'open' else range(1, N)
-        for s in srcs:
+        for s in range(1, N + 1) if stack.top == 'open' else range(1, N):
             v = [None] * (N + 1)
             v[s] = 1.0 / (Yu[s] + Yd[s])
             for k in range(s + 1, N + 1):
-                if stack.top == 'pec' and k == N:
-                    v[k] = np.zeros_like(kr)
-                else:
-                    v[k] = v[k - 1] * sc[k] / (1 + 1j * (Yu[k] / Y0[k]) * tn[k])
+                v[k] = np.zeros_like(kr) if stack.top == 'pec' and k == N else \
+                    v[k - 1] * sc[k] / (1 + 1j * (Yu[k] / Y0[k]) * tn[k])
             for k in range(s, 0, -1):
                 v[k - 1] = np.zeros_like(kr) if k - 1 == 0 else v[k] * sc[k] / (1 + 1j * (Yd[k - 1] / Y0[k]) * tn[k])
             self.V[s] = v
@@ -134,16 +124,11 @@ class TMNetwork:
 
     def dV(self, i, s):
         """V(z_i|z_s) - V(z_{i-1}|z_s); zero for a PEC source interface."""
-        if self.is_pec(s):
-            return 0.0
-        return self.V[s][i] - self.V[s][i - 1]
+        return 0.0 if self.is_pec(s) else self.V[s][i] - self.V[s][i - 1]
 
     def S(self, k, layers):
         """E_t potential on interface k from a unit upward current through `layers`."""
-        out = 0.0
-        for j in layers:
-            out = out + self.dV(j, k) / self.kz2[j]
-        return out
+        return sum((self.dV(j, k) / self.kz2[j] for j in layers), 0.0)
 
     def P(self, li, lj, with_homog=True):
         """Reaction between chains through layers li (obs) and lj (src)."""
@@ -162,6 +147,11 @@ def chain_ends(k_bot, k_top):
     return [(k_bot, +1.0), (k_top, -1.0)]
 
 
+def _layers(span):
+    """The dielectric layers a chain from interface span[0] to span[1] runs through."""
+    return range(span[0] + 1, span[1] + 1)
+
+
 class ViaKernels:
     """
     Per-frequency via kernels for a set of chain spans [(k_bot, k_top), ...] and metal interfaces.
@@ -170,16 +160,11 @@ class ViaKernels:
       homog(span_m, span_n, rho) : analytic K0 part
     """
     def __init__(self, f, stack, spans, interfaces, rho_max, nrho=200):
-        self.f, self.st = f, stack
         w = 2 * np.pi * f
-        self.w = w
-        kr, dk, K = sommerfeld_contour(f, stack, rho_max)
-        self.kr, self.dk = kr, dk
+        kr, dk, _ = sommerfeld_contour(f, stack, rho_max)
         net = TMNetwork(stack, kr, w)
-        self.net = net
-        _, _ = None, None
-        # G_q spectral between interfaces (both non-PEC), from the stack network
-        self._gq = {}
+        self.f, self.st, self.w, self.kr, self.dk, self.net = f, stack, w, kr, dk, net
+        self._gq = {}                     # G_q spectral between interfaces (both non-PEC), from the stack network
 
         def gq(a, b):
             if net.is_pec(a) or net.is_pec(b):
@@ -188,15 +173,12 @@ class ViaKernels:
             if key not in self._gq:
                 self._gq[key] = stack.spectral(kr, w, a, b)[1]
             return self._gq[key]
-        self.gq = gq
+        self.gq, self.rho_max, self.D = gq, rho_max, {}
         rho = rho_max * np.linspace(0, 1, nrho) ** 2
-        self.rho_max = rho_max
-        self.D = {}
         keys, specs = [], []
         for span in sorted(set(spans)):
-            layers = range(span[0] + 1, span[1] + 1)
             for k in interfaces:
-                spec = net.S(k, layers)
+                spec = net.S(k, _layers(span))
                 for ke, div in chain_ends(*span):
                     spec = spec - div * gq(k, ke) / (1j * w)
                 keys.append((k, span)); specs.append(spec * np.ones_like(kr))
@@ -206,15 +188,10 @@ class ViaKernels:
                 self.D[key] = Table1D(rho, v, rho_max)
 
     def R(self, sm, sn, rho):
-        lm, ln = range(sm[0] + 1, sm[1] + 1), range(sn[0] + 1, sn[1] + 1)
-        spec = self.net.P(lm, ln)
+        spec = self.net.P(_layers(sm), _layers(sn), with_homog=False)   # the homogeneous term: homog(), analytic
         for ka, da in chain_ends(*sm):
             for kb, db in chain_ends(*sn):
                 spec = spec - da * db * self.gq(ka, kb) / (1j * self.w)
-        # remove the homogeneous same-layer term (added back analytically by homog())
-        kr2 = self.kr ** 2
-        for j in set(lm) & set(ln):
-            spec = spec - 1j * self.w * MU0 * self.st.layers[j - 1].h / (kr2 - self.net.k2[j])
         return hankel(spec, self.kr, self.dk, rho)
 
     def R_table(self, sm, sn, nrho=200):
@@ -224,10 +201,8 @@ class ViaKernels:
         return Table1D(rho, self.R(sm, sn, rho), self.rho_max)
 
     def homog(self, sm, sn, rho):
-        lm, ln = range(sm[0] + 1, sm[1] + 1), range(sn[0] + 1, sn[1] + 1)
-        rho = np.atleast_1d(rho)
-        out = np.zeros(len(rho), complex)
-        for j in set(lm) & set(ln):
+        rho, out = np.atleast_1d(rho), np.zeros(np.size(rho), complex)
+        for j in set(_layers(sm)) & set(_layers(sn)):
             kj = np.sqrt(self.net.k2[j] + 0j)
             if kj.imag > 0:
                 kj = -kj

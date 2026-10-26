@@ -25,6 +25,8 @@ from shapely.geometry import Polygon
 from shapely.geometry.polygon import orient
 from scipy import sparse
 
+from .quads import excluded
+
 PROFILES = {                       # weight w(theta) with  p(y) dy = w(theta) dtheta,  y = a sin(theta)
     'maxwell': lambda th: np.full_like(th, 1 / np.pi),
     'uniform': lambda th: 0.5 * np.cos(th),
@@ -40,9 +42,8 @@ class Run:
         self.n = np.array([-self.t[1], self.t[0]])
 
     def polygon(self, pad=0.0):
-        P = [self.c0 + self.t * x + self.n * y for x, y in ((self.x0, -self.a - pad), (self.x1, -self.a - pad),
-                                                          (self.x1, self.a + pad), (self.x0, self.a + pad))]
-        return Polygon(P)
+        return Polygon([self.c0 + self.t * x + self.n * y for x, y in ((self.x0, -self.a - pad), (self.x1, -self.a - pad),
+                                                                     (self.x1, self.a + pad), (self.x0, self.a + pad))])
 
     def local(self, P):
         d = np.atleast_2d(P) - self.c0
@@ -70,12 +71,9 @@ def find_runs(geoms, h_of, signal=None, w_max=2.0e-3, min_len=3.0, margin=1.0, t
                         segs.append((a_, b_, d, np.array([-d[1], d[0]]), L))
             cand = []
             for i, (a1, b1, d1, n1, L1) in enumerate(segs):
-                for j in range(i + 1, len(segs)):
-                    a2, b2, d2, n2, L2 = segs[j]
-                    if d1 @ d2 > -0.9999:
-                        continue
-                    w = (a2 - a1) @ n1
-                    if not (tol < w <= w_max):
+                for a2, b2, d2, _, _ in segs[i + 1:]:
+                    w = (a2 - a1) @ n1                            # antiparallel, facing across the copper
+                    if d1 @ d2 > -0.9999 or not (tol < w <= w_max):
                         continue
                     s0, s1 = sorted(((b2 - a1) @ d1, (a2 - a1) @ d1))
                     lo, hi = max(0.0, s0), min(L1, s1)
@@ -85,17 +83,14 @@ def find_runs(geoms, h_of, signal=None, w_max=2.0e-3, min_len=3.0, margin=1.0, t
                     cand.append((hi - lo, k, a1 + n1 * w / 2, d1, w / 2, lo + margin * e, hi - margin * e))
             cand.sort(key=lambda c: -c[0])
             taken = []
-            for _, k_, c0, t, a, x0, x1 in cand:
+            for _, k_, c0, t, a, x0, x1 in cand:                  # the longest first, on the copper, not overlapping
                 r = Run(k_, c0, t, a, x0, x1)
                 poly = r.polygon()
-                if not p.buffer(tol).contains(poly.buffer(-tol)):
-                    continue
-                if signal is not None and not signal.buffer(tol).contains(poly.buffer(-tol)):
-                    continue
-                if any(poly.intersection(q).area > 1e-3 * poly.area for q in taken):
-                    continue
-                taken.append(poly)
-                runs.append(r)
+                if p.buffer(tol).contains(poly.buffer(-tol)) and \
+                        (signal is None or signal.buffer(tol).contains(poly.buffer(-tol))) and \
+                        not any(poly.intersection(q).area > 1e-3 * poly.area for q in taken):
+                    taken.append(poly)
+                    runs.append(r)
     return runs
 
 
@@ -133,17 +128,12 @@ def line_subspace(rwg, n_total, tri_layer, runs, h_of, profiles=('maxwell', 'odd
     len(profiles) functions per column (quads.project's layout: the kept unknowns first, then the line functions,
     which live on the eliminated edges only)."""
     Ne = rwg.Ne
-    bad_t = np.zeros(len(rwg.tris), bool)
-    bad_t[np.asarray(list(exclude_tris), int)] = True
-    bad_e = np.zeros(Ne, bool)
-    bad_e[np.asarray(list(exclude_edges), int)] = True
-    for e in np.nonzero(bad_e)[0]:                                 # port gaps, cuts, lumped edges stay unknowns
-        bad_t[[rwg.tp[e], rwg.tm[e]]] = True
+    bad_t, bad_e = excluded(rwg, exclude_tris, exclude_edges)     # port gaps, cuts, lumped edges stay unknowns
+    bad_t[np.r_[rwg.tp[bad_e], rwg.tm[bad_e]]] = True              # (and their triangles)
     owner = -np.ones(len(rwg.tris), int)
-    cent = rwg.cent
     for i, r in enumerate(runs):
         sel = (tri_layer == r.k) & (owner < 0) & ~bad_t
-        x, y = r.local(cent[sel])
+        x, y = r.local(rwg.cent[sel])
         inside = (x > r.x0) & (x < r.x1) & (np.abs(y) < r.a)
         owner[np.nonzero(sel)[0][inside]] = i
     o1, o2 = owner[rwg.tp], owner[rwg.tm]
@@ -152,9 +142,7 @@ def line_subspace(rwg, n_total, tri_layer, runs, h_of, profiles=('maxwell', 'odd
     erow = -np.ones(Ne, int)
     erow[elim] = np.arange(len(elim))
     keep = np.setdiff1d(np.arange(n_total), elim)
-    rows, cols, vals = [], [], []
-    ncol = len(keep)
-    nfun = 0
+    rows, cols, vals, ncol = [], [], [], len(keep)
     for i, r in enumerate(runs):
         es = elim[o1[elim] == i]
         if not len(es):
@@ -165,9 +153,7 @@ def line_subspace(rwg, n_total, tri_layer, runs, h_of, profiles=('maxwell', 'odd
         tn = rwg.nrm[es] @ r.t                                      # t . n of each edge (RWG direction)
         hstep = xs[1] - xs[0]
         for j in range(0, M + 1):                                   # the end tents carry the current to the ends
-            lo = xs[j - 1] if j > 0 else None
-            hi = xs[j + 1] if j < M else None
-            mid = xs[j]
+            lo, mid, hi = xs[j - 1] if j > 0 else None, xs[j], xs[j + 1] if j < M else None
             near = np.nonzero(((ex > mid - 1.5 * hstep) | (lo is None)) & ((ex < mid + 1.5 * hstep) | (hi is None)))[0]
             for prof in profiles:
                 col = []
@@ -182,14 +168,11 @@ def line_subspace(rwg, n_total, tri_layer, runs, h_of, profiles=('maxwell', 'odd
                     if c != 0.0:
                         col.append((erow[e], c))
                 if col:
-                    for rr, c in col:
-                        rows.append(rr); cols.append(ncol); vals.append(c)
+                    rows += [rr for rr, _ in col]; vals += [c for _, c in col]; cols += [ncol] * len(col)
                     ncol += 1
-                    nfun += 1
     rows = np.asarray(rows, int)
     T = sparse.csc_matrix((np.concatenate([np.ones(len(keep)), vals]),
                            (np.concatenate([keep, elim[rows]]), np.concatenate([np.arange(len(keep)), cols]))),
                           shape=(n_total, ncol))
-    info = dict(runs=len(runs), functions=nfun, elim=elim, keep=keep, reduced=ncol, full=n_total,
-                edges_replaced=len(elim))
-    return T, info
+    return T, dict(runs=len(runs), functions=ncol - len(keep), elim=elim, keep=keep, reduced=ncol, full=n_total,
+                   edges_replaced=len(elim))

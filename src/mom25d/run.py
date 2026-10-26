@@ -13,8 +13,7 @@ import numpy as np
 
 def renorm(S, zc, zref):
     """Renormalise S from reference impedances zc to zref (scalars or per-port, real)."""
-    zc = np.asarray(zc, float)
-    n = S.shape[0]
+    zc, n = np.asarray(zc, float), S.shape[0]
     zref = np.broadcast_to(np.asarray(zref, float), (n,))
     if np.allclose(zc, zref):
         return S
@@ -30,9 +29,8 @@ def out_refs(sim, z0):
     out = []
     for p in sim.ports:
         mode = getattr(p, 'mode', None)
-        base = getattr(p, 'parent', p).name if mode else p.name
-        z = z0.get(base, z0.get(p.name, 50.0)) if isinstance(z0, dict) else z0
-        out.append(2 * z if mode == 'd' else (z / 2 if mode == 'c' else z))
+        z = z0.get(p.parent.name if mode else p.name, z0.get(p.name, 50.0)) if isinstance(z0, dict) else z0
+        out.append({'d': 2 * z, 'c': z / 2}.get(mode, z))
     return np.array(out, float)
 
 
@@ -47,9 +45,7 @@ def solve_band(sim, fmin, fmax, points=401, zref=50.0, linear=None, afs_tol=2e-3
     tolerance). max_solves: cap of the adaptive sweep. keep_mid: one extra solve at
     mid-band keeping the currents (sim.last). progress(solves, at most, f): after each EM solve. on_step(entry):
     after each model of the adaptive sweep (afs.adaptive_sweep)."""
-    t0 = time.time()
-    zr = out_refs(sim, zref)
-    done = []
+    t0, zr, done = time.time(), out_refs(sim, zref), []
 
     def solve(fr):
         log(f"  solving {fr / 1e9:.4f} GHz")

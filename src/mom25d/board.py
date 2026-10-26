@@ -41,8 +41,7 @@ def wall_points(walls, pitch, taken=()):
     `pitch` mm along each. A point within WALL_GAP of a via already there (`taken`, or an earlier wall's: walls
     meeting at a corner share their end) is left out: two vias in one place make the via block singular (the
     SMA launch: 4 duplicated wall ends, an exact null space a complex64 LU cannot factor)."""
-    pts = [tuple(p) for p in taken]
-    out = []
+    pts, out = [tuple(p) for p in taken], []
     for i, (axis, at, t0, t1, _, _) in enumerate(walls):
         n = max(2, int(round((t1 - t0) / pitch)) + 1)
         for t in np.linspace(t0, t1, n):
@@ -115,59 +114,39 @@ class BoardModel(PlanarModel):
         self.vias = []
         for v in data.get('vias', []):
             via = self._via(v['x'], v['y'], v['z0'], v['z1'], v['r'], f"{v.get('net', '')}@({v['x']:.2f},{-v['y']:.2f})")
-            if via and gnets:                       # Simulation(signal_vias=, stitching_vias=): how each is meshed
-                via.kind = 'stitching' if v.get('net') in gnets else 'signal'
             if via:
+                if gnets:                           # Simulation(signal_vias=, stitching_vias=): how each is meshed
+                    via.kind = 'stitching' if v.get('net') in gnets else 'signal'
                 self.vias.append(via)
-        nwall = 0
+        nvia = len(self.vias)
         walls = [(w['axis'], w['at'], w['t0'], w['t1'], w['z0'], w['z1']) for w in data.get('walls', [])]
         for i, x, y in wall_points(walls, wall_pitch / MM, [(v['x'], v['y']) for v in data.get('vias', [])]):
-            w = walls[i]
-            via = self._via(x, y, w[4], w[5], WALL_R, f"wall@({x:.2f},{-y:.2f})", ring=False)
+            via = self._via(x, y, *walls[i][4:], WALL_R, f"wall@({x:.2f},{-y:.2f})", ring=False)
             if via:
                 via.kind = 'stitching'
                 self.vias.append(via)
-                nwall += 1
-        if data.get('walls'):
-            self.notes.append(f"edge walls: {nwall} vias every {wall_pitch * 1e3:g} mm")
+        if walls:
+            self.notes.append(f"edge walls: {len(self.vias) - nvia} vias every {wall_pitch * 1e3:g} mm")
+        # parts: a series R / L / C element across the gap between the pads, the gap bridged by a strip
+        from .sim import SeriesLumped, rlc
         self.lumped = []
         for p in data.get('parts', []):
-            self._part(p)
-        self.port_specs, self.port_z0 = [], {}
-        self._ports(data.get('ports', []), port, pairs)
-
-    def _metal_at(self, k, x, y):
-        g = self.shapes.get(k)
-        return k == 0 or (bool(g) and g[0].buffer(1e-9).contains(Point(x * MM, y * MM)))
-
-    def _via(self, x, y, z0, z1, r, name, ring=True, Z=None):
-        """A via (board mm) over the interfaces between z0 and z1 that have metal at (x, y) (the ground counts)."""
-        from .sim import Via
-        ks = sorted(k for k in [0] + list(self.iface.values())
-                    if z0 - 1e-9 <= self._zk[k] <= z1 + 1e-9 and self._metal_at(k, x, y))
-        if len(set(ks)) < 2:
-            return None
-        return Via(x * MM, y * MM, ks[0], ks[-1], radius=r * MM, name=name, ring=ring, Z=Z)
-
-    def _part(self, p):
-        from .sim import SeriesLumped, rlc
-        k = self.iface.get(p['layer'])
-        if k is None:
-            self.notes.append(f"{p['ref']}: on {p['layer']}, not a metal interface - left out")
-            return
-        s, e = np.array(p['s'][:2]) * MM, np.array(p['e'][:2]) * MM
-        self.shapes[k] = [unary_union(self.shapes.get(k, []) + [box(*s, *e)]).buffer(0)]     # the strip
-        R, L, C = p.get('R'), p.get('L'), p.get('C')
-        given = [v for v in (R, L, C) if v is not None]
-        if given == [0.0] and C is None:                                   # 0 ohm: the strip is the part
-            return
-        Z = rlc(R=R or 0.0, L=L or 0.0, C=C) if len(given) > 1 else rlc(R=R, L=L, C=C, parallel=True)
-        a = int(p['axis'])
-        self.lumped.append(SeriesLumped(k, 0.5 * (s + e), np.eye(2)[a], e[1 - a] - s[1 - a], Z, name=p['ref']))
-
-    def _ports(self, ports, kind, pairs):
-        legs = {}
-        for p in ports:
+            k = self.iface.get(p['layer'])
+            if k is None:
+                self.notes.append(f"{p['ref']}: on {p['layer']}, not a metal interface - left out")
+                continue
+            s, e = np.array(p['s'][:2]) * MM, np.array(p['e'][:2]) * MM
+            self.shapes[k] = [unary_union(self.shapes.get(k, []) + [box(*s, *e)]).buffer(0)]     # the strip
+            R, L, C = p.get('R'), p.get('L'), p.get('C')
+            given = [v for v in (R, L, C) if v is not None]
+            if given == [0.0] and C is None:                               # 0 ohm: the strip is the part
+                continue
+            Z = rlc(R=R or 0.0, L=L or 0.0, C=C) if len(given) > 1 else rlc(R=R, L=L, C=C, parallel=True)
+            a = int(p['axis'])
+            self.lumped.append(SeriesLumped(k, 0.5 * (s + e), np.eye(2)[a], e[1 - a] - s[1 - a], Z, name=p['ref']))
+        # ports (PlanarModel.port_specs)
+        self.port_specs, self.port_z0, legs = [], {}, {}
+        for p in data.get('ports', []):
             if p.get('kind', 'z') != 'z':
                 raise ValueError(f"{p['name']}: a gap port (a dipole or slot feed) has no planar equivalent")
             k = self.iface.get(p['layer'])
@@ -178,11 +157,20 @@ class BoardModel(PlanarModel):
             d[int(p['axis'])] = p['sgn']
             kref = 0 if p.get('ref_layer') in (None, '', self.ground) else self.iface.get(p['ref_layer'], 0)
             spec = dict(name=p['name'], c=np.asarray(p['c'], float) * MM, d=d, k=k, w=p['w'] * MM, z0=float(p['z0']),
-                        kind=kind, kref=kref, radius=max(p['w'] / 4, 0.02) * MM)
+                        kind=port, kref=kref, radius=max(p['w'] / 4, 0.02) * MM)
             self.port_z0[p['name']] = float(p['z0'])
             if pairs and p.get('pair'):
                 legs.setdefault(p['pair'], {})[p['leg']] = spec
                 if len(legs[p['pair']]) == 2:
                     self.port_specs.append(dict(name=p['pair'], legs=legs[p['pair']]))
-                continue
-            self.port_specs.append(spec)
+            else:
+                self.port_specs.append(spec)
+
+    def _via(self, x, y, z0, z1, r, name, ring=True, Z=None):
+        """A via (board mm) over the interfaces between z0 and z1 that have metal at (x, y) (the ground counts)."""
+        from .sim import Via
+        metal = lambda k: k == 0 or (bool(g := self.shapes.get(k)) and g[0].buffer(1e-9).contains(Point(x * MM, y * MM)))
+        ks = sorted(k for k in [0] + list(self.iface.values()) if z0 - 1e-9 <= self._zk[k] <= z1 + 1e-9 and metal(k))
+        if len(set(ks)) < 2:
+            return None
+        return Via(x * MM, y * MM, ks[0], ks[-1], radius=r * MM, name=name, ring=ring, Z=Z)
