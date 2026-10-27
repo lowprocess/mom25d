@@ -63,6 +63,7 @@ f, S, info = solve_band(sim, 1e9, 6e9, points=101, zref=m.port_z0)
 | `afs.py`, `run.py` | the adaptive frequency sweep |
 | `farfield.py` | far and near fields from the currents |
 | `core/` | the compiled C++ kernels |
+| `kicad2ems/` | kicad2ems's solver plugins, `mom25d` and `mixed` (the `kicad2ems.solvers` entry points; only kicad2ems imports them) |
 
 The formulation is a mixed-potential integral equation with RWG basis functions. Layered-media kernels
 come from a spectral transmission-line network. The singular terms are integrated analytically.
