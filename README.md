@@ -19,6 +19,13 @@ python -m mom25d.core.build         # mom25d/_core*.so, about five times faster
 pip install '.[gpu-rocm7]'          # the GPU LU: the CuPy wheel for your stack (gpu-cuda12, gpu-cuda13, gpu-rocm7)
 ```
 
+PyPI has no triangle 20230923 or later for every Python (none for 3.14). Where `pip install .` cannot find one,
+build it from its repository first (needs a C compiler; kicad2ems's `setup.sh` does this for you):
+
+```bash
+pip install "triangle @ git+https://github.com/drufat/triangle.git@595b43eb6682992a0b1012b9671bf860c0e6ae56"
+```
+
 `MOM25D_GPU=off` turns the GPU off. Consumer AMD cards outside ROCm's support list may need
 `HSA_OVERRIDE_GFX_VERSION=11.0.0` (RDNA3) or `10.3.0` (RDNA2).
 
