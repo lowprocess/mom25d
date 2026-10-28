@@ -13,14 +13,12 @@ Backends (picked in this order by gpu='auto'; force with MOM25D_GPU=cupy|torch|o
 
 Typical capacity with 16 GB of VRAM: ~41k unknowns with cupy, ~29k with torch.
 """
-import os
-
 import numpy as np
 import scipy.linalg as sla
+from emdev import gpu as devices                                 # the device and its memory: emdev, shared with gfdtd
 
 
-class GPUUnavailable(RuntimeError):
-    pass
+GPUUnavailable = devices.Unavailable
 
 
 class _Backend:
@@ -42,27 +40,19 @@ class CupyBackend(_Backend):
     name, inplace = 'cupy', True
 
     def __init__(self):
+        self.dev = devices.cupy_device()                         # raises Unavailable: no CuPy, no driver, no GPU
         try:
             import cupy as cp
             import cupyx.scipy.linalg as cla
-            if cp.cuda.runtime.getDeviceCount() < 1:
-                raise GPUUnavailable("no GPU device")
-        except Exception as e:                                   # ImportError, CUDARuntimeError, ...
+        except Exception as e:
             raise GPUUnavailable(f"cupy: {e}")
-        self.cp, self.cla, dev = cp, cla, cp.cuda.Device()
-        try:
-            nm = cp.cuda.runtime.getDeviceProperties(dev.id).get('name', b'GPU')
-            self.device = nm.decode() if isinstance(nm, bytes) else str(nm)
-        except Exception:
-            pass                                                 # _Backend.device
-        self.hip = bool(getattr(cp.cuda.runtime, 'is_hip', False))
+        self.cp, self.cla, self.device, self.hip = cp, cla, self.dev.name, self.dev.hip
 
     def mem_free(self):
-        self.cp.get_default_memory_pool().free_all_blocks()
-        return float(self.cp.cuda.Device().mem_info[0])
+        return self.dev.free()
 
     def mem_total(self):
-        return float(self.cp.cuda.Device().mem_info[1])
+        return self.dev.total
 
     def factor(self, Z):
         """Z: host complex64, C-contiguous, equilibrated. Factors Z^T (Fortran-contiguous view) in place."""
@@ -86,23 +76,16 @@ class TorchBackend(_Backend):
     name = 'torch'
 
     def __init__(self):
-        try:
-            import torch
-            available = torch.cuda.is_available()                # ROCm builds report through torch.cuda
-        except Exception as e:
-            raise GPUUnavailable(f"torch: {e}")
-        if not available:
-            raise GPUUnavailable("torch.cuda.is_available() is False")
-        self.torch, self.dev = torch, torch.device('cuda')
-        self.device = torch.cuda.get_device_name(0)
-        self.hip = getattr(torch.version, 'hip', None) is not None
+        d = devices.torch_device()                               # ROCm builds report through torch.cuda
+        import torch
+        self.torch, self.dev, self.info = torch, torch.device('cuda'), d
+        self.device, self.hip = d.name, d.hip
 
     def mem_free(self):
-        self.torch.cuda.empty_cache()
-        return float(self.torch.cuda.mem_get_info()[0])
+        return self.info.free()
 
     def mem_total(self):
-        return float(self.torch.cuda.mem_get_info()[1])
+        return self.info.total
 
     def factor(self, Z):
         """Upload Z (row-major), factor A = Z^T (a column-major view: no extra transpose copy)."""
@@ -153,8 +136,7 @@ def get_backend(pref='auto'):
     """Return a backend instance or None. pref: 'auto' | 'cupy' | 'torch' | 'emulate' | 'off'.
     The environment variable MOM25D_GPU overrides pref. Reasons for failures are kept in
     get_backend.why for logging."""
-    pref = os.environ.get('MOM25D_GPU', pref) or 'auto'
-    pref = {'0': 'off', 'false': 'off', 'no': 'off', '1': 'auto', 'on': 'auto', 'true': 'auto'}.get(str(pref).lower(), str(pref).lower())
+    pref = devices.preference(pref, 'MOM25D_GPU')
     get_backend.why = []
     if pref == 'off':
         return None

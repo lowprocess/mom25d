@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import shapely
+from emdev.memory import available as available_memory      # noqa: F401  (bytes; mom25d's name for it)
 
 from .model import KNOWN_SPAN
 from .base import MU0, EPS0, RWG, qform, combine, singular_moments, quad_pts, gram_matrix, \
@@ -53,31 +54,6 @@ def rlc(R=0.0, L=0.0, C=None, parallel=False):
             return R + 1j * w * L + (1 / (1j * w * C) if C else 0)
         return 1 / ((1 / R if R else 0) + (1 / (1j * w * L) if L else 0) + (1j * w * C if C else 0))
     return Z
-
-
-def available_memory():
-    """Bytes of memory available to this process: MemAvailable, capped by a cgroup limit."""
-    try:
-        avail = next((int(l.split()[1]) * 1024 for l in open('/proc/meminfo') if l.startswith('MemAvailable:')), None)
-    except OSError:
-        avail = None
-    for lim, use in (('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory.current'),
-                     ('/sys/fs/cgroup/memory/memory.limit_in_bytes', '/sys/fs/cgroup/memory/memory.usage_in_bytes')):
-        try:
-            L = open(lim).read().strip()
-            if L != 'max' and int(L) < 1 << 60:
-                free = int(L) - int(open(use).read())
-                avail = free if avail is None else min(avail, free)
-            break
-        except (OSError, ValueError):
-            continue
-    if avail is None:
-        try:
-            import psutil
-            avail = psutil.virtual_memory().available
-        except ImportError:
-            avail = 8e9
-    return float(avail)
 
 
 MIXED_MIN_N = 3500       # above this, 'auto' precision is mixed whenever the compiled core is there

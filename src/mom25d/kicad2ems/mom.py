@@ -11,9 +11,9 @@ import json
 import os
 import numpy as np
 
-from kicad2ems.options import Option, floatlist
-from kicad2ems.solvers import Solver, Result, Deviation
-from kicad2ems import stop
+from kicad2ems.api.solver import Option, floatlist
+from kicad2ems.api.solver import Solver, Result, Deviation
+from kicad2ems.api.solver import stop
 
 G = 'mom25d'
 # --solvers auto (docs/architecture.md#choosing-solvers): seconds per EM solve on 24 cores, fitted on the examples
@@ -72,7 +72,7 @@ def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, log=print, 
     gives openEMS (default: lossless copper, like openEMS's PEC sheets). progress(solves, at most, f). hold: a
     dict that receives mom25d's result as 'res' (its model and simulation, for the current dumps)."""
     from mom25d.api import solve_board
-    from kicad2ems.sparams import mixed_mode
+    from kicad2ems.api.solver import mixed_mode
     kind = 'via' if port == 'lumped' else port
     pairs = any(len(legs) == 2 for _, legs in m.user_ports) and kind != 'via'
     metal, t_mm = _metal(m, sigma)
@@ -115,7 +115,7 @@ def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, log=print, 
 
 def save_mesh(run, sim, model):
     """mom25d's triangles for the 3D view (meshes.py): each meshed layer at its copper's height."""
-    from kicad2ems.meshes import save
+    from kicad2ems.api.solver import save_mesh
     lay = {k: l for l, k in model.iface.items()}
     z = np.array([run.m.cu_z.get(lay.get(int(k)), np.nan) for k in sim.tri_layer])
     tris = np.asarray(sim.rwg.tris)
@@ -123,7 +123,7 @@ def save_mesh(run, sim, model):
     nz = np.zeros(len(sim.rwg.nodes))                               # each layer is meshed on its own: no shared nodes
     nz[tris[keep].ravel()] = np.repeat(z[keep], 3)
     nodes = np.column_stack([sim.rwg.nodes[:, :2] * 1e3, nz])
-    run.wrote('mom25d mesh (3D view)', save(run, 'mom25d', 'tris', nodes=nodes, tris=tris[keep]))
+    run.wrote('mom25d mesh (3D view)', save_mesh(run, 'mom25d', 'tris', nodes=nodes, tris=tris[keep]))
 
 
 HOW = {'dense': 'dense, NumPy', 'double': 'direct LU in double on the CPU',
@@ -151,6 +151,7 @@ def _solid_ground(m):
 
 
 class MoM25D(Solver):
+    api = (1, 0)                    # kicad2ems.api
     name, aliases, label = 'mom25d', ('mom',), 'mom25d (MoM)'
     consumes, previewed, rank, order = 'board', False, 1, 20     # order: after openEMS in kicad2ems's lists
     capabilities = dict(ports='yes: lumped, or de-embedded wave ports on a long enough feed', gap_ports='no',
@@ -215,6 +216,16 @@ class MoM25D(Solver):
                 return ("mom_core = compiled, but mom25d's compiled core is not built (python -m mom25d.core.build, "
                         "or setup.sh): auto or python run on NumPy")
         return None
+
+    def resources(self):
+        """The GPU mom25d's LU would use (MOM25D_GPU), or why there is none."""
+        from mom25d.gpu import get_backend
+        b = get_backend('auto')
+        if b is None:
+            return dict(gpus=[], why='; '.join(get_backend.why) or 'disabled (MOM25D_GPU=off)')
+        total = b.mem_total() if hasattr(b, 'mem_total') else None
+        return dict(gpus=[dict(device=b.device, backend=b.name, api='ROCm/HIP' if b.hip else 'CUDA',
+                               free=b.mem_free() / 1e9, total=total / 1e9 if total else None)], why='')
 
     def check(self, s=None):
         return mom25d_status()
@@ -325,7 +336,7 @@ class MoM25D(Solver):
         self._held = {}
         port = s.mom_port
         if run.antenna and (s.drive or s.grid or s.steer or s.taper):  # a drive that names no port: before the solve
-            from kicad2ems.phased import settings_drive
+            from kicad2ems.api.solver import settings_drive
             settings_drive(s.drive, [p.name for p in run.m.ports], s.grid, s.steer, s.taper)
         if run.antenna and port == 'auto':                          # the gap source the antenna's power is taken from
             port = 'lumped'
@@ -367,9 +378,9 @@ class MoM25D(Solver):
         (<name>_mom25d_array.npz) for the GUI's beam steering. Gain counts substrate loss and surface waves as
         loss; nothing radiates below the infinite ground."""
         from mom25d.farfield import far_field, radiated
-        from kicad2ems import phased
-        from kicad2ems.fields.antenna import match_summary, describe, save as save_antenna
-        from kicad2ems.plots import plot_antenna, plot_pattern
+        from kicad2ems.api.solver import phased
+        from kicad2ems.api.solver import match_summary, describe_antenna, save_antenna
+        from kicad2ems.api.solver import plot_antenna, plot_pattern
         s, m, sim = run.s, run.m, held.sim
         names = [p.name for p in sim.ports]
         n = len(names)
@@ -459,7 +470,7 @@ class MoM25D(Solver):
                 run.log(f"  mom25d phased drive {ant['port']}: beam at theta {pk['theta']:g}, phi {pk['phi']:g} deg; "
                         f"active S11 " + ', '.join(f"{p} {v:.1f} dB" for p, v in ant['active_db'].items()) +
                         f" at {ffr[ip] / 1e9:.4g} GHz")
-        for line in describe(match, rows, ant['f_pattern']):
+        for line in describe_antenna(match, rows, ant['f_pattern']):
             run.log(f"  mom25d {line}")
         tag = '' if 'antenna' not in run.summary else '_mom25d'          # openEMS's antenna results come first
         run.figure(plot_antenna(run.freq, s11, m.ports[k].z0, ant, f"{run.name} - antenna (mom25d)"),
@@ -478,7 +489,7 @@ class MoM25D(Solver):
         currents / extra / unit (the mixed solver's)."""
         if not run.s.mom_dump or held is None:
             return
-        from kicad2ems.fields.frames import DumpSource, save_fd_outputs
+        from kicad2ems.api.solver import DumpSource, save_fd_outputs
         tag = self.name
         for port, d in current_dumps(run, held, [f * 1e9 for f in run.s.mom_dump], run.s.dump_port, run.s.mom_near,
                                      tag=tag, **kw):
@@ -509,8 +520,8 @@ def current_dumps(run, res, freqs, ports=None, near=(), tag='mom25d', currents=N
     RWG currents of each port driven (default: sim.currents of the excitations); extra(k, f_index, column, gx, gy, Jx,
     Jy) -> (Jx, Jy): layer k's grid with what the solver adds (mixed: the stretches put back as lines)."""
     from mom25d.farfield import current_on_grid, near_field
-    from kicad2ems.fields.dumps import Dump, write_info
-    from kicad2ems.fields.frames import write_npz
+    from kicad2ems.api.solver import Dump, write_info
+    from kicad2ems.api.solver import write_npz
     sim, model = res.sim, res.model
     names = [p.name for p in sim.ports]
     want = [n.strip() for n in (ports.split(',') if isinstance(ports, str) else ports or [])]
