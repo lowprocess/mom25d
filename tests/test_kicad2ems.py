@@ -144,7 +144,7 @@ def test_stop_ends_mom25d_after_its_current_solve(run_cli, tmp_path, monkeypatch
     result; the line model (the --fast reference) still gives its. ABORT alone had left mom25d running."""
     pytest.importorskip('triangle')
     from kicad2ems import pipeline
-    from kicad2ems.gui.runner import stop_runs
+    from kicad2ems.runs import stop_runs
     out = tmp_path / 'out'
     seen = []
     status = pipeline.Job.status
