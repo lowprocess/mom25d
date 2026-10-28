@@ -11,7 +11,9 @@ pytest.importorskip('triangle')
 
 CASES = dict(transition=('demo', ['--nets', 'RF,GND', '--ground', 'B.Cu']),
              lowpass=('lowpass', []),
-             launch=('launch', ['--edge-walls', 'all']))
+             launch=('launch', ['--edge-walls', 'all']),
+             transition_pads=('demo', ['--nets', 'RF,GND', '--ground', 'B.Cu', '--mom-planes', 'pec',
+                                       '--mom-stitching-pads', 'drop']))
 
 
 @pytest.mark.parametrize('case', list(CASES))

@@ -118,15 +118,19 @@ def _spaced(P, h, dmin):
     return np.vstack(out)
 
 
-def _run_grid(geom, dmax, lines, vias, offsets, w_max, h=None, fill=0.98):
+def _run_grid(geom, dmax, lines, vias, offsets, w_max, h=None, fill=0.98, within=None):
     """The tensor grid of mesh_polygons(structured=): (transverse and longitudinal constraint segments, the runs'
     polygons, the indices of the vias snapped to a cell of it). h(points): the local spacing (None: dmax), the
-    stations at fill x it so that no outline or ring piece between two is split again."""
+    stations at fill x it so that no outline or ring piece between two is split again. within: only the runs
+    inside this area (the zone's fine region)."""
     from .line import find_runs
     h = h or (lambda P: np.full(len(P), dmax))
-    segs, polys, snapped = [], [], set()
+    segs, polys, snapped, on_run = [], [], set(), set()
     for r in find_runs({0: geom}, {0: dmax}, w_max=w_max, min_len=1.0, margin=0.0):
         a, cl = r.a, lambda x: r.c0 + r.t * np.asarray(x, float)[..., None]
+        if within is not None and not within.contains(
+                Polygon([cl(r.x0) - r.n * a, cl(r.x1) - r.n * a, cl(r.x1) + r.n * a, cl(r.x0) + r.n * a])):
+            continue
         # fixed stations: the run's ends and the port / cut lines across it; gaps around vias
         fixed, cuts = [r.x0, r.x1], []
         for p0, p1 in lines:
@@ -148,6 +152,7 @@ def _run_grid(geom, dmax, lines, vias, offsets, w_max, h=None, fill=0.98):
             rad = v[2] if len(v) > 2 else 0.0
             if not (abs(yv) < a + rad + 0.5 * dmax and r.x0 - rad - 0.5 * dmax < xv < r.x1 + rad + 0.5 * dmax):
                 continue                                   # not on the run (a via beside it, on another trace)
+            on_run.add(i)
             square, aligned = len(v) > 3 and v[3] == 4 and v[2] > 0, min(abs(r.t)) < 1e-9
             if square and aligned and len(v) > 4 and v[4]:
                 hc = 0.5 * fill * float(h(np.array(v[:2], float)[None])[0])        # half a cell there
@@ -189,7 +194,7 @@ def _run_grid(geom, dmax, lines, vias, offsets, w_max, h=None, fill=0.98):
                 segs.append((cl(x0) + r.n * y, cl(x1) + r.n * y))
         ext = 1e-3 * a
         segs += [(cl(x) - r.n * (a + ext), cl(x) + r.n * (a + ext)) for x in np.unique(np.concatenate(xs))] if xs else []
-    return segs, polys, snapped
+    return segs, polys, snapped, on_run
 
 
 def _cell_sides(yv, hc, rings):
@@ -264,15 +269,24 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
         Fk = cKDTree(F) if len(F) else None
         dist = (lambda P: Fk.query(P)[0]) if Fk is not None else (lambda P: np.full(len(P), np.inf))
         hfield = lambda P, d_: np.minimum(coarsen * d_, d_ + grow * dist(P))
-    run_polys, snapped = [], set()
+    run_polys, snapped, on_run = [], set(), set()
     if structured:
-        st_lines, run_polys, snapped = _run_grid(geom, dmax, lines, vias, offsets[offsets < 0.5 * w_ref - 1e-12],
-                                                 struct_w_max, (lambda P: hfield(P, dmax)) if hfield is not None else None)
+        hrun, within, dgrid = (lambda P: hfield(P, dmax)) if hfield is not None else None, None, dmax
+        if edge_zone is not None and fine_u is not None:
+            # zone=: only the runs inside its fine region (the traces), at its spacing. A run reaching out of it (a
+            # plane under the zone, 8 mm wide on rf_stripline) took its grid's lines over the coarse cells:
+            # rf_stripline 5,647 unknowns against 4,985 without the grid
+            within, dgrid = fine_u.buffer(1e-6 * dmax), dmax_fine
+            hrun = (lambda P: hfield(P, dmax_fine)) if hfield is not None else (lambda P: np.full(len(P), dmax_fine))
+        st_lines, run_polys, snapped, on_run = _run_grid(geom, dgrid, lines, vias, offsets[offsets < 0.5 * w_ref - 1e-12],
+                                                 struct_w_max, hrun, within=within)
         linework += [LineString([p0, p1]).intersection(geom) for p0, p1 in st_lines]
     vpts = []
     for i, via in enumerate(vias):
         x, y, r = via[:3]
         vpts.append((x, y))
+        if len(via) > 4 and via[4] and i not in on_run:
+            r = 0.0                                              # one that could snap, on no run: its vertex alone
         if r > 0 and i not in snapped:                           # (x, y, r, n): a regular n-gon, else an octagon
             ring = ngon(x, y, r, int(via[3]), closed=True) if len(via) > 3 else \
                 Point(x, y).buffer(r, quad_segs=2).exterior.coords

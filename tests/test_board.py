@@ -119,3 +119,49 @@ def test_wall_points_skip_a_via_already_there():
     pts = wall_points(walls, 0.5)
     assert len(pts) == 9 and sum((x, y) == (0.0, 0.0) for _, x, y in pts) == 1
     assert len(wall_points(walls, 0.5, taken=[(0.0, 1.02)])) == 8
+
+
+def stripline():
+    """The demo transition made a stripline: In1.Cu and F.Cu solid ground planes (the signal via, P1 and F.Cu's
+    copper gone), the trace on In2.Cu between B.Cu and In1.Cu, its stitching vias' lone pads beside it."""
+    data = board('demo')
+    full = dict(polygon=data['outline'], net='GND')
+    data['copper']['In1.Cu'] = [dict(full)]
+    data['copper']['F.Cu'] = [dict(full)]
+    data['vias'] = [v for v in data['vias'] if v['net'] in data['ground_nets']]
+    data['ports'] = [p for p in data['ports'] if p['layer'] == 'In2.Cu']
+    return data
+
+
+def test_solid_planes_as_pec_and_lone_pads_dropped():
+    """planes='pec': the solid plane over the trace is a PEC cover (the copper above it left out), the ground
+    stays B.Cu (the trace's layer is not solid), the stitching vias run from the ground to the cover.
+    stitching_pads='drop': the pads beside the trace, and nothing else, are left out; the vias are kept."""
+    from mom25d.board import pec_planes, lone_pads
+    data = stripline()
+    assert pec_planes(data, 'B.Cu') == ('B.Cu', 'In1.Cu')
+    assert pec_planes(board('demo'), 'B.Cu') == ('B.Cu', None)         # In1.Cu has the signal via's antipad
+    m = BoardModel(data, planes='pec', log=quiet)
+    assert m.cover == 'In1.Cu' and m.stack.top == 'pec' and m.stack.N == 2 and m.iface == {'In2.Cu': 1}
+    assert any('above the cover (F.Cu)' in n for n in m.notes)
+    assert {(v.k_bot, v.k_top) for v in m.vias} == {(0, 2)} and [sp['kref'] for sp in m.port_specs] == [0]
+    pads = lone_pads(data, ['In2.Cu'])['In2.Cu']
+    nets = [p['net'] for p in data['copper']['In2.Cu']]
+    assert len(pads) == nets.count('GND') and all(nets[i] == 'GND' for i in pads)
+    d = BoardModel(data, planes='pec', stitching_pads='drop', log=quiet)
+    assert len(d.vias) == len(m.vias) and d.shapes[1][0].area < m.shapes[1][0].area
+    assert BoardModel(data, log=quiet).cover is None and len(BoardModel(data, log=quiet).iface) == 3
+
+
+def test_a_raised_ground():
+    """planes='pec' on a stripline whose lower plane is not the board's ground (rf_stripline: B.Cu, In2.Cu
+    solid, the trace on In1.Cu): the ground moves up to In2.Cu and B.Cu is left out."""
+    from mom25d.board import pec_planes
+    data = stripline()
+    data['copper']['In2.Cu'], data['copper']['In1.Cu'] = data['copper']['In1.Cu'], data['copper']['In2.Cu']
+    for p in data['ports']:
+        p['layer'], p['ref_layer'] = 'In1.Cu', 'In2.Cu'
+    assert pec_planes(data, 'B.Cu') == ('In2.Cu', 'F.Cu')
+    m = BoardModel(data, planes='pec', log=quiet)
+    assert m.ground == 'In2.Cu' and m.cover == 'F.Cu' and m.iface == {'In1.Cu': 1} and m.stack.N == 2
+    assert [sp['kref'] for sp in m.port_specs] == [0] and {(v.k_bot, v.k_top) for v in m.vias} == {(0, 2)}
