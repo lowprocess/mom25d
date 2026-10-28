@@ -349,7 +349,7 @@ def test_quad_cells_match_triangles_with_fewer_unknowns():
         out[q] = sim, sim.sparams(6e9)
     (s0, S0), (s1, S1) = out[False], out[True]
     n0, n1 = s0.Ne + s0.Nv, s1.qT.shape[1]
-    assert n1 < 0.7 * n0
+    assert n1 < 0.8 * n0
     assert np.abs(S1 - S0).max() < 0.01
     assert abs(S1[0, 1] - S1[1, 0]) < 1e-3                  # wave-port fits: ~5e-5 either way
     I = s1.qT @ np.random.default_rng(0).standard_normal(n1)

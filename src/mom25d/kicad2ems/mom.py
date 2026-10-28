@@ -66,7 +66,7 @@ def _via_sides(v, words):
 def factorisations(runlog):
     """(on the GPU, on the CPU): the matrix factorisations of a sweep, from mom25d's stage timings. A solve whose
     complex64 LU failed to precondition counts on both (it is factored again in double on the CPU)."""
-    names = [(stage, detail) for stage, _, detail in runlog.records]
+    names = [(stage, detail) for stage, _, detail in getattr(runlog, "records", ())]
     gpu = sum(st in ('LU factor (GPU)', 'LDLT factor (GPU, tiled)') for st, _ in names)
     cpu = sum(st in ('LU factor', 'BLR assemble + factor') or (st == 'LU solve' and detail.startswith('N='))
               for st, detail in names)
