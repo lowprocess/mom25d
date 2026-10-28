@@ -699,7 +699,25 @@ class Simulation:
             return d[:, None] * np.linalg.solve(Z * d[:, None] * d[None, :], d[:, None] * E)
 
     def currents(self, f, E):
-        """Basis currents for excitation columns E, with the configured solver."""
+        """Basis currents for excitation columns E, with the configured solver. A result that isn't finite (the
+        GPU solve once returned NaN on a 22.7k-unknown board) is solved again on the CPU, and if that isn't finite
+        either, FloatingPointError: never NaN S-parameters."""
+        I = self._currents(f, E)
+        if np.isfinite(I).all():
+            return I
+        if self.gpu != 'off' and self.solver == 'direct':
+            self.log.note(f"WARNING the GPU solve at {f / 1e9:.4g} GHz was not finite - solving it again on the CPU")
+            gpu, self.gpu = self.gpu, 'off'
+            try:
+                I = self._currents(f, E)
+            finally:
+                self.gpu = gpu
+            if np.isfinite(I).all():
+                return I
+        raise FloatingPointError(f"mom25d: the {self.solver} solve at {f / 1e9:.4g} GHz is not finite (N = "
+                                 f"{len(I)}): a degenerate mesh, or a port with no return path")
+
+    def _currents(self, f, E):
         if self.solver == 'aca':
             return self.fast.solve(f, E)
         if self.solver == 'direct':

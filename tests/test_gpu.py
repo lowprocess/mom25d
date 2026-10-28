@@ -215,3 +215,25 @@ def test_symmetric_factor_of_a_random_matrix():
     assert fac.on_device.count(False) > 0
     R = rng.standard_normal((N, 2)) + 0j
     assert np.linalg.norm(Z @ fac.solve(R) - R) / np.linalg.norm(R) < 1e-5
+
+
+def test_a_nan_gpu_factor_falls_back(clean, S_cpu):
+    """A GPU LU that comes back NaN: the refinement breaks down and the solve is redone in double on the CPU."""
+    clean.setattr(mom25d_gpu.EmulatedBackend, 'solve', lambda self, R: np.full(np.shape(R), np.nan, complex))
+    sim = make_sim('emulate')
+    S = sim.sparams(4e9)
+    assert np.isfinite(S).all() and np.abs(S - S_cpu).max() < 1e-6
+
+
+def test_a_nan_solve_is_redone_on_the_cpu_or_refused(clean, S_cpu):
+    """Whatever path a NaN takes past the refinement: the currents are solved again with the GPU off, and a solve
+    that isn't finite on the CPU either raises instead of giving NaN S-parameters."""
+    sim = make_sim('emulate')
+    real = type(sim)._currents
+    clean.setattr(sim, '_currents', lambda f, E: real(sim, f, E) * (np.nan if sim.gpu != 'off' else 1))
+    S = sim.sparams(4e9)
+    assert np.abs(S - S_cpu).max() < 1e-6 and sim.gpu == 'emulate'
+    assert any('not finite - solving it again on the CPU' in n for n in sim.log.notes)
+    clean.setattr(sim, '_currents', lambda f, E: real(sim, f, E) * np.nan)
+    with pytest.raises(FloatingPointError, match='not finite'):
+        sim.sparams(4e9)
