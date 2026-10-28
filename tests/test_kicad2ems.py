@@ -63,11 +63,15 @@ def test_sigma_reaches_mom(demo_files):
 
 def test_current_dumps(boards, run_cli, tmp_path, monkeypatch):
     """--mom-dump: mom25d's surface currents at the frequencies asked, a |J| map each, with --dump-animate one
-    period of Re(J e^j phase), and the dumps where the GUI's Fields tab finds them."""
+    period of Re(J e^j phase), and the dumps where the GUI's Fields tab finds them. The sweep solves at the dump
+    frequencies among its samples and the dumps reuse those currents: no solve of their own."""
     pytest.importorskip('triangle')
     from kicad2ems.fields import frames as F
+    from mom25d.sim import Simulation
     save = F.save_fd_outputs
     monkeypatch.setattr(F, 'save_fd_outputs', lambda *a, **kw: save(*a, n_phase=4, **kw))     # 4 frames, not 24
+    calls, currents = [], Simulation.currents
+    monkeypatch.setattr(Simulation, 'currents', lambda self, f, E: (calls.append(f), currents(self, f, E))[1])
     base, out = boards['lowpass'], tmp_path / 'out'
     code, so, err = run_cli(base + '.kicad_pcb', '--pos', base + '-top.pos', '--solvers', 'mom', '--mom-dmax', '1.6',
                             '--mom-solves', '6', '--points', '21', '--mom-dump', '2,5', '--dump-animate', 'gif',
@@ -84,6 +88,8 @@ def test_current_dumps(boards, run_cli, tmp_path, monkeypatch):
     assert np.abs(J).max() > 0 and np.all(J[..., 2] == 0)                # in-plane currents only
     sm = json.loads((out / 'lowpass_run.json').read_text())
     assert any(d['label'].startswith('mom25d dump_J_F_Cu_fd') for d in sm['dumps'])
+    mom = sm['solved']['mom25d']
+    assert {2.0, 5.0} <= set(mom['samples_ghz']) and len(calls) == mom['solves'], (calls, mom['solves'])
 
 
 def test_antenna_mode(run_cli, tmp_path):

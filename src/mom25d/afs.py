@@ -68,7 +68,7 @@ def aaa(z, F, tol=1e-10, mmax=80):
     return r
 
 
-def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001, log=print, on_step=None):
+def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001, log=print, on_step=None, seed=()):
     """
     solve(f) -> S (P x P).  Returns (f_grid, S_grid (ngrid, P, P), f_samples, S_samples, history): one dict per
     model after the first, solves (samples so far), change (max |dS| from the previous model, on the grid) at
@@ -76,7 +76,8 @@ def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001,
     frequency solved, None when the sweep stopped). on_step(entry): called with each entry as it is made.
     Converged when, twice in a row, the models from the last two iterations agree to `tol` (max |dS|) on the
     grid and the model predicted the newest sample to `tol` before it was solved. (The model change alone can
-    be zero while the model is still wrong: a sparse fit that the new sample does not alter.)
+    be zero while the model is still wrong: a sparse fit that the new sample does not alter.) seed: frequencies
+    (Hz) solved among the first samples, besides the n0 spread over the band (those inside it).
     """
     def checked(f):
         S = solve(f)
@@ -90,7 +91,7 @@ def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001,
         i = int(np.argmax(np.diff(fsort)))
         return fsort[i] + (fsort[i + 1] - fsort[i]) / 2
 
-    fs = list(np.linspace(fmin, fmax, n0))
+    fs = sorted(set(np.linspace(fmin, fmax, n0).tolist()) | {float(f) for f in seed if fmin <= f <= fmax})
     Ss = [checked(f) for f in fs]
     P, grid, sc = Ss[0].shape[0], np.linspace(fmin, fmax, ngrid), 1e9
     prev, hist, ok, pred_err = None, [], 0, np.inf

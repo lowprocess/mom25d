@@ -65,12 +65,13 @@ def _via_sides(v, words):
 
 def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, log=print, progress=None,
           hold=None, tiled='auto', on_step=None, core='auto', quads=False, zone=None,
-          signal_vias='round', stitching_vias='auto', lines=None):
+          signal_vias='round', stitching_vias='auto', lines=None, keep_at=()):
     """S-parameters of the board m on `freq` (Hz) from mom25d, as kicad2ems reports them: (S (nf, n, n) in
     m.user_ports order with differential pairs as (d, c) modes, names, reference impedances, info dict).
     dmax in mm (planes 3x, refined near the copper of other layers). sigma (S/m): conductor loss, as --sigma
     gives openEMS (default: lossless copper, like openEMS's PEC sheets). progress(solves, at most, f). hold: a
-    dict that receives mom25d's result as 'res' (its model and simulation, for the current dumps)."""
+    dict that receives mom25d's result as 'res' (its model and simulation, for the current dumps). keep_at:
+    frequencies (Hz) the sweep solves and keeps the currents of (sim.kept: the current dumps')."""
     from mom25d.api import solve_board
     from kicad2ems.api.solver import mixed_mode
     kind = 'via' if port == 'lumped' else port
@@ -81,7 +82,7 @@ def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, log=print, 
     kw = dict(dmax=dmax * 1e-3, port=kind, metal=metal, max_solves=max_solves,
               log=lambda t: log(f"  mom25d:{t}") if 'AFS' in t else None,
               progress=progress, tiled=tiled, on_step=on_step, core=core, quads=quads, zone=zone,
-              signal_vias=signal_vias, stitching_vias=stitching_vias, lines=lines)
+              signal_vias=signal_vias, stitching_vias=stitching_vias, lines=lines, keep_at=keep_at)
     try:
         res = solve_board(m.to_dict(), freq, pairs=pairs, **kw)
     except ValueError as e:
@@ -346,7 +347,7 @@ class MoM25D(Solver):
                                      core=s.mom_core, quads={'off': False, 'on': True}.get(s.mom_quads, s.mom_quads),
                                      zone='auto' if s.mom_zone == 'on' else None,
                                      signal_vias=s.mom_signal_vias, stitching_vias=s.mom_stitching_vias,
-                                     lines=s.mom_lines,
+                                     lines=s.mom_lines, keep_at=[f * 1e9 for f in s.mom_dump or []],
                                      progress=lambda k, n, f: (run.status('mom25d', dict(fraction=k / n, solves=k,
                                                                                          f_ghz=f / 1e9)), stop.check()),
                                      on_step=lambda h: run.status('mom25d', dict(afs_solves=h['solves'],
@@ -385,11 +386,12 @@ class MoM25D(Solver):
         names = [p.name for p in sim.ports]
         n = len(names)
         grid = phased.parse_grid(s.grid, names)
+        pos = {p.name: (float(p.c[0]), float(p.c[1])) for p in m.ports}   # the ports' places (model mm): --aim
         if s.drive:
             a, grid = phased.settings_drive(s.drive, names, s.grid, s.steer, s.taper)
         else:
-            if s.steer or s.taper:
-                run.log("note: --steer and --taper need --drive (the ports to drive): ignored")
+            if s.steer or s.taper or s.aim:
+                run.log("note: --steer, --taper and --aim need --drive (the ports to drive): ignored")
             want = [x.strip() for x in (s.excite.split(',') if isinstance(s.excite, str) else s.excite or [])]
             a = np.eye(n, dtype=complex)[next((j for j, nm in enumerate(names) if nm in want), 0)]
         driven = [j for j in range(n) if abs(a[j]) > 0]
@@ -399,6 +401,11 @@ class MoM25D(Solver):
         s11 = Sa[:, k] / a[k]                                              # the active reflection of the first
         match = match_summary(run.freq, s11, m.ports[k].z0)
         f_pat = float(s.ff_freq[0]) * 1e9 if s.ff_freq else match['f_res']
+        if s.drive and s.aim:                                              # phases for the pattern frequency
+            a = phased.aim(a, names, pos, s.aim[0], s.aim[1], f_pat)
+            Sa = result.S @ a
+            s11 = Sa[:, k] / a[k]
+            match = match_summary(run.freq, s11, m.ports[k].z0)
         ffr = np.unique(np.concatenate([np.linspace(run.fmin, run.fmax, ANT_FREQS), [f_pat]]))
         th, ph = np.arange(0, 181, 5.0), np.arange(0, 361, 5.0)
         up = th <= 90
@@ -417,7 +424,8 @@ class MoM25D(Solver):
             if i == ip:
                 I_pat = I
         data = dict(theta=th[up], phi=ph, theta_sphere=th, freq=ffr, ports=names, zc=zc, Y=np.array(Ys),
-                    Eth=np.array(Eth), Eph=np.array(Eph), drive=a, f_pattern=float(ffr[ip]))
+                    Eth=np.array(Eth), Eph=np.array(Eph), drive=a, f_pattern=float(ffr[ip]),
+                    pos=np.array([pos.get(nm, (np.nan, np.nan)) for nm in names]))
         comb = phased.combine(data, a)
         rows, sph = comb['rows'], comb['sphere']
         dmax, pacc = sph['dmax'], [r['Pacc'] for r in rows]
@@ -457,10 +465,12 @@ class MoM25D(Solver):
             ant['drive'] = phased.format_drive(a, names)
             if grid:
                 ant['grid'] = phased.format_grid(grid, names)             # the GUI's steering starts with it
-            if s.drive and (s.taper or s.steer):                         # the GUI's Reset: these settings again
+            if s.drive and (s.taper or s.steer or s.aim):                # the GUI's Reset: these settings again
                 ant['drive_base'] = phased.format_drive(phased.parse_drive(s.drive, names), names)
                 ant['taper'] = s.taper or 'uniform'
                 ant['steer'] = [float(x) for x in (list(s.steer or []) + [0.0, 0.0])[:2]]
+                if s.aim:
+                    ant['aim'] = [float(x) for x in s.aim]
             ant['peak'] = comb['peak']
             ant['active_db'] = {names[j]: float(20 * np.log10(max(abs(comb['active'][ip][j]), 1e-15)))
                                 for j in driven}
@@ -531,7 +541,8 @@ def current_dumps(run, res, freqs, ports=None, near=(), tag='mom25d', currents=N
     lay = {k: l for l, k in model.iface.items()}
     layers = [k for k, idx in sorted(sim.tri_idx.items()) if len(idx) and k in lay]
     nodes = sim.rwg.nodes[:, :2] * 1e3
-    currents = currents or (lambda f: sim.currents(f, sim.excitation()))
+    kept = getattr(sim, 'kept', None) or {}                               # solved by the sweep at these: no solve
+    currents = currents or (lambda f: kept[f] if f in kept else sim.currents(f, sim.excitation()))
     I_f = [(stop.check(), currents(f))[1] for f in freqs]
     step = max(run.s.mom_dmax / 3, 0.02)
     ztop = float(model._zk[-1])
