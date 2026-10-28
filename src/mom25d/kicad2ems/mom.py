@@ -154,7 +154,7 @@ def _solid_ground(m):
 
 
 class MoM25D(Solver):
-    api = (1, 0)                    # kicad2ems.api
+    api = (2, 0)                    # kicad2ems.api
     name, aliases, label = 'mom25d', ('mom',), 'mom25d (MoM)'
     consumes, previewed, rank, order = 'board', False, 1, 20     # order: after openEMS in kicad2ems's lists
     capabilities = dict(ports='yes: lumped, or de-embedded wave ports on a long enough feed', gap_ports='no',

@@ -30,7 +30,7 @@ core = ["pybind11>=2.10"]          # python -m mom25d.core.build: the C++ / Open
 gpu-cuda12 = ["cupy-cuda12x>=14"]   # NVIDIA, CUDA 12.x driver
 gpu-cuda13 = ["cupy-cuda13x>=14"]   # NVIDIA, CUDA 13.x driver
 gpu-rocm7 = ["cupy-rocm-7-0>=14"]   # AMD, ROCm 7.0
-kicad2ems = ["kicad2ems>=261027"]  # the kicad2ems solver plugins (mom25d.kicad2ems): kicad2ems installs mom25d
+kicad2ems = ["kicad2ems>=261028"]  # the kicad2ems solver plugins (mom25d.kicad2ems): kicad2ems installs mom25d
                                    # through its own mom extra, so this is rarely needed
 test = ["pytest>=7"]
 
