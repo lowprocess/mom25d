@@ -102,25 +102,26 @@ class Table1D:
 
 # ---- TM network voltages for all source interfaces --------------------------
 class TMNetwork:
-    """V[s][i](kr): TM voltage at interface i (0..N) for a unit shunt current source at interface s."""
+    """V[s][i](kr): TM voltage at interface i (0..N) for a unit shunt current source at interface s (any interface
+    but a PEC plane of the stack: with bottom='open', interface 0 too)."""
     def __init__(self, stack, kr, w):
         self.st, self.kr, self.w, N = stack, kr, w, stack.N
         Y0, tn, sc, Yd, Yu = stack._network(kr, w, 'e')
         self.k2 = [None] + [(w / C0) ** 2 * stack.eps(j) for j in range(1, N + 1)]
         self.kz2 = [None] + [k2 - kr ** 2 for k2 in self.k2[1:]]
         self.V = {}
-        for s in range(1, N + 1) if stack.top == 'open' else range(1, N):
+        for s in stack.metal_interfaces:                # a source on every interface that is not a PEC plane
             v = [None] * (N + 1)
             v[s] = 1.0 / (Yu[s] + Yd[s])
             for k in range(s + 1, N + 1):
-                v[k] = np.zeros_like(kr) if stack.top == 'pec' and k == N else \
-                    v[k - 1] * sc[k] / (1 + 1j * (Yu[k] / Y0[k]) * tn[k])
+                v[k] = np.zeros_like(kr) if stack.is_pec(k) else v[k - 1] * sc[k] / (1 + 1j * (Yu[k] / Y0[k]) * tn[k])
             for k in range(s, 0, -1):
-                v[k - 1] = np.zeros_like(kr) if k - 1 == 0 else v[k] * sc[k] / (1 + 1j * (Yd[k - 1] / Y0[k]) * tn[k])
+                v[k - 1] = np.zeros_like(kr) if stack.is_pec(k - 1) else \
+                    v[k] * sc[k] / (1 + 1j * (Yd[k - 1] / Y0[k]) * tn[k])
             self.V[s] = v
 
     def is_pec(self, k):
-        return k == 0 or (self.st.top == 'pec' and k == self.st.N)
+        return self.st.is_pec(k)
 
     def dV(self, i, s):
         """V(z_i|z_s) - V(z_{i-1}|z_s); zero for a PEC source interface."""

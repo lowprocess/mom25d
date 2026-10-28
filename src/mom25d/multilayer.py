@@ -2,7 +2,9 @@
 mom25d.multilayer - multilayer stackups for the 2.5D planar MoM solver (sim.Simulation):
 
   * Arbitrary stack of dielectric layers above a PEC ground, open (air) or PEC top cover
-    (microstrip, embedded microstrip, stripline, offset/broadside stripline ...)
+    (microstrip, embedded microstrip, stripline, offset/broadside stripline ...); or the whole stack
+    with a half-space below too (bottom='open'): no infinite ground, metal on interface 0 as well
+    (a board's every copper layer, its planes meshed, radiation above and below)
   * Layered-media Green's functions from a transmission-line network in the spectral domain,
     for source and observation on the same or different interfaces (MPIE "formulation C",
     exact for horizontal currents):
@@ -63,14 +65,17 @@ class Layer:
 
 class LayerStack:
     """
-    Dielectric layers listed bottom -> top above a PEC ground at z = 0.
+    Dielectric layers listed bottom -> top, interface 0 at z = 0 their bottom surface.
     Interface k (k = 1..N) is the top surface of layer k.
     top='open': half-space of permittivity top_er above layer N (metal allowed on 1..N)
     top='pec' : PEC cover on interface N (metal allowed on 1..N-1)  -> stripline-type stacks
+    bottom='pec' : a PEC ground at z = 0 (interface 0 is the ground; the default)
+    bottom='open': a half-space of permittivity bottom_er below layer 1, metal allowed on interface 0 too
     """
-    def __init__(self, layers, top='open', top_er=1.0):
-        assert top in ('open', 'pec')
+    def __init__(self, layers, top='open', top_er=1.0, bottom='pec', bottom_er=1.0):
+        assert top in ('open', 'pec') and bottom in ('open', 'pec')
         self.layers, self.top, self.top_er = list(layers), top, top_er
+        self.bottom, self.bottom_er = bottom, bottom_er
         self.N = len(self.layers)
         self.z = np.concatenate([[0.0], np.cumsum([l.h for l in self.layers])])
         for i, l in enumerate(self.layers):
@@ -79,14 +84,21 @@ class LayerStack:
 
     @property
     def metal_interfaces(self):
-        return list(range(1, self.N + 1 if self.top == 'open' else self.N))
+        return list(range(0 if self.bottom == 'open' else 1, self.N + 1 if self.top == 'open' else self.N))
+
+    def is_pec(self, k):
+        """Interface k is a PEC plane of the stack itself (the ground, a cover), not meshed metal."""
+        return (k == 0 and self.bottom == 'pec') or (k == self.N and self.top == 'pec')
 
     @property
     def hmin(self):
         return min(l.h for l in self.layers)
 
     def eps(self, j):
-        return self.layers[j - 1].er_c if 1 <= j <= self.N else complex(self.top_er)
+        """Permittivity of layer j (1..N); j = 0 the half-space below, j = N + 1 the one above."""
+        if 1 <= j <= self.N:
+            return self.layers[j - 1].er_c
+        return complex(self.bottom_er if j <= 0 else self.top_er)
 
     def eps_sum(self, k):
         """permittivity below + above interface k (sets the 1/rho singular coefficient)."""
@@ -94,14 +106,15 @@ class LayerStack:
 
     def nearest_discontinuity(self, k):
         """Distance from interface k to the closest interface with a permittivity step, or a ground."""
-        down = next((self.z[k] - self.z[j] for j in range(k - 1, -1, -1) if j == 0 or self.eps(j) != self.eps(j + 1)),
-                    np.inf)
+        down = next((self.z[k] - self.z[j] for j in range(k - 1, -1, -1)
+                     if (j == 0 and self.bottom == 'pec') or self.eps(j) != self.eps(j + 1)), np.inf)
         up = next((self.z[j] - self.z[k] for j in range(k + 1, self.N + 1)
                    if (self.top == 'pec' and j == self.N) or self.eps(j) != self.eps(j + 1)), np.inf)
         return min(down, up)
 
     def max_er(self):
-        return max([abs(l.er_c) for l in self.layers] + ([abs(self.top_er)] if self.top == 'open' else []))
+        return max([abs(l.er_c) for l in self.layers] + ([abs(self.top_er)] if self.top == 'open' else []) +
+                   ([abs(self.bottom_er)] if self.bottom == 'open' else []))
 
     def _network(self, kr, w, mode):
         k0, N = w / C0, self.N
@@ -116,21 +129,26 @@ class LayerStack:
             E = np.exp(-2j * th)                    # tan and sec of th, overflow-free for Im(th) <= 0
             tn[j], sc[j] = -1j * (1 - E) / (1 + E), 2 * np.exp(-1j * th) / (1 + E)
         Yd = [None] * (N + 1)                       # looking down from interface k
-        Yd[1] = -1j * Y0[1] / tn[1]                 # shorted by the ground plane
-        for k in range(2, N + 1):
+        if self.bottom == 'pec':
+            Yd[1], kfirst = -1j * Y0[1] / tn[1], 2  # shorted by the ground plane
+        else:
+            Yd[0], kfirst = y0(complex(self.bottom_er))[0], 1     # the half-space below
+        for k in range(kfirst, N + 1):
             Yd[k] = Y0[k] * (Yd[k - 1] + 1j * Y0[k] * tn[k]) / (Y0[k] + 1j * Yd[k - 1] * tn[k])
         Yu = [None] * (N + 1)                       # looking up from interface k
         if self.top == 'open':
             Yu[N], kstart = y0(complex(self.top_er))[0], N
         else:
             Yu[N - 1], kstart = -1j * Y0[N] / tn[N], N - 1      # shorted by the top cover
-        for k in range(kstart, 1, -1):
+        for k in range(kstart, 0 if self.bottom == 'open' else 1, -1):
             Yu[k - 1] = Y0[k] * (Yu[k] + 1j * Y0[k] * tn[k]) / (Y0[k] + 1j * Yu[k] * tn[k])
         return Y0, tn, sc, Yd, Yu
 
     def voltage(self, kr, w, o, s, mode):
         """Voltage at interface o for a unit shunt current source at interface s, in the TM ('e') or TE ('h')
-        transmission-line network of the stack."""
+        transmission-line network of the stack. Zero at a PEC interface (either end)."""
+        if self.is_pec(o) or self.is_pec(s):
+            return np.zeros_like(np.asarray(kr, complex))
         Y0, tn, sc, Yd, Yu = self._network(kr, w, mode)
         v = 1.0 / (Yu[s] + Yd[s])
         for k in range(s + 1, o + 1):               # up through layer k, load Yu[k]

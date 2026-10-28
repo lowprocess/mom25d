@@ -8,7 +8,7 @@ shapes  : {interface: [rect (x0,y0,x1,y1) | shapely Polygon/MultiPolygon, ...]}
 ports   : LinePort (wave port, de-embedded to a reference plane, any direction)
           GapPort  (lumped port across a strip, reference plane at the gap)
           ViaPort  (lumped port in a via, e.g. pad-to-ground)
-vias    : Via(x, y, k_bot, k_top, radius)   k = 0 is the bottom ground, k = N a PEC cover
+vias    : Via(x, y, k_bot, k_top, radius)   k = 0 the bottom ground (an open bottom: metal there), k = N a PEC cover
 lumped  : SeriesLumped (element across a strip); Via(..., Z=...) puts an element inside a via
 metal   : Metal(sigma, t) -> surface impedance on strips, wall loss on vias (optional)
 
@@ -128,11 +128,12 @@ class GapPort:
 
 
 class ViaPort:
-    """Lumped port inside a via (EMF in its lowest chain, + toward the top)."""
+    """Lumped port inside a via (EMF in its lowest chain, + toward the top; sign=-1: + toward the bottom, a port
+    whose reference plane is above it, so the signal is + against its reference either way)."""
     kind = 'via'
 
-    def __init__(self, via, z0=50.0, name=''):
-        self.via, self.zc, self.name, self.layer = via, z0, name, None
+    def __init__(self, via, z0=50.0, name='', sign=1):
+        self.via, self.zc, self.name, self.layer, self.sign = via, z0, name, None, float(sign)
 
 
 class DiffPort:
@@ -296,7 +297,7 @@ class Simulation:
         for v in self.vias:
             on = lambda k: k in geoms and geoms[k].buffer(1e-9).contains(shapely.Point(v.x, v.y))
             for k in (v.k_bot, v.k_top):
-                assert k == 0 or (stack.top == 'pec' and k == stack.N) or on(k), \
+                assert stack.is_pec(k) or on(k), \
                     f"via {v.name} ends on M{k} where there is no metal"
             att = [v.k_bot] + [k for k in range(v.k_bot + 1, v.k_top) if on(k)] + [v.k_top]
             self.via_attach.append([k for k in att if k in geoms])
@@ -675,7 +676,7 @@ class Simulation:
         E = np.zeros((self.Ne + self.Nv, len(self.ports)), complex)
         for j, p in enumerate(self.ports):
             if isinstance(p, ViaPort):
-                E[self.Ne + self._port_chain(p), j] = 1.0
+                E[self.Ne + self._port_chain(p), j] = p.sign
             else:
                 idx, sig = self.gap[j]
                 E[idx, j] = sig * self.rwg.l[idx]
@@ -684,7 +685,7 @@ class Simulation:
     def port_current(self, I, j):
         p = self.ports[j]
         if isinstance(p, ViaPort):
-            return I[self.Ne + self._port_chain(p)]
+            return p.sign * I[self.Ne + self._port_chain(p)]
         idx, sig = self.gap[j]
         return ((sig * self.rwg.l[idx])[:, None] * I[idx]).sum(0)
 

@@ -419,3 +419,103 @@ def test_line_functions_on_a_straight_run():
     qi = s1.quad_info
     assert qi['runs'] == 1 and qi['functions'] < qi['edges_replaced'] / 6
     assert np.abs(S1 - S0).max() < 0.003
+
+
+# ---- the whole stack (LayerStack bottom='open'): no infinite ground, metal on interface 0 ---------------------
+def test_open_bottom_network_is_free_space_in_a_homogeneous_stack():
+    """With air in every layer and both half-spaces, the TM and TE line voltages between any two interfaces
+    (interface 0 included) are free space's, e^{-j kz |z - z'|} / (2 Y0); the PEC bottom keeps zero there."""
+    st = LayerStack([Layer(0.3e-3, 1.0), Layer(0.5e-3, 1.0), Layer(0.2e-3, 1.0)], bottom='open')
+    assert st.metal_interfaces == [0, 1, 2, 3] and not st.is_pec(0)
+    f = 5e9
+    w, k0 = 2 * np.pi * f, 2 * np.pi * f / C0
+    kr = np.array([0.3, 0.9, 1.5, 4, 30]) * k0 + 1e-3j * k0
+    kz = -1j * np.sqrt(kr ** 2 - k0 ** 2)
+    for mode, Y0 in (('e', w * EPS0 / kz), ('h', kz / (w * MU0))):
+        for o in range(4):
+            for s in range(4):
+                ex = np.exp(-1j * kz * abs(st.z[o] - st.z[s])) / (2 * Y0)
+                assert np.allclose(st.voltage(kr, w, o, s, mode), ex, rtol=1e-12)
+    pec = LayerStack([Layer(0.3e-3, 1.0)])
+    assert pec.metal_interfaces == [1] and pec.is_pec(0) and not np.any(pec.voltage(kr, w, 0, 1, 'e'))
+
+
+def _line_sims(m, bottom_open=True, flip=False, layers=None):
+    """A 10 mm microstrip with via ports at both ends: over the PEC ground, or with an open bottom and a ground
+    plane margin m round it meshed on interface 0; flip: the same board upside down (the strip on interface 0)."""
+    from shapely.geometry import box, Point
+    w, h, L = 0.35e-3, 0.2e-3, 10e-3
+    layers = layers or [Layer(h, 4.3)]
+    strip = [box(-L / 2, -w / 2, L / 2, w / 2), Point(-L / 2, 0).buffer(0.25e-3), Point(L / 2, 0).buffer(0.25e-3)]
+    if not bottom_open:
+        st = LayerStack(layers)
+        return Simulation(st, {st.N: strip}, [ViaPort(Via(x, 0, 0, st.N, 0.1e-3), 54.0) for x in (-L / 2, L / 2)],
+                          dmax=0.3e-3, w_ref=w, verbose=False)
+    st = LayerStack(list(reversed(layers)) if flip else layers, bottom='open')
+    plane = [box(-L / 2 - m, -m, L / 2 + m, m)]
+    shapes = {0: strip, st.N: plane} if flip else {0: plane, st.N: strip}
+    return Simulation(st, shapes, [ViaPort(Via(x, 0, 0, st.N, 0.1e-3), 54.0) for x in (-L / 2, L / 2)],
+                      dmax=0.3e-3, dmax_layer={st.N if flip else 0: 0.3e-3}, w_ref=w, verbose=False)
+
+
+def test_a_meshed_ground_converges_to_the_infinite_one():
+    """The same line over its ground plane meshed on interface 0 (open bottom): reciprocal, and as the plane
+    widens S21 comes to the infinite ground's (the plane's mesh sets how close S11 at -33 dB gets)."""
+    ref = _line_sims(0, bottom_open=False).sparams(2e9)
+    err = []
+    for m in (0.5e-3, 2e-3):
+        S = _line_sims(m).sparams(2e9)
+        assert abs(S[0, 1] - S[1, 0]) < 1e-10
+        err.append(abs(S[1, 0] - ref[1, 0]))
+    assert err[1] < 0.15 * err[0] and err[1] < 2e-3, err
+    assert abs(S[0, 0] - ref[0, 0]) < 6e-3
+
+
+def test_upside_down_board_is_the_same_board():
+    """A strip on interface 0 under its plane (B.Cu microstrip) gives what the strip on top over the plane gives
+    (F.Cu): one layer, and two layers of different permittivity reversed."""
+    for layers in ([Layer(0.2e-3, 4.3)], [Layer(0.1e-3, 3.0), Layer(0.1e-3, 6.0)]):
+        top = _line_sims(1e-3, layers=layers).sparams(2e9)
+        bot = _line_sims(1e-3, flip=True, layers=layers).sparams(2e9)
+        assert np.abs(np.abs(top) - np.abs(bot)).max() < 3e-4
+
+
+def _point_sim(st, k, Jx, chains=(), Iv=()):
+    """A stand-in sim: one 1 mm^2 triangle of current density Jx on interface k, and via chains with currents Iv."""
+    from types import SimpleNamespace as NS
+    return (NS(st=st, rwg=NS(cent=np.array([[0.0, 0.0, st.z[k]]]), area=np.array([1e-6])), tri_idx={k: np.array([0])},
+               current_density=lambda I: (np.array([Jx + 0j]), np.array([0j])), chains=list(chains), Ne=1),
+            np.array([0] + list(Iv), complex))
+
+
+def test_far_field_both_half_spaces_and_vias():
+    """far_field against free-space dipoles: in a homogeneous whole space (open bottom) an x element and a via
+    radiate their free-space patterns above and below the board, with the right sign and phase between them
+    (E ~ (theta_hat . p) e^{j k r_hat . r'}); a via over the PEC ground radiates with its image, nothing below."""
+    from types import SimpleNamespace as NS
+    from mom25d.farfield import far_field
+    eta, f = np.sqrt(MU0 / EPS0), 3e9
+    k0 = 2 * np.pi * f / C0
+    H = 0.05 * C0 / f
+    th, ph = np.array([10.0, 30, 60, 85, 95, 120, 150, 170]), np.array([0.0, 45, 90, 200])
+    T, P = np.meshgrid(np.radians(th), np.radians(ph))
+    st = LayerStack([Layer(H, 1.0), Layer(H, 1.0)], bottom='open')
+    Et, Ep = far_field(*_point_sim(st, 1, 1.0)[:1], _point_sim(st, 1, 1.0)[1], f, th, ph)
+    amp = eta * k0 * 1e-6 / (4 * np.pi)
+    assert np.allclose(np.abs(Et), amp * np.abs(np.cos(T) * np.cos(P)), atol=1e-6 * amp)
+    assert np.allclose(np.abs(Ep), amp * np.abs(np.sin(P)), atol=1e-6 * amp)
+    via = NS(x=0.0, y=0.0)
+    sim, I = _point_sim(st, 1, 0.0, chains=[(via, 1, 2)], Iv=[1.0])
+    Ev, Epv = far_field(sim, I, f, th, ph)
+    sinc = np.sinc(k0 * H * np.cos(T) / (2 * np.pi))
+    assert np.allclose(np.abs(Ev), eta * k0 * H / (4 * np.pi) * np.sin(T) * np.abs(sinc), rtol=1e-6) and not Epv.any()
+    zx, zv = st.z[1], 0.5 * (st.z[1] + st.z[2])
+    want = (-np.sin(T) * H * np.exp(1j * k0 * np.cos(T) * zv) * sinc) / \
+        (np.cos(T) * np.cos(P) * 1e-6 * np.exp(1j * k0 * np.cos(T) * zx))
+    ok = np.abs(np.cos(P)) > 0.1
+    assert np.allclose(Ev[ok] / Et[ok], want[ok], rtol=1e-5)
+    sim, I = _point_sim(LayerStack([Layer(H, 1.0)]), 1, 0.0, chains=[(via, 0, 1)], Iv=[1.0])
+    Eg, _ = far_field(sim, I, f, th, ph)
+    up = T < np.pi / 2
+    ampg = eta * k0 * 2 * H / (4 * np.pi) * np.sin(T) * np.abs(np.sinc(k0 * 2 * H * np.cos(T) / (2 * np.pi)))
+    assert np.allclose(np.abs(Eg[up]), ampg[up], rtol=1e-6) and not Eg[~up].any()

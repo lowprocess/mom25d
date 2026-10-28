@@ -211,3 +211,55 @@ def test_mixed_connect_cascades_lines():
     S[:2, :2], S[2:, 2:] = A, B
     out = connect(S, [(1, 2)], [C])
     assert np.allclose(out, line_S(g, zc, 15e-3, z0), atol=1e-12)
+
+
+def test_whole_stack_ports_below_the_ground(run_cli, tmp_path):
+    """--mom-stack whole on rf_msvia (F.Cu microstrip through a via to B.Cu, two inner planes): the B.Cu port that
+    no ground plane allows, lumped ports to the nearest plane, and S21 as gfdtd gives it (-0.38 dB at 5 GHz);
+    with the board's own ground (the default) that port cannot be."""
+    pytest.importorskip('triangle')
+    import subprocess, sys
+    from mom25d.board import BoardModel
+    ex = os.path.join(os.path.dirname(FILTER), 'make_rf_examples.py')
+    subprocess.check_call([sys.executable, ex, 'msvia', str(tmp_path / 'rf_msvia')], stdout=subprocess.DEVNULL)
+    cfg = os.path.join(os.path.dirname(FILTER), 'rf_msvia.toml')
+    toml = (tmp_path / 'msvia.toml')
+    toml.write_text(open(cfg).read().replace('rf_msvia.kicad_pcb', str(tmp_path / 'rf_msvia.kicad_pcb')))
+    out = tmp_path / 'out'
+    code, so, err = run_cli(toml, '--solvers', 'mom25d', '--mom-stack', 'whole', '--mom-dmax', '0.8', '--out', out,
+                            '--no-report')
+    assert code == 0, so + err
+    assert 'whole stack: no infinite ground' in so and 'P2 (lumped)' in so
+    from kicad2ems.touchstone import read_touchstone
+    f, S = read_touchstone(str(out / 'rf_msvia_mom25d.s2p'))
+    i = int(np.argmin(np.abs(f - 5e9)))
+    assert abs(20 * np.log10(abs(S[i, 1, 0])) + 0.38) < 0.15
+    board = json.loads((out / 'rf_msvia_board.json').read_text())
+    with pytest.raises(ValueError, match='B.Cu is not a metal interface above the ground In2.Cu'):
+        BoardModel(board, port='via', log=lambda *a: None)
+    m = BoardModel(board, ground='none', port='via', log=lambda *a: None)
+    assert m.whole and m.stack.bottom == 'open' and [(s['k'], s['kref']) for s in m.port_specs] == [(3, 2), (0, 1)]
+
+
+def test_whole_stack_antenna_radiates_behind_its_ground(run_cli, tmp_path):
+    """The patch over its own 80 mm ground meshed (--mom-stack whole): a back lobe (gfdtd, the finite board: -13
+    dBi), which the infinite ground cannot have, and gain near gfdtd's 3.1 dBi (the infinite ground's 1.9). No
+    ground named is the board's own ground, not the whole stack (ground=None once read as 'none')."""
+    pytest.importorskip('triangle')
+    import subprocess, sys
+    ex = os.path.join(os.path.dirname(FILTER), 'make_antennas.py')
+    subprocess.check_call([sys.executable, ex, 'patch', str(tmp_path / 'patch')], stdout=subprocess.DEVNULL)
+    out = tmp_path / 'out'
+    code, so, err = run_cli(tmp_path / 'patch.kicad_pcb', '--mode', 'antenna', '--fmin', '2.3', '--fmax', '2.6',
+                            '--points', '61', '--solvers', 'mom', '--mom-dmax', '2', '--mom-solves', '12',
+                            '--mom-stack', 'whole', '--out', out, '--no-report')
+    assert code == 0, so + err
+    res = json.loads((out / 'patch_mom25d_antenna.json').read_text())
+    c = res['cuts']['xz (phi = 0)']
+    a, g = np.array(c['angle']), np.array(c['gain_dbi'])
+    assert -25 < g[np.abs(np.abs(a) - 180) < 1.5].max() < -10                     # behind the board
+    row = min(res['rows'], key=lambda r: abs(r['f'] - res['f_pattern']))
+    assert 2.4 < row['G_dbi'] < 3.6 and 'whole stack' in res['model']
+    from mom25d.board import BoardModel
+    board = json.loads((out / 'patch_board.json').read_text())
+    assert not BoardModel(board, log=lambda *a: None).whole and BoardModel(board, ground='none', log=lambda *a: None).whole

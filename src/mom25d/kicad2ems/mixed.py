@@ -331,6 +331,13 @@ class Mixed(MoM25D):
                gui='Shortest stretch cut out (mm)', group=G, cli=dict(metavar='MM')),
     ]
 
+    def assess(self, run):
+        out = super().assess(run)
+        if run.s.mom_stack == 'whole':                              # its lines are cut against the ground plane
+            out.append("mom_stack = whole: mixed cuts its lines over the infinite ground (mom25d models the whole "
+                       "stack)")
+        return out
+
     def solve(self, run, prep):
         s = run.s
         self._held = {}

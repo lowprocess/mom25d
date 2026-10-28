@@ -65,13 +65,14 @@ def _via_sides(v, words):
 
 def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, log=print, progress=None,
           hold=None, tiled='auto', on_step=None, core='auto', quads=False, zone=None,
-          signal_vias='round', stitching_vias='auto', lines=None, keep_at=()):
+          signal_vias='round', stitching_vias='auto', lines=None, keep_at=(), stack='ground'):
     """S-parameters of the board m on `freq` (Hz) from mom25d, as kicad2ems reports them: (S (nf, n, n) in
     m.user_ports order with differential pairs as (d, c) modes, names, reference impedances, info dict).
     dmax in mm (planes 3x, refined near the copper of other layers). sigma (S/m): conductor loss, as --sigma
     gives openEMS (default: lossless copper, like openEMS's PEC sheets). progress(solves, at most, f). hold: a
     dict that receives mom25d's result as 'res' (its model and simulation, for the current dumps). keep_at:
-    frequencies (Hz) the sweep solves and keeps the currents of (sim.kept: the current dumps')."""
+    frequencies (Hz) the sweep solves and keeps the currents of (sim.kept: the current dumps'). stack: 'ground'
+    (an infinite ground plane) or 'whole' (every copper layer meshed, mom25d.board ground='none')."""
     from mom25d.api import solve_board
     from kicad2ems.api.solver import mixed_mode
     kind = 'via' if port == 'lumped' else port
@@ -82,7 +83,8 @@ def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, log=print, 
     kw = dict(dmax=dmax * 1e-3, port=kind, metal=metal, max_solves=max_solves,
               log=lambda t: log(f"  mom25d:{t}") if 'AFS' in t else None,
               progress=progress, tiled=tiled, on_step=on_step, core=core, quads=quads, zone=zone,
-              signal_vias=signal_vias, stitching_vias=stitching_vias, lines=lines, keep_at=keep_at)
+              signal_vias=signal_vias, stitching_vias=stitching_vias, lines=lines, keep_at=keep_at,
+              **(dict(ground='none') if stack == 'whole' else {}))
     try:
         res = solve_board(m.to_dict(), freq, pairs=pairs, **kw)
     except ValueError as e:
@@ -168,6 +170,11 @@ class MoM25D(Solver):
                "traces)", float, name='dmax', gui='Largest cell along the copper (mm)', group=G, cli=dict(metavar='MM')),
         Option('mom_port', 'auto', "auto (default): de-embedded wave ports where a straight feed allows, else lumped",
                choices=('auto', 'wave', 'lumped'), name='port', gui='Ports', group=G),
+        Option('mom_stack', 'ground', "the stack mom25d models: ground (default: an infinite plane at the ground "
+               "layer, its copper not meshed, the copper below it left out) or whole (every copper layer meshed, the "
+               "planes too, air above and below: ports and copper on any layer, radiation below the board and a "
+               "finite ground in antenna mode; lumped ports; more unknowns)", choices=('ground', 'whole'),
+               name='stack', gui='MoM stack', group=G),
         Option('mom_quads', 'off', "experimental: merge near-rectangular triangle pairs into quad cells, a "
                "constant-divergence subspace with fewer unknowns and a cheaper LU (docs/mom.md#quads): off (default), "
                "on (wherever they pair up) or centre (only in the middle of signal lines, away from the copper edges)",
@@ -236,8 +243,9 @@ class MoM25D(Solver):
         gaps = [p.name for p in m.ports if p.kind == 'gap']
         if gaps:
             out.append(f"gap port(s) {', '.join(gaps)}: no planar equivalent")
-        if _solid_ground(m) is None:
-            out.append("no solid ground plane (no copper layer covers half the board): set ground = <layer>")
+        if run.s.mom_stack != 'whole' and _solid_ground(m) is None:
+            out.append("no solid ground plane (no copper layer covers half the board): set ground = <layer>, or "
+                       "mom_stack = whole")
         return out
 
     # ---- what it changes, and what it holds -------------------------------------------------------------
@@ -250,18 +258,20 @@ class MoM25D(Solver):
         from shapely.geometry import Point, box
         from shapely.ops import unary_union
         m, out = run.m, []
-        g = _solid_ground(m)
-        if g is None:
+        whole = run.s.mom_stack == 'whole'                           # every copper layer meshed: no ground plane
+        g = None if whole else _solid_ground(m)
+        if g is None and not whole:
             return out
-        zg = m.cu_z[g]
+        zg = min(m.cu_z.values()) if whole else m.cu_z[g]
         out.append(Deviation('outline', 'outline', 'ignored: laterally infinite dielectric'))
-        out.append(Deviation(f"copper:{g}", 'planes', 'the infinite ground plane (not meshed)', dropped=True))
-        out += [Deviation(f"copper:{l}", 'planes', 'below the ground: left out', dropped=True)
-                for l in m.copper if m.cu_z[l] < zg - 1e-9]
-        metal = {l: unary_union(m.copper[l]).buffer(1e-6) for l in m.copper if m.cu_z[l] > zg + 1e-9}
+        if not whole:
+            out.append(Deviation(f"copper:{g}", 'planes', 'the infinite ground plane (not meshed)', dropped=True))
+            out += [Deviation(f"copper:{l}", 'planes', 'below the ground: left out', dropped=True)
+                    for l in m.copper if m.cu_z[l] < zg - 1e-9]
+        metal = {l: unary_union(m.copper[l]).buffer(1e-6) for l in m.copper if whole or m.cu_z[l] > zg + 1e-9}
 
         def span(x, y, z0, z1):
-            zs = [zg] * (z0 - 1e-9 <= zg <= z1 + 1e-9) + [m.cu_z[l] for l, cu in metal.items()
+            zs = [zg] * (not whole and z0 - 1e-9 <= zg <= z1 + 1e-9) + [m.cu_z[l] for l, cu in metal.items()
                                                        if z0 - 1e-9 <= m.cu_z[l] <= z1 + 1e-9 and cu.contains(Point(x, y))]
             return (min(zs), max(zs)) if len(set(zs)) >= 2 else None
         for i, (x, y, r, z0, z1) in enumerate(m.vias):
@@ -325,7 +335,8 @@ class MoM25D(Solver):
         if run.s.preview and mom25d_status()[0]:                   # the mesh alone, for the 3D view
             from mom25d.board import BoardModel
             s = run.s
-            bm = BoardModel(run.m.to_dict(), port='via' if s.mom_port == 'lumped' else s.mom_port, log=lambda *a: None)
+            bm = BoardModel(run.m.to_dict(), port='via' if s.mom_port == 'lumped' else s.mom_port, log=lambda *a: None,
+                            **(dict(ground='none') if s.mom_stack == 'whole' else {}))
             dmax = s.mom_dmax * 1e-3
             planes = {k: 3 * dmax for k, gs in bm.shapes.items() if sum(g.area for g in gs) > 0.5 * bm.outline_area}
             sim = bm.simulation(dmax=dmax, dmax_layer=planes, fmin=run.fmin, fmax=run.fmax, characterize=False,
@@ -347,7 +358,7 @@ class MoM25D(Solver):
                                      core=s.mom_core, quads={'off': False, 'on': True}.get(s.mom_quads, s.mom_quads),
                                      zone='auto' if s.mom_zone == 'on' else None,
                                      signal_vias=s.mom_signal_vias, stitching_vias=s.mom_stitching_vias,
-                                     lines=s.mom_lines, keep_at=[f * 1e9 for f in s.mom_dump or []],
+                                     lines=s.mom_lines, keep_at=[f * 1e9 for f in s.mom_dump or []], stack=s.mom_stack,
                                      progress=lambda k, n, f: (run.status('mom25d', dict(fraction=k / n, solves=k,
                                                                                          f_ghz=f / 1e9)), stop.check()),
                                      on_step=lambda h: run.status('mom25d', dict(afs_solves=h['solves'],
@@ -408,7 +419,7 @@ class MoM25D(Solver):
             match = match_summary(run.freq, s11, m.ports[k].z0)
         ffr = np.unique(np.concatenate([np.linspace(run.fmin, run.fmax, ANT_FREQS), [f_pat]]))
         th, ph = np.arange(0, 181, 5.0), np.arange(0, 361, 5.0)
-        up = th <= 90
+        up = th <= 90 if sim.st.bottom == 'pec' else np.ones(len(th), bool)   # the whole stack radiates below too
         what = ', '.join(phased.format_drive(a, names)) if len(driven) > 1 else names[k]
         run.log(f"mom25d: antenna, {what} driven: far field of {n} port{'s' if n > 1 else ''} at {len(ffr)} "
                 f"frequencies")
@@ -438,7 +449,7 @@ class MoM25D(Solver):
             g = np.zeros(len(tc))
             for sign, sel in ((1, tc >= 0), (-1, tc < 0)):          # negative theta: the far side, phi + 180
                 ang = np.abs(tc[sel])
-                ok = ang <= 90
+                ok = ang <= (90 if sim.st.bottom == 'pec' else 180)
                 if ok.any():
                     Et, Ep = far_field(sim, I, ffr[ip], ang[ok], [phi0 if sign > 0 else phi0 + 180])
                     gg = np.zeros(sel.sum())
@@ -456,7 +467,8 @@ class MoM25D(Solver):
         ant = dict(match=match, rows=rows, f_pattern=float(ffr[ip]), cuts=cuts, port=names[k], solver='mom25d',
                    sphere=dict(theta=th, phi=ph, gain=((e_pat / e_pat.max()) ** 2 * dmax[ip] * eff).T),
                    sphere_file=os.path.basename(sph_file),
-                   model='infinite ground plane: no radiation below it, no board edge')
+                   model='infinite ground plane: no radiation below it, no board edge' if sim.st.bottom == 'pec' else
+                   'the whole stack: its planes meshed, radiation above and below; laterally infinite dielectric')
         if n > 1:                                                          # the per-port fields: the GUI steers
             arr_file = run.path('_mom25d_array.npz')
             phased.save(arr_file, **data)

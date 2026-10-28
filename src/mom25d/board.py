@@ -11,8 +11,12 @@ model: the canonical board kicad2ems gives every solver, read without kicad2ems.
 The board is in mm with y up; the model in metres. What a planar solver takes from it:
 
   ground   the board's ground layer, else the lowest copper layer covering half the outline: the solver's
-           infinite plane at z = 0 (its copper is not meshed); copper below it is left out (with a note)
-  stack    the dielectric layers above the ground, copper layers on their interfaces
+           infinite plane at z = 0 (its copper is not meshed); copper below it is left out (with a note).
+           ground='none': the whole stack instead, no infinite plane: every copper layer meshed (planes too),
+           the lowest on interface 0, air above and below (LayerStack bottom='open'), ports referenced to the
+           nearest plane under or over them
+  stack    the dielectric layers above the ground (whole stack: between the lowest and highest copper), copper
+           layers on their interfaces
   copper   per interface; the outline is not modelled: MoM's dielectrics are laterally infinite
   vias     between the interfaces they span that have metal at the via (the ground counts)
   walls    rows of vias every wall_pitch: a planar solver has no vertical sheets
@@ -69,8 +73,9 @@ class BoardModel(PlanarModel):
         copper = {l: [shape(p['polygon']) for p in ps] for l, ps in data.get('copper', {}).items()}
         outline = shape(data['outline'])
         self.outline_area = outline.area * MM * MM
-        # ---- the ground: z = 0 of the solver ----
-        name = ground or data.get('ground')
+        # ---- the ground: z = 0 of the solver (whole stack: the lowest copper layer, meshed) ----
+        self.whole = isinstance(ground, str) and ground.lower() == 'none'     # not None: the board's own ground
+        name = min(cu_z, key=cu_z.get) if self.whole else ground or data.get('ground')
         if name is None:
             solid = [l for l in sorted(cu_z, key=cu_z.get) if sum(p.area for p in copper.get(l, [])) >= 0.5 * outline.area]
             if not solid:
@@ -79,16 +84,22 @@ class BoardModel(PlanarModel):
             self.notes.append(f"ground: {name} (the lowest solid copper layer)")
         if name not in cu_z:
             raise ValueError(f"no copper layer {name!r} (layers: {', '.join(cu_z)})")
-        self.ground, zg = name, cu_z[name]
+        self.ground, zg = (None if self.whole else name), cu_z[name]
         # ---- the stack above it, copper on the interfaces ----
-        diels = sorted([l for l in st['layers'] if l['z0'] >= zg - 1e-9], key=lambda l: l['z0'])
-        self.stack = LayerStack([Layer((l['z1'] - l['z0']) * MM, l['er'], l['tand'], l['name']) for l in diels])
+        ztop = max(cu_z.values())
+        diels = sorted([l for l in st['layers'] if l['z0'] >= zg - 1e-9 and (not self.whole or l['z1'] <= ztop + 1e-9)],
+                       key=lambda l: l['z0'])
+        self.stack = LayerStack([Layer((l['z1'] - l['z0']) * MM, l['er'], l['tand'], l['name']) for l in diels],
+                                bottom='open' if self.whole else 'pec')
+        if self.whole:
+            self.notes.append(f"whole stack: no infinite ground, {len(cu_z)} copper layers meshed (planes too), "
+                              f"air above and below")
         zk = np.array([zg] + [l['z1'] for l in diels])                  # interface heights, mm
         self.iface, below = {}, []
         for lay, z in sorted(cu_z.items(), key=lambda kv: kv[1]):
             if z < zg - 1e-9:
                 below += [lay] if lay in copper else []
-            elif lay != name:
+            elif lay != name or self.whole:
                 k = int(np.argmin(np.abs(zk - z)))
                 if abs(zk[k] - z) > 1e-6:
                     self.notes.append(f"{lay} at z = {z:g} mm is not on a dielectric interface - left out")
@@ -155,9 +166,13 @@ class BoardModel(PlanarModel):
                                  f"{self.ground}")
             d = np.zeros(2)
             d[int(p['axis'])] = p['sgn']
-            kref = 0 if p.get('ref_layer') in (None, '', self.ground) else self.iface.get(p['ref_layer'], 0)
+            if self.whole:
+                kref, kind = self._reference(p, k), 'via'                 # wave ports assume the ground plane
+            else:
+                kref = 0 if p.get('ref_layer') in (None, '', self.ground) else self.iface.get(p['ref_layer'], 0)
+                kind = port
             spec = dict(name=p['name'], c=np.asarray(p['c'], float) * MM, d=d, k=k, w=p['w'] * MM, z0=float(p['z0']),
-                        kind=port, kref=kref, radius=max(p['w'] / 4, 0.02) * MM)
+                        kind=kind, kref=kref, radius=max(p['w'] / 4, 0.02) * MM)
             self.port_z0[p['name']] = float(p['z0'])
             if pairs and p.get('pair'):
                 legs.setdefault(p['pair'], {})[p['leg']] = spec
@@ -166,10 +181,25 @@ class BoardModel(PlanarModel):
             else:
                 self.port_specs.append(spec)
 
+    def _reference(self, p, k):
+        """A port's reference interface in the whole stack: its ref_layer, else the nearest other layer whose
+        copper covers the port's centre (the plane under or over it). ValueError when there is none."""
+        if p.get('ref_layer') in self.iface:
+            return self.iface[p['ref_layer']]
+        pt = Point(p['c'][0] * MM, p['c'][1] * MM)
+        cover = [j for j, gs in self.shapes.items() if j != k and gs and gs[0].buffer(1e-9).contains(pt)]
+        if not cover:
+            raise ValueError(f"{p['name']}: no copper under or over the port on another layer to reference it to "
+                             f"(whole stack: name its ref_layer)")
+        j = min(cover, key=lambda j: abs(self.stack.z[j] - self.stack.z[k]))
+        self.notes.append(f"{p['name']}: lumped port to {next(n for n, i in self.iface.items() if i == j)}")
+        return j
+
     def _via(self, x, y, z0, z1, r, name, ring=True, Z=None):
         """A via (board mm) over the interfaces between z0 and z1 that have metal at (x, y) (the ground counts)."""
         from .sim import Via
-        metal = lambda k: k == 0 or (bool(g := self.shapes.get(k)) and g[0].buffer(1e-9).contains(Point(x * MM, y * MM)))
+        metal = lambda k: (k == 0 and not self.whole) or \
+            (bool(g := self.shapes.get(k)) and g[0].buffer(1e-9).contains(Point(x * MM, y * MM)))
         ks = sorted(k for k in [0] + list(self.iface.values()) if z0 - 1e-9 <= self._zk[k] <= z1 + 1e-9 and metal(k))
         if len(set(ks)) < 2:
             return None

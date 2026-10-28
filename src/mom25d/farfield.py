@@ -11,11 +11,18 @@ u along k_rho), and that E the far field (exact for the half-space above a plane
 
     r E_theta = j k_top / (2 pi) E_u,   r E_phi = j k_top cos(theta) / (2 pi) E_v      (e^{-j k r} dropped)
 
-The ground is infinite: nothing radiates below it (theta > 90 deg), and what the substrate guides away
-(surface waves) and its loss are not radiated, so efficiency = P_rad / P_accepted counts both as loss.
-Vertical currents (vias) are left out of the far field: a probe or shorting via of a patch radiates
-little next to the patch's edges. A board whose radiation depends on its finite ground (an inverted-F, a
-monopole at the board edge) is not this model's antenna.
+Vertical currents (the via chains: one unknown each, a +z current through its layers) radiate through the TM
+network too: a unit current through layer j gives E_t = grad_t S on interface o, S~ = sum_j [V(z_j | z_o) -
+V(z_{j-1} | z_o)] / kz_j^2 (mom25d.via), so E_u = -j k_rho S~ e^{j k.rho_via} and nothing in E_v.
+
+Over the PEC ground nothing radiates below it (theta > 90 deg: zero). A whole stack (LayerStack bottom='open':
+no infinite ground, the planes meshed) radiates below as well: mirrored in z, the lower half-space's far field
+comes from the tangential E on interface 0, k_bot the half-space's wavenumber (cos(theta) < 0):
+
+    r E_theta = -j k_bot / (2 pi) E_u,   r E_phi = -j k_bot cos(theta) / (2 pi) E_v
+
+What the substrate guides away (surface waves) and its loss are not radiated, so efficiency = P_rad / P_accepted
+counts both as loss.
 """
 import numpy as np
 
@@ -30,30 +37,69 @@ def _surface_E(st, kr, w, k, Jx, Jy, c, s):
     return (-st.voltage(kr, w, st.N, k, 'e') * (Jx * c + Jy * s), -st.voltage(kr, w, st.N, k, 'h') * (-Jx * s + Jy * c))
 
 
-def far_field(sim, I, f, theta, phi):
-    """r E_theta, r E_phi (V, complex, shape (len(phi), len(theta))) of the currents I (one excitation column)
-    at f (Hz); theta from the board normal (0..90 deg: above the ground), phi from +x (degrees)."""
+def _via_Eu(st, kr, w, o, layers):
+    """E_u on interface o (spectral) from a unit +z current through `layers` (TM only): -j k_rho S~ (module doc)."""
+    k2 = (w / C0) ** 2
+    S = 0.0
+    for j in layers:
+        S = S + (st.voltage(kr, w, j, o, 'e') - st.voltage(kr, w, j - 1, o, 'e')) / (k2 * st.eps(j) - kr ** 2)
+    return -1j * kr * S
+
+
+def _tangential(sim, I, w, o, kr, cphi, sphi):
+    """E_u, E_v on interface o at the plane-wave directions (kr, cos / sin phi) from all the currents: the surface
+    currents of every layer, and the via chains' (sim.chains, unknowns after the Ne edges, when the sim has them)."""
     st = sim.st
-    if st.top != 'open':
-        raise ValueError("a PEC cover on the stack: nothing radiates")
-    w = 2 * np.pi * f
-    k_top = w / C0 * np.sqrt(complex(st.top_er)).real
-    th, ph = np.radians(np.asarray(theta, float)), np.radians(np.asarray(phi, float))
-    TH, PH = np.meshgrid(th, ph)                                         # (nphi, ntheta)
-    kr = k_top * np.sin(TH).ravel() + 1e-9 * k_top                      # k_rho = 0 at broadside: just off it
-    kx, ky = kr * np.cos(PH).ravel(), kr * np.sin(PH).ravel()
+    kx, ky = kr * cphi, kr * sphi
     jx, jy = sim.current_density(I)                                      # per triangle (A/m)
     cen, area = sim.rwg.cent[:, :2], sim.rwg.area
     Eu, Ev = np.zeros(kr.shape, complex), np.zeros(kr.shape, complex)
-    cphi, sphi = np.cos(PH).ravel(), np.sin(PH).ravel()
     for k, idx in sim.tri_idx.items():
         if not len(idx):
             continue
         ph_ = np.exp(1j * (np.outer(kx, cen[idx, 0]) + np.outer(ky, cen[idx, 1])))   # e^{j k.rho}
-        eu, ev = _surface_E(st, kr, w, k, ph_ @ (jx[idx] * area[idx]), ph_ @ (jy[idx] * area[idx]), cphi, sphi)
+        eu, ev = _surface_E_at(st, kr, w, o, k, ph_ @ (jx[idx] * area[idx]), ph_ @ (jy[idx] * area[idx]), cphi, sphi)
         Eu, Ev = Eu + eu, Ev + ev
-    c = 1j * k_top / (2 * np.pi)
-    return (c * Eu).reshape(TH.shape), (c * np.cos(TH).ravel() * Ev).reshape(TH.shape)
+    chains, ne = getattr(sim, 'chains', None) or [], getattr(sim, 'Ne', None)
+    if chains and ne is not None:
+        Iv = np.asarray(I)[ne:ne + len(chains)]
+        spans = {}
+        for c, (v, a, b) in enumerate(chains):                          # one kernel per span, summed over its vias
+            spans.setdefault((a, b), []).append((v.x, v.y, Iv[c]))
+        for (a, b), vs in spans.items():
+            xy, cur = np.array([(x, y) for x, y, _ in vs]), np.array([i for _, _, i in vs])
+            Eu = Eu + _via_Eu(st, kr, w, o, range(a + 1, b + 1)) * (np.exp(1j * (np.outer(kx, xy[:, 0]) +
+                                                                                    np.outer(ky, xy[:, 1]))) @ cur)
+    return Eu, Ev
+
+
+def _surface_E_at(st, kr, w, o, k, Jx, Jy, c, s):
+    """E_u, E_v on interface o from the current spectrum (Jx, Jy) on interface k."""
+    return (-st.voltage(kr, w, o, k, 'e') * (Jx * c + Jy * s), -st.voltage(kr, w, o, k, 'h') * (-Jx * s + Jy * c))
+
+
+def far_field(sim, I, f, theta, phi):
+    """r E_theta, r E_phi (V, complex, shape (len(phi), len(theta))) of the currents I (one excitation column)
+    at f (Hz), the surface currents and the vias'; theta from the board normal (0..180 deg: above the board to 90,
+    below it beyond; zero below the PEC ground), phi from +x (degrees)."""
+    st = sim.st
+    th, ph = np.radians(np.asarray(theta, float)), np.radians(np.asarray(phi, float))
+    TH, PH = np.meshgrid(th, ph)                                         # (nphi, ntheta)
+    if st.top != 'open' and (TH < np.pi / 2).any():
+        raise ValueError("a PEC cover on the stack: nothing radiates above it")
+    w = 2 * np.pi * f
+    Et, Ep = np.zeros(TH.size, complex), np.zeros(TH.size, complex)
+    t, cphi, sphi = TH.ravel(), np.cos(PH).ravel(), np.sin(PH).ravel()
+    for up, sel in ((True, t <= np.pi / 2), (False, t > np.pi / 2)):
+        if not sel.any() or (not up and st.bottom == 'pec'):
+            continue                                                     # below the ground: nothing
+        er = st.top_er if up else st.bottom_er
+        k = w / C0 * np.sqrt(complex(er)).real
+        kr = k * np.sin(t[sel]) + 1e-9 * k                               # k_rho = 0 at broadside: just off it
+        Eu, Ev = _tangential(sim, I, w, st.N if up else 0, kr, cphi[sel], sphi[sel])
+        c = (1 if up else -1) * 1j * k / (2 * np.pi)
+        Et[sel], Ep[sel] = c * Eu, c * np.cos(t[sel]) * Ev
+    return Et.reshape(TH.shape), Ep.reshape(TH.shape)
 
 
 def radiated(Eth, Eph, theta, phi, eta=ETA0):

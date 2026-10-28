@@ -49,11 +49,15 @@ class PlanarModel:
 
     def describe(self):
         L = ["stack (from ground up):"]
+        cu0 = [n for n, k in self.iface.items() if k == 0]
+        if cu0:
+            L.append(f"  metal {cu0[0]} on interface 0 (the bottom)")
         for j, l in enumerate(self.stack.layers):
             cu = [n for n, k in self.iface.items() if k == j + 1]
             L.append(f"  D{j + 1} {l.name:<14s} h={l.h * 1e3:.3f} mm er={l.er:.2f} tand={l.tand:.4f}"
                      + (f"   -> metal {cu[0]} on interface {j + 1}" if cu else ''))
-        L.append(f"  ground: {self.ground} (z=0)" + (f", PEC cover: {self.cover}" if self.cover else ''))
+        L.append((f"  ground: {self.ground} (z=0)" if self.ground else "  no ground: the whole stack, air below")
+                 + (f", PEC cover: {self.cover}" if self.cover else ''))
         L.append("metal interfaces: " + ", ".join(f"{n}->M{k}" for n, k in self.iface.items() if k in self.shapes))
         L.append(f"vias: {len(self.vias)}   ports: " + ", ".join(
             sp['name'] + (' (differential)' if 'legs' in sp else '') for sp in self.port_specs))
@@ -134,8 +138,9 @@ class PlanarModel:
                                   + (f" down to {fmin / 1e9:g} GHz" if fmin else '') + f" (found {L * 1e3:.2f} mm) - lumped port")
                 kind = 'via'
             if kind == 'via':
-                v = Via(c[0], c[1], sp.get('kref', 0), k, radius=sp.get('radius', 0.1 * MM), name=f"{name}_via")
-                out.append(ViaPort(v, z0=z0, name=name))
+                kr = sp.get('kref', 0)                                     # its reference: below, or above it
+                v = Via(c[0], c[1], min(kr, k), max(kr, k), radius=sp.get('radius', 0.1 * MM), name=f"{name}_via")
+                out.append(ViaPort(v, z0=z0, name=name, sign=1 if kr < k else -1))
             elif kind == 'gap':
                 out.append(GapPort(k, c, d, sp.get('width', 0.3 * MM), z0=z0, name=name))
             else:
