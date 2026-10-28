@@ -15,7 +15,7 @@ Typical capacity with 16 GB of VRAM: ~41k unknowns with cupy, ~29k with torch.
 """
 import numpy as np
 import scipy.linalg as sla
-from emdev import gpu as devices                                 # the device and its memory: emdev, shared with gfdtd
+from emsdev import gpu as devices                                 # the device and its memory: emsdev, shared with gfdtd
 
 
 GPUUnavailable = devices.Unavailable

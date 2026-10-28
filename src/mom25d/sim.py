@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import shapely
-from emdev.memory import available as available_memory      # noqa: F401  (bytes; mom25d's name for it)
+from emsdev.memory import available as available_memory      # noqa: F401  (bytes; mom25d's name for it)
 
 from .model import KNOWN_SPAN
 from .base import MU0, EPS0, RWG, qform, combine, singular_moments, quad_pts, gram_matrix, \

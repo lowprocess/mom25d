@@ -20,7 +20,7 @@ dependencies = [
     "scipy>=1.10",
     "shapely>=2.0",
     "triangle>=20230923",          # the surface mesher
-    "emdev @ git+https://github.com/lowprocess/emdev",   # the GPU and memory probes (shared with gfdtd)
+    "emsdev @ git+https://github.com/lowprocess/emsdev",   # the GPU and memory probes (shared with gfdtd)
 ]
 
 [project.optional-dependencies]

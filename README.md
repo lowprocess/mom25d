@@ -13,7 +13,7 @@ covers what it models, its ports, the mesh, antenna mode, the GPU paths and its 
 ## Install
 
 ```bash
-pip install .                       # numpy, scipy, shapely, triangle, emdev (the GPU and memory probes)
+pip install .                       # numpy, scipy, shapely, triangle, emsdev (the GPU and memory probes)
 pip install '.[core]'               # pybind11, then build the compiled core (g++ with OpenMP):
 python -m mom25d.core.build         # mom25d/_core*.so, about five times faster
 pip install '.[gpu-rocm7]'          # the GPU LU: the CuPy wheel for your stack (gpu-cuda12, gpu-cuda13, gpu-rocm7)
