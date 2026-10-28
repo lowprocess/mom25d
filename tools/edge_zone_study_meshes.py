@@ -1,7 +1,6 @@
 import os, sys
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'); sys.path.insert(0, ROOT)
-from kicad2ems.board import Board
-from kicad2ems.importers.kicad import KiCadBoard
+from kicad2ems.api.frontend import Board, KiCadBoard
 from mom25d.board import BoardModel
 base = os.path.join(ROOT, 'examples', 'demo_transition')
 D = Board(KiCadBoard(base + '.kicad_pcb'), nets=['RF', 'GND'], ground='B.Cu', pos_file=base + '-top.pos',

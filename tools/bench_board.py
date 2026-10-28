@@ -4,8 +4,7 @@ import os, sys, time, subprocess
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
 sys.path.insert(0, ROOT)
 import numpy as np
-from kicad2ems.board import Board
-from kicad2ems.importers.kicad import KiCadBoard
+from kicad2ems.api.frontend import Board, KiCadBoard
 from mom25d.board import BoardModel
 
 

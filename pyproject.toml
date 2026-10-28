@@ -20,6 +20,7 @@ dependencies = [
     "scipy>=1.10",
     "shapely>=2.0",
     "triangle>=20230923",          # the surface mesher
+    "matplotlib>=3.7",             # farfield.current_on_grid: the triangle each point is in (current dumps)
     "emsdev @ https://github.com/lowprocess/emsdev/archive/refs/heads/main.zip", # the GPU and memory probes (shared with gfdtd)
 ]
 

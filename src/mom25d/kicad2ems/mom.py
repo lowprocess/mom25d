@@ -391,7 +391,7 @@ class MoM25D(Solver):
         loss; nothing radiates below the infinite ground."""
         from mom25d.farfield import far_field, radiated
         from kicad2ems.api.solver import phased
-        from kicad2ems.api.solver import match_summary, describe_antenna, save_antenna
+        from kicad2ems.api.solver import match_summary, describe_antenna, save_antenna, pattern_gain
         from kicad2ems.api.solver import plot_antenna, plot_pattern
         s, m, sim = run.s, run.m, held.sim
         names = [p.name for p in sim.ports]
@@ -465,7 +465,7 @@ class MoM25D(Solver):
         eff = rows[ip]['eff']
         e_pat = sph['e_norm'][ip]
         ant = dict(match=match, rows=rows, f_pattern=float(ffr[ip]), cuts=cuts, port=names[k], solver='mom25d',
-                   sphere=dict(theta=th, phi=ph, gain=((e_pat / e_pat.max()) ** 2 * dmax[ip] * eff).T),
+                   sphere=dict(theta=th, phi=ph, gain=pattern_gain(e_pat, dmax[ip], eff).T),
                    sphere_file=os.path.basename(sph_file),
                    model='infinite ground plane: no radiation below it, no board edge' if sim.st.bottom == 'pec' else
                    'the whole stack: its planes meshed, radiation above and below; laterally infinite dielectric')

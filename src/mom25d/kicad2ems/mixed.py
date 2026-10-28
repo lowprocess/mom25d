@@ -19,6 +19,7 @@ import numpy as np
 
 from kicad2ems.api.solver import Result, Option
 from .mom import MoM25D, _metal
+from ..base import C0
 from kicad2ems.api.solver import stop
 
 G = 'mixed'                                     # its section in kicad2ems's GUI
@@ -70,7 +71,7 @@ def plan_cuts(model, data, dmax, fmin, cut_min=CUT_MIN * 1e-3, keep_out=None, lo
         w = 2 * r.a
         win, need0 = model._wave_window(w, 1.0, dmax)
         er = model.stack.layers[r.k - 1].er
-        beta = 2 * np.pi * fmin * np.sqrt(0.5 * (er + 1)) / 299792458.0
+        beta = 2 * np.pi * fmin * np.sqrt(0.5 * (er + 1)) / C0
         need = max(need0, 1.0 - (win[2] - win[1]) + KNOWN_SPAN / beta)        # the feed each cut face needs
         need += 1e-6                                                          # (rounding: the port still fits)
         xc0, xc1 = r.x0 + need, r.x1 - need
@@ -143,7 +144,7 @@ def solve_mixed(m, freq, dmax=0.3, sigma=None, max_solves=60, cut_min=CUT_MIN, k
     # otherwise, and leaves nothing of the line to cut)
     from mom25d.model import KNOWN_SPAN
     er_min = min(l.er for l in model.stack.layers)
-    beta_lo = 2 * np.pi * fmin * np.sqrt(0.5 * (er_min + 1)) / 299792458.0
+    beta_lo = 2 * np.pi * fmin * np.sqrt(0.5 * (er_min + 1)) / C0
     feed = model._feed
 
     def capped(g, c, d, step):

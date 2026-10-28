@@ -18,6 +18,7 @@ Simulation.
 import numpy as np
 from shapely.geometry import LineString, Point
 from shapely.ops import unary_union
+from .base import C0
 
 MM = 1e-3
 
@@ -125,7 +126,7 @@ class PlanarModel:
                     # with gamma from the line characterisation (characterize: gamma_fn) the two wave amplitudes
                     # need the cuts to span KNOWN_SPAN at the lowest frequency
                     er = self.stack.layers[k - 1].er
-                    beta = 2 * np.pi * fmin * np.sqrt(0.5 * (er + 1)) / 299792458.0      # a lower bound
+                    beta = 2 * np.pi * fmin * np.sqrt(0.5 * (er + 1)) / C0      # a lower bound
                     if (win[2] - win[1]) * beta < KNOWN_SPAN:
                         need = max(need, L - (win[2] - win[1]) + KNOWN_SPAN / beta)
                         win = None
