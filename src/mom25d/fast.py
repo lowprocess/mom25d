@@ -50,6 +50,47 @@ def set_core(module):
     _core = module
 
 
+def fast_cores():
+    """The physical cores of the fastest class (a hybrid CPU's P-cores; every core of the others), from Linux's
+    /sys; None where it cannot tell."""
+    import glob
+    cores = {}
+    for d in glob.glob('/sys/devices/system/cpu/cpu[0-9]*'):
+        try:
+            f = int(open(d + '/cpufreq/cpuinfo_max_freq').read())
+            key = tuple(open(f'{d}/topology/{k}').read().strip() for k in ('physical_package_id', 'core_id'))
+        except (OSError, ValueError):
+            return None
+        cores[key] = max(cores.get(key, 0), f)
+    top = max(cores.values(), default=0)
+    return sum(f >= 0.9 * top for f in cores.values()) or None
+
+
+_blas_capped = False
+
+
+def cap_blas_threads():
+    """Once: the LU's BLAS (OpenBLAS / MKL, through threadpoolctl) on the fast physical cores only. A BLAS LU splits
+    each step evenly over its threads and waits for the slowest: on an i7-13700K (8 P-cores with their hyperthreads,
+    8 E-cores) its 24 threads made rf_stubnotch's 1.5k-unknown LU 0.62 s against 0.047 s on 8 (a whole kicad2ems
+    run 10.8 s against 3.3 s), as fast at 5k unknowns. MOM25D_BLAS_THREADS (or OPENBLAS_NUM_THREADS / MKL_NUM_THREADS)
+    sets it instead; without threadpoolctl nothing is changed."""
+    global _blas_capped
+    if _blas_capped:
+        return
+    _blas_capped = True
+    env = os.environ.get('MOM25D_BLAS_THREADS')
+    if not env and (os.environ.get('OPENBLAS_NUM_THREADS') or os.environ.get('MKL_NUM_THREADS')):
+        return
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        return
+    n = int(env) if env else fast_cores()
+    if n:
+        threadpool_limits(limits=n, user_api='blas')
+
+
 NEAR_CHUNK = 8_000_000      # near-field triplets per piece of the sum into the sparse matrix (_near_csr)
 
 
@@ -524,13 +565,16 @@ class FastOperator:
         self.setup(f, mode='direct')
         Sx, self.iters = self.extra_blocks(f), []
         T = sim.qT
-        quads = T is not None                       # quad cells / line functions: the projected LU on the CPU (for now)
+        quads = T is not None                       # quad cells / line functions: Z projected before the LU
+        Nq = T.shape[1] if quads else N
         # mixed precision with a GPU: Z filled in double and kept on the host (24 N^2 bytes with the complex64
         # copy the GPU factors), the refinement products dense: 5.7 s a solve on the via transition (13.5k
         # unknowns) against 8.7 s with the sparse exact near field (its CSR build alone 3.1 s) and 14.9 s double
         from .sim import available_memory
-        gpu = self._backend() if precision == 'mixed' and not quads else None
-        hybrid = gpu is not None and gpu.fits(N) and 24.0 * N * N + 0.9e9 <= 0.8 * available_memory()
+        # quads: the projection holds Z and the reduced matrix (16 (N^2 + Nq^2) bytes), then the GPU's copy of it
+        gpu = self._backend() if precision == 'mixed' else None
+        host = max(16.0 * (N * N + Nq * Nq), 24.0 * Nq * Nq) if quads else 24.0 * N * N
+        hybrid = gpu is not None and gpu.fits(Nq) and host + 0.9e9 <= 0.8 * available_memory()
         if hybrid and f <= HYBRID_RETRY * self._hybrid_failed:
             # the complex64 LU failed to precondition at or above this frequency: double up to HYBRID_RETRY x
             # the highest failure, the GPU again above it (it fails at the low end of a band, where the MPIE
@@ -542,7 +586,7 @@ class FastOperator:
             precision = 'double'
         tiled = self.tiled or sim.tiled
         if precision == 'mixed' and tiled != 'off' and not self._tiled_failed and (tiled == 'on' or not hybrid) \
-                and gpu is not None and hasattr(gpu, 'cp') \
+                and gpu is not None and hasattr(gpu, 'cp') and not quads \
                 and 0.9 * gpu.mem_free() >= self._tiled_work(N, self.tiled_block):
             # no dense Z: the GPU holds half a complex64 matrix (or streams it), the host a block column
             X = self._solve_tiled(f, E, Sx, gpu, self.tiled_block)
@@ -576,11 +620,11 @@ class FastOperator:
             with sim.log.timer('quad projection', f"{T.shape[0]} -> {T.shape[1]}"):
                 if not hasattr(self, '_qC'):
                     self._qC = T[sim.quad_info['elim']].tocsr()
-                Z = project(Z, sim.quad_info['keep'], sim.quad_info['elim'], self._qC)
+                Z = project(Z, sim.quad_info['keep'], sim.quad_info['elim'], self._qC, core=self.core)
         dsc = 1.0 / np.sqrt(np.abs(np.diagonal(Z)).astype(float) + 1e-300)
         if hybrid:
-            return self._solve_hybrid(f, Z, dsc, E, gpu)
-        gpu = self._mixed_gpu(N) if precision == 'mixed' and not quads else None
+            return up(self._solve_hybrid(f, Z, dsc, down(E), gpu))
+        gpu = self._mixed_gpu(Nq) if precision == 'mixed' else None
         _equilibrate(Z, dsc)
         if gpu is not None:
             with sim.log.timer('LU factor (GPU)', f"N={N}, {gpu.name}"):

@@ -13,6 +13,7 @@
 //                   (n_rho x n_k) Bessel matrix (the Green tables and the via kernels)
 //   scale_c64     : Z <- D Z D (equilibration) and its complex64 copy, one pass (the GPU LU's input)
 //   fan_q         : G_q moments between every triangle and the via fan triangles (centroid rule)
+//   project       : T^T Z T for the quad cells / line functions (quads.project), Z's rows reduced in place
 //
 // Everything mirrors the NumPy implementation in mom25d_fast.py (same tables and conventions),
 // which stays the fallback when this module is not built.
@@ -641,6 +642,56 @@ py::array_t<cd> fan_q(py::dict geom, py::dict tabs, arr<int> F) {
     return out;
 }
 
+// ---------------------------------------------------------------------------------------------
+// T^T Z T for T = (identity on `keep` in its first nk columns, rows `elim` = C): quads.project without the
+// N x Nr temporaries. Z T is formed in place, row by row (Z[r, :Nr]; keep is ascending so keep[j] >= j is read
+// before it is written, the eliminated entries are copied out first), then T^T (Z T) row by row into the
+// Nr x Nr result: row j = (Z T)[keep[j]] + sum_i C[i, j] (Z T)[elim[i]] (Ct: C^T as CSR). Z is overwritten.
+// ---------------------------------------------------------------------------------------------
+template <class C>
+py::array_t<C> project_t(py::array_t<C, py::array::c_style> Z, arr<int> keep, arr<int> elim,
+                         arr<int> cp, arr<int> ci, arr<double> cv, arr<int> tp, arr<int> ti, arr<double> tv, int Nr) {
+    auto b = Z.request();
+    const size_t N = b.shape[0];
+    const int nk = (int)keep.shape(0), ne = (int)elim.shape(0);
+    if ((size_t)b.shape[1] != N || (size_t)(nk + ne) != N || Nr < nk || (int)cp.shape(0) != ne + 1 ||
+        (int)tp.shape(0) != Nr + 1)
+        throw std::invalid_argument("project: Z square, keep + elim its size, C (ne x Nr) and C^T as CSR");
+    C *z = (C *)b.ptr;
+    const int *k = keep.data(), *e = elim.data(), *cpp = cp.data(), *cii = ci.data(), *tpp = tp.data(), *tii = ti.data();
+    const double *cvv = cv.data(), *tvv = tv.data();
+    py::array_t<C> out({(size_t)Nr, (size_t)Nr});
+    C *o = out.mutable_data();
+    {
+        py::gil_scoped_release nogil;
+#pragma omp parallel
+        {
+            std::vector<C> ze(ne);
+#pragma omp for schedule(static)
+            for (long r = 0; r < (long)N; ++r) {
+                C *zr = z + (size_t)r * N;
+                for (int i = 0; i < ne; ++i) ze[i] = zr[e[i]];
+                for (int j = 0; j < nk; ++j) zr[j] = zr[k[j]];
+                for (int j = nk; j < Nr; ++j) zr[j] = C(0);
+                for (int i = 0; i < ne; ++i)
+                    for (int p = cpp[i]; p < cpp[i + 1]; ++p) zr[cii[p]] += (typename C::value_type)cvv[p] * ze[i];
+            }
+#pragma omp for schedule(static)
+            for (long j = 0; j < (long)Nr; ++j) {
+                C *oj = o + (size_t)j * Nr;
+                if (j < nk) std::copy(z + (size_t)k[j] * N, z + (size_t)k[j] * N + Nr, oj);
+                else std::fill(oj, oj + Nr, C(0));
+                for (int p = tpp[j]; p < tpp[j + 1]; ++p) {
+                    const C *zi = z + (size_t)e[tii[p]] * N;
+                    const typename C::value_type c = (typename C::value_type)tvv[p];
+                    for (int m = 0; m < Nr; ++m) oj[m] += c * zi[m];
+                }
+            }
+        }
+    }
+    return out;
+}
+
 PYBIND11_MODULE(_core, m) {
     m.doc() = "compiled kernels for mom25d";
     m.def("fill_far", &fill_far_t<cd>, "far-field entries into a complex128 Z");
@@ -657,4 +708,6 @@ PYBIND11_MODULE(_core, m) {
     m.def("hankel_real", &hankel_real, "sum_k J0(rho kr_k) W[s, k] for real kr");
     m.def("scale_c64", &scale_c64, "Z <- D Z D in place, and its complex64 copy");
     m.def("fan_q", &fan_q, "G_q moments between every triangle and the fan triangles");
+    m.def("project", &project_t<cd>, "T^T Z T (quad cells, line functions), complex128, Z overwritten");
+    m.def("project_c64", &project_t<cf>, "T^T Z T (quad cells, line functions), complex64, Z overwritten");
 }

@@ -65,13 +65,7 @@ def quad_subspace(rwg, n_total, exclude_tris=(), exclude_edges=(), tol_deg=25.0)
         q = _quad_quality(nodes, a, tris[t1][(i + 1) % 3], b, tris[t1][(i + 2) % 3])
         if q <= tol_deg:
             cand.append((q, d))
-    used, elim = np.zeros(len(tris), bool), []
-    for q, d in sorted(cand):
-        t1, t2 = rwg.tp[d], rwg.tm[d]
-        if not (used[t1] or used[t2]):
-            used[t1] = used[t2] = True
-            elim.append(d)
-    elim = np.array(sorted(elim), int)
+    elim = np.array(sorted(_match(cand, rwg.tp, rwg.tm, len(tris))), int)
     keep, col = np.setdiff1d(np.arange(n_total), elim), -np.ones(n_total, int)
     col[keep] = np.arange(len(keep))
     rows, cols, vals = list(keep), list(col[keep]), [1.0] * len(keep)
@@ -92,6 +86,54 @@ def quad_subspace(rwg, n_total, exclude_tris=(), exclude_edges=(), tol_deg=25.0)
                    full=n_total, keep=keep, elim=elim)
 
 
+def _match(cand, tp, tm, nt, depth=12):
+    """The diagonals to eliminate: a matching of the triangles over the candidate diagonals cand [(quality, edge)].
+    Greedy, best quality first, then grown along augmenting paths (alternating free / matched diagonals from an
+    unpaired triangle to another, up to `depth` diagonals long): each one pairs two more triangles. The search is
+    a tree without blossoms, so it can miss a path, never take a wrong one. Greedy alone leaves about a tenth of
+    the triangles unpaired that a maximum matching would pair (looser tolerances, Delaunay interiors)."""
+    mate = -np.ones(nt, int)                          # the diagonal each triangle is paired over
+    adj = [[] for _ in range(nt)]
+    for q, d in sorted(cand):
+        t1, t2 = tp[d], tm[d]
+        adj[t1].append((t2, d)); adj[t2].append((t1, d))
+        if mate[t1] < 0 and mate[t2] < 0:
+            mate[t1] = mate[t2] = d
+    other = lambda t, d: tm[d] if tp[d] == t else tp[d]
+    for root in range(nt):
+        if mate[root] >= 0 or not adj[root]:
+            continue
+        # BFS over even triangles (reached by a matched diagonal; the root is even): parent[t] = (odd tri, edge)
+        parent, front, end = {root: None}, [root], None
+        for _ in range(depth // 2):
+            nxt = []
+            for u in front:
+                for v, d in adj[u]:
+                    if v in parent or v == root:
+                        continue
+                    if mate[v] < 0:                    # a free triangle: the path ends here
+                        parent[v], end = (u, d), v
+                        break
+                    w = other(v, mate[v])
+                    if w in parent:
+                        continue
+                    parent[v], parent[w] = (u, d), (v, mate[v])
+                    nxt.append(w)
+                if end is not None:
+                    break
+            if end is not None or not nxt:
+                break
+            front = nxt
+        if end is None:
+            continue
+        v = end                                        # flip the path: its free diagonals become matched
+        while v != root:
+            u, d = parent[v]
+            mate[v] = mate[u] = d
+            v = parent[u][0] if u != root else root
+    return {int(d) for d in mate if d >= 0}
+
+
 def _opposite(tri, ends, nodes):
     """The vertex of triangle `tri` not on the edge with end points `ends`."""
     for n in tri:
@@ -100,10 +142,20 @@ def _opposite(tri, ends, nodes):
     raise ValueError("degenerate triangle")
 
 
-def project(Z, keep, elim, C):
+def project(Z, keep, elim, C, core=None):
     """T^T Z T for T = (identity on `keep` in its first len(keep) columns, rows `elim` = C), without forming T:
     Z (N x N) dense, C (ne x Nr) sparse, Nr >= len(keep) (the columns past len(keep) are combined functions on the
-    eliminated unknowns, line.py). Stays in Z's dtype; returns the Nr x Nr matrix (C order)."""
+    eliminated unknowns, line.py). Stays in Z's dtype; returns the Nr x Nr matrix (C order). core: the compiled
+    core (fast._core), which reduces Z's rows in place (Z is overwritten) on every thread: the demo transition's
+    8.3k unknowns in 0.2 s against 1.4 s here."""
+    if core is not None and hasattr(core, 'project') and Z.flags.c_contiguous and Z.dtype in (np.complex64, np.complex128):
+        C = sparse.csr_matrix(C, dtype=np.float64)
+        C.sort_indices()
+        Ct = C.T.tocsr()
+        i32 = lambda a: np.ascontiguousarray(a, np.int32)
+        return (core.project_c64 if Z.dtype == np.complex64 else core.project)(
+            Z, i32(keep), i32(elim), i32(C.indptr), i32(C.indices), C.data, i32(Ct.indptr), i32(Ct.indices), Ct.data,
+            int(C.shape[1]))
     rdt = np.float32 if Z.dtype == np.complex64 else np.float64
     C = sparse.csr_matrix(C, dtype=rdt)
     Ct = C.T.tocsr()

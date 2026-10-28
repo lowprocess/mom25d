@@ -294,8 +294,8 @@ def test_new_core_kernels_match_numpy():
 
 
 def test_core_choice():
-    """core='compiled': the core's direct solver for a small board too (auto: NumPy's dense one there);
-    use_core('python'): no compiled kernels; the answers agree."""
+    """core='auto' and 'compiled': the core's direct solver for a small board too; use_core('python'): no compiled
+    kernels, NumPy's dense solver; the answers agree."""
     pytest.importorskip('mom25d._core')
     from shapely.geometry import box, Point
     from mom25d import fast
@@ -306,11 +306,12 @@ def test_core_choice():
                                                 ViaPort(Via(L / 2, 0, 0, 1, 0.1e-3), 54.0)],
                                  dmax=0.3e-3, w_ref=w, solver='auto', core=core, verbose=False)
     auto, comp = mk('auto'), mk('compiled')
-    assert auto.solver == 'dense' and comp.solver == 'direct'
-    assert np.abs(auto.sparams(4e9) - comp.sparams(4e9)).max() < 0.01
+    assert auto.solver == 'direct' and comp.solver == 'direct'
     prev = fast.use_core('python')
     try:
-        assert fast._core is None and mk('auto').solver == 'dense'
+        dense = mk('auto')
+        assert fast._core is None and dense.solver == 'dense'
+        assert np.abs(auto.sparams(4e9) - dense.sparams(4e9)).max() < 0.01
     finally:
         fast.set_core(prev)
     assert fast._core is not None
