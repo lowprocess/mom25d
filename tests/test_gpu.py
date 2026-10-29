@@ -60,14 +60,43 @@ def fake_torch(mem=8e9):
                                        mem_get_info=lambda: (mem, 16e9), synchronize=lambda: None,
                                        empty_cache=lambda: None)
 
-    def lu_factor(A):                                   # factors A exactly as given (torch semantics)
+    def lu_factor(A):                                   # factors A exactly as given (torch semantics: 1-based pivots)
         lu, piv = sla.lu_factor(np.array(A.a), check_finite=False)
-        return T(lu), T(piv)
+        return T(lu), T(piv + 1)
 
     def lu_solve(LU, piv, B, adjoint=False):            # A X = B, or A^H X = B
-        return T(sla.lu_solve((LU.a, piv.a), B.a, trans=2 if adjoint else 0, check_finite=False))
+        return T(sla.lu_solve((LU.a, piv.a - 1), B.a, trans=2 if adjoint else 0, check_finite=False))
     torch.linalg = types.SimpleNamespace(lu_factor=lu_factor, lu_solve=lu_solve)
     return {'torch': torch}
+
+
+def test_gpu_solves_that_stall_are_done_on_the_cpu(clean, S_cpu):
+    """The GPU's triangular solves losing a good factor's accuracy (ROCm's complex64 trsm on an ill-conditioned
+    factor, gpu.py): the factor is downloaded and solved on the CPU, no double-precision LU; near that frequency
+    straight away, the GPU still factoring."""
+    mods, _ = fake_cupy()
+    for k, v in mods.items():
+        clean.setitem(sys.modules, k, v)
+    sim = make_sim('cupy')
+    gpu = mom25d_gpu.get_backend('cupy')
+    clean.setattr(type(gpu), 'solve', lambda self, R: np.asarray(R, complex) * 1e-3)
+    S = sim.sparams(4e9)
+    assert np.abs(S - S_cpu).max() < 1e-6 and not sim.fast._hybrid_failed and sim.fast._gpu_solve_bad == 4e9
+    assert not any(r[0] == 'LU factor' for r in sim.log.records)              # no CPU LU
+    n = sum(r[0] == 'LU factor (GPU)' for r in sim.log.records)
+    sim.reuse = 'off'
+    sim.sparams(4.5e9)
+    assert sum(r[0] == 'LU factor (GPU)' for r in sim.log.records) == n + 1
+    assert sum('did not converge' in m for m in sim.log.notes) == 1          # solved on the CPU at once
+
+
+def bad_factor(v):
+    """A GPU backend's download() giving a wrong factor (v x the identity: the preconditioner R / v; NaN: one that
+    breaks the refinement down)."""
+    def download(self):
+        n = self.lu.shape[0]
+        return np.asfortranarray(np.eye(n, dtype=np.complex64) * v), np.arange(n, dtype=np.int32)
+    return download
 
 
 # ---- small two-layer model with vias (same as the core/solver agreement test) --------------------
@@ -121,7 +150,8 @@ def test_gpu_too_small_falls_back_to_cpu(clean, S_cpu):
     sim = make_sim('cupy')
     S = sim.sparams(4e9)
     assert not any(r[0] == 'LU factor (GPU)' for r in sim.log.records)
-    assert np.abs(S - S_cpu).max() < 1e-12
+    # the CPU's path: refined to rtol 1e-6, from a Z whose near field is summed by threads in no fixed order
+    assert np.abs(S - S_cpu).max() < 1e-6
 
 
 def test_auto_without_gpu_is_silent_cpu(clean, S_cpu):
@@ -129,19 +159,20 @@ def test_auto_without_gpu_is_silent_cpu(clean, S_cpu):
     clean.setitem(sys.modules, 'torch', None)
     assert mom25d_gpu.get_backend('auto') is None
     S = make_sim('auto').sparams(4e9)
-    assert np.abs(S - S_cpu).max() < 1e-12
+    assert np.abs(S - S_cpu).max() < 1e-6
 
 
 def test_gpu_refinement_that_stalls_falls_back_to_double_nearby(clean, S_cpu):
-    """A GPU LU too weak to precondition (here: a wrong one) must not cost the sweep: the refinement stops after
-    two restarts, the frequency is solved in double, and so is everything up to 1.25 x it; above that the GPU
+    """A GPU LU too weak to precondition (here: a wrong one) must not cost the sweep: the refinement stops after its
+    30 iterations, the frequency is solved in double, and so is everything up to 1.25 x it; above that the GPU
     is tried again (it fails at the low end of a band, and a sweep that gave up for good ran on the CPU)."""
     mods, _ = fake_cupy()
     for k, v in mods.items():
         clean.setitem(sys.modules, k, v)
     sim = make_sim('cupy')
     gpu = mom25d_gpu.get_backend('cupy')
-    clean.setattr(type(gpu), 'solve', lambda self, R: np.asarray(R, complex) * 1e-3)   # a useless preconditioner
+    clean.setattr(type(gpu), 'download', bad_factor(1e3))                         # a useless preconditioner,
+    clean.setattr(type(gpu), 'solve', lambda self, R: np.asarray(R, complex) * 1e-3)   # on the GPU and the CPU
     S = sim.sparams(4e9)
     assert np.abs(S - S_cpu).max() < 1e-6 and sim.fast._hybrid_failed     # S_cpu: refined to 1e-6, this: double
     n_gpu = sum(r[0] == 'LU factor (GPU)' for r in sim.log.records)
@@ -159,6 +190,7 @@ def test_gpu_refinement_that_breaks_down_falls_back_to_double(clean, S_cpu):
         clean.setitem(sys.modules, k, v)
     sim = make_sim('cupy')
     gpu = mom25d_gpu.get_backend('cupy')
+    clean.setattr(type(gpu), 'download', bad_factor(np.nan))
     clean.setattr(type(gpu), 'solve', lambda self, R: np.full(np.shape(R), np.nan, complex))
     with np.errstate(invalid='ignore'):
         S = sim.sparams(4e9)
@@ -219,6 +251,7 @@ def test_symmetric_factor_of_a_random_matrix():
 
 def test_a_nan_gpu_factor_falls_back(clean, S_cpu):
     """A GPU LU that comes back NaN: the refinement breaks down and the solve is redone in double on the CPU."""
+    clean.setattr(mom25d_gpu.EmulatedBackend, 'download', bad_factor(np.nan))
     clean.setattr(mom25d_gpu.EmulatedBackend, 'solve', lambda self, R: np.full(np.shape(R), np.nan, complex))
     sim = make_sim('emulate')
     S = sim.sparams(4e9)

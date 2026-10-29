@@ -231,6 +231,9 @@ HYBRID_RETRY = 1.25      # after the GPU's mixed precision fails at f, double up
 MIXED_RETRY = HYBRID_RETRY   # the same after the complex64 LU (CPU or GPU) fails to precondition
 MIXED_MAX_ITER = 30      # refinement iterations before giving up on the complex64 LU (2 on the demo transition; a stall
                          # ran all 300 of restart 30 x 10: 150 s on 8.4k unknowns against 18 s for a double LU)
+REUSE_ITER = (8, 60)     # GMRES iterations a reused LU may take (FastOperator._solve_reused): the cap, from the cost of
+                         # a fresh solve, is clamped to this range
+REUSE_KEEP = 4           # complex64 LUs the CPU keeps at most, memory allowing (FastOperator._solve_kept)
 
 
 
@@ -250,6 +253,39 @@ def _lu(Z):
     return sla.lu_factor(Z.T, overwrite_a=True, check_finite=False)
 
 
+class _GPUKept:
+    """A complex64 LU kept on the GPU, taken from the backend (its own factor freed for the next): M(R) = Z^-1 R
+    there; download() it to the host. device_bytes: its GPU memory."""
+    nbytes = 0                                          # host bytes
+
+    def __init__(self, gpu, device_bytes):
+        self.gpu, self.lu, self.piv, self.device_bytes = gpu, gpu.lu, gpu.piv, device_bytes
+        gpu.lu = gpu.piv = None
+
+    def _with(self, fn):
+        g = self.gpu
+        held, (g.lu, g.piv) = (g.lu, g.piv), (self.lu, self.piv)
+        try:
+            return fn()
+        finally:
+            g.lu, g.piv = held
+
+    def __call__(self, R):
+        return self._with(lambda: self.gpu.solve(R))
+
+    def download(self):
+        return self._with(self.gpu.download)
+
+
+class _Kept:
+    """A kept LU factorisation as a preconditioner: M(R) = Z^-1 R (_lu_solve), nbytes its memory."""
+    def __init__(self, lu):
+        self.lu, self.nbytes = lu, lu[0].nbytes
+
+    def __call__(self, R):
+        return _lu_solve(self.lu, R)
+
+
 def _lu_solve(lu, R):
     """Z^-1 R with _lu's factor (trans=1), in the factor's precision; complex128 out."""
     return sla.lu_solve(lu, R.astype(lu[0].dtype), trans=1, check_finite=False).astype(complex)
@@ -264,7 +300,12 @@ class FastOperator:
         self.near_fac, self.tol, self.leaf, self.eta = near_fac or sim.near_fac, tol, leaf, eta
         self.tiled, self.tiled_block = None, 1024          # None: sim.tiled
         self._mixed_failed = self._hybrid_failed = 0.0      # the highest frequency the complex64 LU failed at
+        self._gpu_solve_bad = 0.0                           # ... the GPU's triangular solves with it (not the LU)
         self._tiled_failed = self._gpu_logged = False
+        self._kept = []                                     # [(f, preconditioner, scales, seconds a fresh one took)]
+        self._t_iter = None                                 # seconds a refinement iteration takes
+        self._reach = np.log(2.0)                           # |ln(f / f0)| a reused LU is tried within (learnt)
+        self._ready = None                                  # the frequency dZ_exact, B and C were set up for
         # half-basis description: half h is edge h on its T+ (h < Ne), edge h - Ne on its T-: triangle, alpha,
         # free vertex; and the halves on each triangle (-1: none)
         self.h_tri = np.concatenate([r.tp, r.tm])
@@ -290,6 +331,12 @@ class FastOperator:
                           W6=c(sim.W6))
             self.nP32, self.nQ32 = self.nP.astype(np.int32), self.nQ.astype(np.int32)
             self._near_pat = None                       # _near_csr: the structure of these pairs
+            # the near pairs' analytic parts (geometry only, most of a pair's cost) kept across frequencies by the
+            # core: 96 bytes a pair; the via transition's 11.3 M pairs, 1.1 GB: its near field into the dense Z 0.29 s
+            # a frequency against 1.10 s
+            from .sim import available_memory
+            if hasattr(self.core, 'near_coo') and 96.0 * len(self.nP) <= 0.1 * available_memory():
+                self.q.update(stat=np.zeros((len(self.nP), 12)), stat_ready=False)
 
     # ---- near pairs (geometry only) ---------------------------------------------------------------
     def _near_pairs(self):
@@ -410,7 +457,13 @@ class FastOperator:
     def _near_exact(self):
         """The core's exact near-field correction (sparse, double); keeps its via-fan part (_qcorr)."""
         ri, ci, vv, self._qcorr = self.core.near_coo(self.g, self.tb, self.q, self.nP32, self.nQ32, self.w)
+        self._near_kept()
         return _near_csr(ri, ci, vv, self.sim.Ne, self)
+
+    def _near_kept(self):
+        """After a pass of the core's near_core: its analytic parts are in q['stat']."""
+        if 'stat' in self.q:
+            self.q['stat_ready'] = True
 
     def _vias(self, f):
         """The via rows / columns B and block C (sim._via_blocks with this operator's fan columns)."""
@@ -430,6 +483,8 @@ class FastOperator:
                        dr=np.array([t.rho[1] for t in T]), d=get('d'), dimg=get('dimg'), cA=get('cA', complex),
                        cq=get('cq', complex), cAi=get('cAi', complex), cqi=get('cqi', complex), tab=tab,
                        kind=np.array([0 if a == b else (1 if t.cA != 0 else 2) for (a, b), t in zip(keys, T)], np.int32))
+        if 'stat' in self.q and not np.array_equal(self.tb['kind'], self.q.get('stat_kind')):
+            self.q.update(stat_ready=False, stat_kind=self.tb['kind'])      # other parts extracted: computed again
 
     # ---- assemble & solve ---------------------------------------------------------------------------------
     def matvec_exact(self, X, Sx=None):
@@ -445,6 +500,8 @@ class FastOperator:
             far = per_column(lambda x: core.matvec_far(x, self.g, self.tb, self.w))
         near = self.dZ_exact @ Xe if self.dZ_exact is not None else \
             per_column(lambda x: core.near_matvec(x, self.g, self.tb, self.q, self.nP32, self.nQ32, self.w))
+        if self.dZ_exact is None:
+            self._near_kept()
         return self._bordered(X, far + near + (Sx[:Ne, :Ne] @ Xe if Sx is not None else 0))
 
     def _bordered(self, X, Ye):
@@ -574,7 +631,9 @@ class FastOperator:
         # quads: the projection holds Z and the reduced matrix (16 (N^2 + Nq^2) bytes), then the GPU's copy of it
         gpu = self._backend() if precision == 'mixed' else None
         host = max(16.0 * (N * N + Nq * Nq), 24.0 * Nq * Nq) if quads else 24.0 * N * N
-        hybrid = gpu is not None and gpu.fits(Nq) and host + 0.9e9 <= 0.8 * available_memory()
+        on_gpu = sum(getattr(k[1], 'device_bytes', 0) for k in self._kept)        # LUs kept there (theirs to free)
+        gpu_fits = gpu is not None and gpu.vram_needed(Nq) <= 0.9 * (gpu.mem_free() + on_gpu)
+        hybrid = gpu_fits and host + 0.9e9 <= 0.8 * available_memory()
         if hybrid and f <= HYBRID_RETRY * self._hybrid_failed:
             # the complex64 LU failed to precondition at or above this frequency: double up to HYBRID_RETRY x
             # the highest failure, the GPU again above it (it fails at the low end of a band, where the MPIE
@@ -592,21 +651,45 @@ class FastOperator:
             X = self._solve_tiled(f, E, Sx, gpu, self.tiled_block)
             if X is not None:
                 return X
-        dt = np.complex64 if precision == 'mixed' and not hybrid else np.complex128
+        # mixed precision on the CPU, with room for a double Z, its complex64 LU and one more: Z in double, solved
+        # with the kept LU nearest in frequency where that preconditions it (_solve_kept), the refinement's products
+        # dense; otherwise one LU kept, the products matrix-free (_solve_reused)
+        kept = sum(k[1].nbytes for k in self._kept if hasattr(k[1], 'nbytes'))
+        no_gpu = not gpu_fits                                 # (a GPU too small: the CPU's LU)
+        if precision != 'mixed' or sim.reuse == 'off' or not (hybrid or no_gpu):
+            self._keep_max = 0
+        elif hybrid:                                          # kept on the GPU
+            self._keep_max = int(min(REUSE_KEEP, (0.9 * (gpu.mem_free() + on_gpu) - 0.4e9) // (8.0 * Nq * Nq)))
+        else:
+            self._keep_max = int(min(REUSE_KEEP, (0.8 * (available_memory() + kept) - host - 0.9e9) // (8.0 * Nq * Nq)))
+        dense_kept = self._keep_max >= 1 and not hybrid
+        if precision == 'mixed' and not hybrid and not dense_kept and self._reusable(f):
+            X = self._solve_reused(f, E, Sx)
+            if X is not None:
+                return X
+        if self._keep_max < 1:
+            self._kept = []                                 # the kept LU's memory is the new Z's
+        t_fresh = time.time()
+        dt = np.complex64 if precision == 'mixed' and not hybrid and not dense_kept else np.complex128
         with sim.log.timer('direct fill', f"N={N}, {np.dtype(dt).name}, {self.core.num_threads()} threads"):
             Z = np.zeros((N, N), dt)
             (self.core.fill_far_c64 if dt == np.complex64 else self.core.fill_far)(Z, self.g, self.tb, self.w)
+        ready = self._ready == f                            # a reused LU's attempt set them up
         with sim.log.timer('near-field correction'):
             if dt == np.complex64:
                 # keep the exact near correction (sparse, double) for the refinement products
-                self.dZ_exact = self._near_exact()
+                if not ready:
+                    self.dZ_exact = self._near_exact()
                 Dc = self.dZ_exact.tocoo()
                 Z[Dc.row, Dc.col] += Dc.data.astype(dt)            # one entry per (row, col): no add.at needed
                 del Dc
             else:
                 self.dZ_exact = None
                 self._qcorr = self.core.near_into_dense(Z, self.g, self.tb, self.q, self.nP32, self.nQ32, self.w)
-        self._vias(f)
+                self._near_kept()
+        if not ready:
+            self._vias(f)
+        self._ready = None
         if Nv:
             Z[:Ne, Ne:], Z[Ne:, :Ne], Z[Ne:, Ne:] = self.B, self.B.T, self.C
         if Sx.nnz:
@@ -623,7 +706,9 @@ class FastOperator:
                 Z = project(Z, sim.quad_info['keep'], sim.quad_info['elim'], self._qC, core=self.core)
         dsc = 1.0 / np.sqrt(np.abs(np.diagonal(Z)).astype(float) + 1e-300)
         if hybrid:
-            return up(self._solve_hybrid(f, Z, dsc, down(E), gpu))
+            return up(self._solve_kept(f, Z, dsc, down(E), gpu))
+        if dense_kept and precision == 'mixed':
+            return up(self._solve_kept(f, Z, dsc, down(E)))
         gpu = self._mixed_gpu(Nq) if precision == 'mixed' else None
         _equilibrate(Z, dsc)
         if gpu is not None:
@@ -644,12 +729,16 @@ class FastOperator:
                 return up(dsc[:, None] * _lu_solve(lu, B))
         # mixed: GMRES on the exact (double, matrix-free) equilibrated operator, LU(complex64) preconditioner
         with sim.log.timer('refinement (GMRES, exact matvec)'):
+            t = time.time()
             Y, ok, rel = self._refine(lambda V: dsc[:, None] * down(self.matvec_exact(up(dsc[:, None] * V), Sx)), B,
                                       gpu.solve if gpu is not None else (lambda R: _lu_solve(lu, R)), MIXED_MAX_ITER, 1)
+            self._t_iter = (time.time() - t) / max(1, max(self.iters, default=1))
         if gpu is not None:
             gpu.release()
         sim.log.note(f"mixed precision: GMRES iterations per port {self.iters}")
         if ok:
+            if gpu is None and sim.reuse != 'off':
+                self._kept = [(f, _Kept(lu), dsc, time.time() - t_fresh)]
             return up(dsc[:, None] * Y)
         # the single-precision LU can be too weak a preconditioner (fine meshes at low frequency: the MPIE matrix is
         # ill-conditioned); an unconverged refinement returns garbage: this solve, and those up to MIXED_RETRY x f,
@@ -658,6 +747,150 @@ class FastOperator:
                      f"- solving in double precision up to {MIXED_RETRY * f / 1e9:.4g} GHz")
         self._mixed_failed = max(self._mixed_failed, f)
         return self.solve_direct(f, E, block, precision='double')
+
+    def _reusable(self, f):
+        """The kept preconditioner (_solve_reused, _solve_kept) to try at f: the one nearest in frequency, if near
+        enough; or None."""
+        if self.sim.reuse == 'off' or not self._kept:
+            return None
+        k = min(self._kept, key=lambda k: abs(np.log(f / k[0])))
+        return k if abs(np.log(f / k[0])) <= self._reach else None
+
+    def _drop_kept(self, only=object):
+        """Drop the most redundant kept factorisation (of type only): the one nearest another kept one."""
+        idx = [i for i, k in enumerate(self._kept) if isinstance(k[1], only)]
+        lf = np.log([k[0] for k in self._kept])
+        gap = [min((abs(lf[i] - y) for j, y in enumerate(lf) if j != i), default=0.0) for i in idx]
+        del self._kept[idx[int(np.argmin(gap))]]
+
+    def _reach_learn(self, d, ok, iters, cap):
+        """The reach after a reused preconditioner at |ln(f / f0)| = d took iters (ok: converged in cap)."""
+        if ok and max(iters) <= cap // 2:                    # well inside the cap: try further from f0
+            self._reach = max(self._reach, 1.25 * d)
+        elif not ok:
+            self._reach = min(self._reach, 0.8 * d)         # not as far as this again
+
+    def _solve_kept(self, f, Z, dsc, E, gpu=None):
+        """Mixed precision with LUs kept (up to _keep_max of them): Z (double, at f) equilibrated, GMRES with the dense
+        Z and the kept complex64 LU nearest in frequency as preconditioner, capped at what a new one costs; where
+        that does not converge, the complex64 copy of Z factored (on the GPU when there is one, the factor then
+        downloaded: the triangular solves stay on the CPU, gpu.py) and kept (the one nearest another kept one
+        dropped past _keep_max), GMRES with it; double precision on the CPU where that does not converge either, and
+        up to MIXED_RETRY (HYBRID_RETRY) x f. Returns the currents, equilibration undone."""
+        sim = self.sim
+        if gpu is not None and not self._gpu_logged:
+            self._gpu_logged = True
+            sim.log.note(f"GPU: {gpu.device} via {gpu.name}, {gpu.mem_free() / 1e9:.1f} GB free: complex64 LU there, "
+                         f"double-precision refinement on the host")
+        _equilibrate(Z, dsc)
+        B = dsc[:, None] * E
+        A = lambda V: Z @ V
+        # near where the GPU's triangular solves lost a factor's accuracy (gpu.py): factored there, solved here
+        bad = gpu is not None and f <= HYBRID_RETRY * self._gpu_solve_bad
+        k = self._reusable(f)
+        if k is not None and bad and isinstance(k[1], _GPUKept):
+            k = None
+        if k is not None:
+            f0, M0, d0, t_fresh = k
+            r = (d0 / dsc)[:, None]                          # Z^-1 ~ D0 Z0s^-1 D0: Zs^-1 ~ (D0 / D) Z0s^-1 (D0 / D)
+            cap = int(np.clip(0.8 * t_fresh / max(self._t_iter or 1e-3, 1e-6), *REUSE_ITER))
+            with sim.log.timer('refinement (GMRES, reused factorisation)',
+                               f"the one of {f0 / 1e9:.4g} GHz, at most {cap} iterations"):
+                t = time.time()
+                Y, ok, rel = self._refine(A, B, lambda R: r * M0(r * R), cap, 1)
+                self._t_iter = (time.time() - t) / max(1, max(self.iters, default=1))
+            self._reach_learn(abs(np.log(f / f0)), ok, self.iters, cap)
+            if ok:
+                sim.log.note(f"reused LU ({f0 / 1e9:.4g} GHz): GMRES iterations per port {self.iters}")
+                return dsc[:, None] * Y
+            sim.log.note(f"the LU of {f0 / 1e9:.4g} GHz did not precondition {f / 1e9:.4g} GHz in {cap} iterations "
+                         f"(residual {rel:.1e}) - a new one")
+        t0, lu, held = time.time(), None, None
+        if gpu is not None:
+            n = len(dsc)
+            while not gpu.fits(n) and any(isinstance(k[1], _GPUKept) for k in self._kept):
+                self._drop_kept(only=_GPUKept)               # room for the new one
+                gpu.release()
+            with sim.log.timer('LU factor (GPU)', f"N={n}, {gpu.name}"):
+                try:
+                    gpu.factor(Z.astype(np.complex64))
+                    if bad:
+                        lu = gpu.download()
+                    else:
+                        held = _GPUKept(gpu, 8.0 * n * n)
+                except Exception as e:                      # driver / unsupported dtype: the CPU's
+                    sim.log.note(f"GPU LU failed ({type(e).__name__}: {e}) - factoring on the CPU")
+                finally:
+                    gpu.release()
+        if lu is None and held is None:
+            with sim.log.timer('LU factor', f"N={len(dsc)}, complex64"):
+                lu = _lu(Z.astype(np.complex64))
+        with sim.log.timer('refinement (GMRES, dense double)'):
+            t = time.time()
+            Y, ok, rel = self._refine(A, B, held if held is not None else (lambda R: _lu_solve(lu, R)), MIXED_MAX_ITER, 1)
+            self._t_iter = (time.time() - t) / max(1, max(self.iters, default=1))
+        sim.log.note(f"mixed precision{' (GPU)' if gpu is not None else ''}: GMRES iterations per port {self.iters}")
+        if not ok and held is not None:
+            # ROCm's complex64 triangular solves lose the accuracy of an ill-conditioned factor (gpu.py): the same
+            # factor solved on the CPU, here and up to HYBRID_RETRY x f
+            sim.log.note(f"the GPU's solves with its LU did not converge at {f / 1e9:.4g} GHz (residual {rel:.1e}) - "
+                         f"the factor solved on the CPU up to {HYBRID_RETRY * f / 1e9:.4g} GHz")
+            self._gpu_solve_bad = max(self._gpu_solve_bad, f)
+            lu, held = held.download(), None
+            self._kept = [k for k in self._kept if not isinstance(k[1], _GPUKept)
+                          or k[0] > HYBRID_RETRY * self._gpu_solve_bad]
+            with sim.log.timer('refinement (GMRES, dense double)'):
+                Y, ok, rel = self._refine(A, B, lambda R: _lu_solve(lu, R), MIXED_MAX_ITER, 1)
+        if ok:
+            if held is not None or gpu is None:              # (factored on the GPU, solved here: not kept)
+                self._kept.append((f, held if held is not None else _Kept(lu), dsc, time.time() - t0))
+            while len(self._kept) > self._keep_max:
+                self._drop_kept()
+            return dsc[:, None] * Y
+        del lu, held
+        retry = HYBRID_RETRY if gpu is not None else MIXED_RETRY
+        sim.log.note(f"WARNING mixed precision{' (GPU)' if gpu is not None else ''} did not converge at "
+                     f"{f / 1e9:.4g} GHz (residual {rel:.1e}) - solving in double precision up to {retry * f / 1e9:.4g} GHz")
+        if gpu is not None:
+            self._hybrid_failed = max(self._hybrid_failed, f)
+        else:
+            self._mixed_failed = max(self._mixed_failed, f)
+        with sim.log.timer('LU factor', f"N={len(dsc)}"):
+            return dsc[:, None] * _lu_solve(_lu(Z), B)
+
+    def _solve_reused(self, f, E, Sx, ready=False):
+        """A solve without a new factorisation: GMRES on the exact operator at f, preconditioned with the one kept
+        from an earlier frequency f0 (the complex64 LU of the mixed direct solver, BLR's or HODLR's, and its
+        equilibration). Z changes smoothly with f, so the LU of one frequency preconditions the band: on the via
+        transition (13.5k unknowns) the 5 GHz LU took 6-30 iterations from 1 to 10 GHz, 4-11 s a solve against 13 s
+        with its own fill and LU; the hairpin 5-28. The iterations are capped at what a fresh solve costs
+        (REUSE_ITER); past it None, and the caller factors at f (that factorisation is then the one kept). ready:
+        dZ_exact, B and C are already f's."""
+        sim, k = self.sim, self._reusable(f)
+        f0, M, dsc, t_fresh = k
+        d = abs(np.log(f / f0))
+        T = sim.qT
+        up, down = ((lambda X: X), (lambda X: X)) if T is None else ((lambda X: T @ X), (lambda X: np.asarray(T.T @ X)))
+        t0 = time.time()
+        if not ready:
+            with sim.log.timer('near-field correction'):
+                self.dZ_exact = self._near_exact()
+            self._vias(f)
+        setup = time.time() - t0
+        cap = int(np.clip(0.8 * (t_fresh - setup) / max(self._t_iter or 1e-3, 1e-6), *REUSE_ITER))
+        with sim.log.timer('refinement (GMRES, reused factorisation)', f"the one of {f0 / 1e9:.4g} GHz, at most {cap} iterations"):
+            t = time.time()
+            Y, ok, rel = self._refine(lambda V: dsc[:, None] * down(self.matvec_exact(up(dsc[:, None] * V), Sx)),
+                                      dsc[:, None] * down(E), M, cap, 1)
+            self._t_iter = (time.time() - t) / max(1, max(self.iters, default=1))
+        self._reach_learn(d, ok, self.iters, cap)
+        if ok:
+            sim.log.note(f"reused LU ({f0 / 1e9:.4g} GHz): GMRES iterations per port {self.iters}")
+            return up(dsc[:, None] * Y)
+        sim.log.note(f"the LU of {f0 / 1e9:.4g} GHz did not precondition {f / 1e9:.4g} GHz in {cap} iterations "
+                     f"(residual {rel:.1e}) - a new one")
+        self._kept, self._ready = [], f                     # the fresh solve keeps this near field and these vias
+        return None
 
     def _solve_tiled(self, f, E, Sx, gpu, block=1024):
         """Mixed precision without a dense Z anywhere: the symmetric part of the equilibrated Z factored as
@@ -760,42 +993,6 @@ class FastOperator:
             return None
         return gpu
 
-    def _solve_hybrid(self, f, Z, dsc, E, gpu):
-        """Mixed precision with the LU on the GPU: Z (double, host) equilibrated, its complex64 copy factored on
-        the GPU, GMRES on the double Z with that LU as the preconditioner; double precision on the CPU when the
-        refinement does not converge."""
-        sim, Z64 = self.sim, None
-        if self.core is not None and hasattr(self.core, 'scale_c64') and Z.dtype == complex and Z.flags.c_contiguous:
-            Z64 = self.core.scale_c64(Z, np.ascontiguousarray(dsc, float))         # Z scaled, and its complex64 copy
-        else:
-            _equilibrate(Z, dsc)
-        if not self._gpu_logged:
-            self._gpu_logged = True
-            sim.log.note(f"GPU: {gpu.device} via {gpu.name}, {gpu.mem_free() / 1e9:.1f} GB free: complex64 LU there, "
-                         f"double-precision refinement on the host")
-        B = dsc[:, None] * E
-        with sim.log.timer('LU factor (GPU)', f"N={Z.shape[0]}, {gpu.name}"):
-            try:
-                gpu.factor(Z.astype(np.complex64) if Z64 is None else Z64)
-                del Z64
-            except Exception as e:                          # driver / unsupported dtype: double on the CPU
-                sim.log.note(f"GPU LU failed ({type(e).__name__}: {e}) - factoring on the CPU in double")
-                gpu.release()
-                return dsc[:, None] * _lu_solve(_lu(Z), B)
-        with sim.log.timer('refinement (GMRES, dense double)'):
-            # 2 restarts at most: where the complex64 LU is too weak (many via chains: the SMA launch, 536 via
-            # unknowns) 300 iterations had not converged and cost 55 s, three times a double LU
-            Y, ok, rel = self._refine(lambda V: Z @ V, B, gpu.solve, 30, 2)
-        gpu.release()
-        sim.log.note(f"mixed precision (GPU): GMRES iterations per port {self.iters}")
-        if not ok:
-            sim.log.note(f"mixed precision (GPU) did not converge at {f / 1e9:.4g} GHz (residual {rel:.1e}): "
-                         f"double precision up to {HYBRID_RETRY * f / 1e9:.4g} GHz")
-            self._hybrid_failed = max(self._hybrid_failed, f)
-            with sim.log.timer('LU factor', f"N={Z.shape[0]}"):
-                Y = _lu_solve(_lu(Z), B)
-        return dsc[:, None] * Y
-
     def _solve_direct_numpy(self, f, E, block=1024):
         """Same entries as the fast operator (centroid far field + exact near correction), written
         into a dense Z block by block and LU-solved: memory ~ N^2 complex, robust at resonances."""
@@ -848,7 +1045,7 @@ class FastOperator:
             return M
         return raw
 
-    def solve_hodlr(self, f, E, tol=1e-6, leaf=256, refine=False):
+    def solve_hodlr(self, f, E, tol=1e-6, leaf=256, refine=False, symmetric=False):
         """The hierarchical direct solver (hodlr.HODLR): Z compressed from its entries, factored recursively; no
         dense Z. refine: GMRES on the exact matrix-free operator, the HODLR solve its preconditioner."""
         from .hodlr import HODLR
@@ -859,6 +1056,11 @@ class FastOperator:
         self.setup(f, mode='sparse')
         self.dZ_exact = self.dZ
         Sx = self.extra_blocks(f)
+        if self._reusable(f):
+            X = self._solve_reused(f, E, Sx, ready=True)
+            if X is not None:
+                return X
+        self._kept, t_fresh = [], time.time()
         dZx = (self.dZ + Sx[:Ne, :Ne]).tocsr()
         raw = self._raw_entry(dZx)
         pts = self._points()
@@ -875,22 +1077,27 @@ class FastOperator:
         sig.eliminate_zeros()
         with sim.log.timer('HODLR compress + factor', f"N={N}, tol {tol:g}"):
             self.hodlr = H = HODLR(lambda r, c: raw(r, c) * dsc[r][:, None] * dsc[c][None, :], pts, leaf=leaf, tol=tol,
-                                   near=sig, log=sim.log.note)
+                                   near=sig, log=sim.log.note, symmetric=symmetric)
         sim.log.note(f"HODLR: {H.stats()}")
         B = dsc[:, None] * E
         if not refine:
             with sim.log.timer('HODLR solve'):
-                return dsc[:, None] * H.solve(B)
+                X = dsc[:, None] * H.solve(B)
+            self._kept = [(f, H.solve, dsc, time.time() - t_fresh)]
+            return X
         with sim.log.timer('refinement (GMRES, exact matvec)'):
+            t = time.time()
             Y, ok, rel = self._refine(lambda V: dsc[:, None] * self.matvec_exact(dsc[:, None] * V, Sx), B, H.solve,
                                       MIXED_MAX_ITER, 1)
+            self._t_iter = (time.time() - t) / max(1, max(self.iters, default=1))
         sim.log.note(f"HODLR: GMRES iterations per port {self.iters}" + ('' if ok else f", NOT converged ({rel:.1e})"))
         if not ok and tol > 1e-9:
             # too loose a factorisation for this matrix (fine meshes at low frequency are ill-conditioned): again at
             # 100 x tighter, rather than an unconverged answer
             sim.log.note(f"WARNING HODLR refinement did not converge at {f / 1e9:.4g} GHz with tol {tol:g} - "
                          f"factoring again at {tol / 100:g}")
-            return self.solve_hodlr(f, E, tol=tol / 100, leaf=leaf, refine=True)
+            return self.solve_hodlr(f, E, tol=tol / 100, leaf=leaf, refine=True, symmetric=symmetric)
+        self._kept = [(f, H.solve, dsc, time.time() - t_fresh)]
         return dsc[:, None] * Y
 
     def solve_blr(self, f, E, tol=1e-4, tile=256, eta=1.0, dtype=np.complex64):
@@ -903,6 +1110,11 @@ class FastOperator:
         self.setup(f, mode='sparse')
         self.dZ_exact = self.dZ
         Sx = self.extra_blocks(f)
+        if self._reusable(f):
+            X = self._solve_reused(f, E, Sx, ready=True)
+            if X is not None:
+                return X
+        self._kept, t_fresh = [], time.time()
         dZx = (self.dZ + Sx[:Ne, :Ne]).tocsr()
         tiles, boxes = cluster_tiles(self._points(), tile)
         raw = self._raw_entry(dZx)
@@ -917,11 +1129,15 @@ class FastOperator:
                      f"{100 * blr.memory / (16 * N * N):.0f}% of complex128), {blr.stats['lowrank']} low-rank tiles, "
                      f"mean rank {blr.stats['rank_sum'] / max(1, blr.stats['lowrank']):.0f}")
         with sim.log.timer('GMRES (BLR preconditioned)'):
-            Y, _ = self._gmres_columns(LinearOperator((N, N), matvec=lambda y: dsc * self.matvec_exact(dsc * y, Sx),
+            t = time.time()
+            Y, infos = self._gmres_columns(LinearOperator((N, N), matvec=lambda y: dsc * self.matvec_exact(dsc * y, Sx),
                                                       dtype=complex),
                                        LinearOperator((N, N), matvec=blr.solve, dtype=complex),
                                        dsc[:, None] * E, self.mixed_tol, 50, 10)
+            self._t_iter = (time.time() - t) / max(1, sum(self.iters))     # column by column
         sim.log.note(f"BLR: GMRES iterations per port {self.iters}")
+        if all(i == 0 for i in infos):
+            self._kept = [(f, blr.solve, dsc, time.time() - t_fresh)]
         return dsc[:, None] * Y
 
 
@@ -964,7 +1180,10 @@ def gmres_batched(A, B, M=None, x0=None, rtol=1e-6, restart=30, maxiter=10):
                                         -np.conj(sn[i]) * H[i, j] + np.conj(cs[i]) * H[i + 1, j])
             den = np.sqrt(np.abs(H[j, j]) ** 2 + np.abs(H[j + 1, j]) ** 2)
             den[den == 0] = 1.0
-            cs[j], sn[j] = H[j, j] / den, H[j + 1, j] / den
+            # conjugated: [[c, s], [-s*, c*]] [a, b] = [|(a, b)|, 0] for complex a, b (without the conjugates the
+            # second entry is not zero and |g| underestimated the residual: 7 iterations "converged" at a true
+            # 1.5e-4 where SciPy's GMRES took 12 to 5e-8)
+            cs[j], sn[j] = H[j, j].conj() / den, H[j + 1, j].conj() / den
             H[j, j], H[j + 1, j] = cs[j] * H[j, j] + sn[j] * H[j + 1, j], 0
             g[j + 1], g[j] = -np.conj(sn[j]) * g[j], cs[j] * g[j]
             iters[act[live]] += 1

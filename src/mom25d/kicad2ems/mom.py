@@ -73,6 +73,12 @@ def factorisations(runlog):
     return gpu, cpu
 
 
+def reused(runlog):
+    """The solves of a sweep that reused a factorisation kept from another frequency instead of their own."""
+    tried = sum(stage == 'refinement (GMRES, reused factorisation)' for stage, _, _ in getattr(runlog, "records", ()))
+    return tried - sum('did not precondition' in n for n in getattr(runlog, "notes", ()))
+
+
 def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, log=print, progress=None,
           hold=None, tiled='auto', on_step=None, core='auto', quads=False, zone=None,
           signal_vias='round', stitching_vias='auto', lines=None, keep_at=(), stack='ground', quad_tol=35.0,
@@ -115,7 +121,9 @@ def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, log=print, 
     log(f"mom25d: {res.unknowns:,} unknowns, solver {res.solver}, ports " +
         ", ".join(f"{p['name']} ({p['kind']})" for p in res.ports))
     gpu_n, cpu_n = factorisations(res.sim.log)
-    log(f"mom25d: factorisations: {gpu_n} on the GPU, {cpu_n} on the CPU")       # benchmarks: where the solves ran
+    n_re = reused(res.sim.log)
+    log(f"mom25d: factorisations: {gpu_n} on the GPU, {cpu_n} on the CPU"         # benchmarks: where the solves ran
+        + (f"; {n_re} solves reused one" if n_re else ''))
     S = res.S
     if pairs:                                                       # mom25d's modal ports -> kicad2ems order
         _, names, zref = mixed_mode(np.zeros((1, len(m.ports), len(m.ports))), m)

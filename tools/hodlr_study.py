@@ -2,7 +2,7 @@
 memory, the ranks per tree level and |dS| at one frequency.
 
     python tools/hodlr_study.py board.json f_GHz [tol,tol,...] [--no-dense] [--zone] [--drop] [--whole] [--refine]
-                                [--leaf N]
+                                [--leaf N] [--sym]
 """
 import json, sys, time
 import numpy as np
@@ -38,6 +38,7 @@ def main():
     for tol in tols:
         s = build(board, 'hodlr', zone, model=model)
         s.hodlr_tol, s.hodlr_leaf, s.hodlr_refine = tol, leaf, '--refine' in a
+        s.hodlr_symmetric = '--sym' in a
         if '--once' not in a:                                    # a warm-up solve, out of the timing
             s.sparams(f)
         n0 = len(s.log.records)

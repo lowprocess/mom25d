@@ -351,7 +351,13 @@ py::tuple offplane_pairs(arr<double> nodes, arr<int> tris, arr<double> P6, arr<d
 //   mode 0: atomically add into dense Z (any T);  mode 1: y += dZ x  (x given);  mode 2: COO output
 // ---------------------------------------------------------------------------------------------
 struct NearOut { int mode; void *Z; size_t ld; bool single; const cd *x; cd *y;
-                 int *ri, *ci; cd *vv; cd *qcorr; };
+                 int *ri, *ci; cd *vv; cd *qcorr;
+                 double *stat; bool stat_ready; };   // stat: the analytic parts' geometry, 2 x 6 a pair (NEAR_STAT)
+
+// the analytic (extracted) parts of a pair's moments are geometry only - m0, mro, mrs, mrr of each extracted
+// distance (tb.d, tb.dimg: the stack's) - and cost most of a pair (offplane_one: logs and arctangents at 6 points x
+// 3 edges); kept across frequencies when the caller gives stat (n x NEAR_STAT doubles)
+static const int NEAR_STAT = 12;
 
 static inline void atomic_add(cd *z, cd v) {
     double *p = reinterpret_cast<double *>(z);
@@ -400,16 +406,20 @@ void near_core(const Mesh &g, const Tables &tb, const double *nodes, const int *
         // analytic parts
         double V[6];
         for (int k = 0; k < 3; ++k) { V[2 * k] = nodes[2 * tris[3 * q + k]]; V[2 * k + 1] = nodes[2 * tris[3 * q + k] + 1]; }
-        auto add = [&](double dd, cd cA, cd cq) {
-            double m0, mro[2], mrs[2], mrr;
-            offplane_one(V, P6 + 12 * (size_t)p, W6 + 6 * (size_t)p, dd, m0, mro, mrs, mrr);
-            M0 += cA * m0; Mox += cA * mro[0]; Moy += cA * mro[1]; Msx += cA * mrs[0]; Msy += cA * mrs[1];
-            Mrr += cA * mrr; Mq += cq * m0;
+        auto add = [&](int k, double dd, cd cA, cd cq) {
+            double st[6], *m = o.stat ? o.stat + NEAR_STAT * (size_t)i + 6 * k : st;
+            if (!(o.stat && o.stat_ready)) {
+                double mro[2], mrs[2];
+                offplane_one(V, P6 + 12 * (size_t)p, W6 + 6 * (size_t)p, dd, m[0], mro, mrs, m[5]);
+                m[1] = mro[0]; m[2] = mro[1]; m[3] = mrs[0]; m[4] = mrs[1];
+            }
+            M0 += cA * m[0]; Mox += cA * m[1]; Moy += cA * m[2]; Msx += cA * m[3]; Msy += cA * m[4];
+            Mrr += cA * m[5]; Mq += cq * m[0];
         };
         if (tb.kind[t] == 0) {
-            add(0.0, tb.cA[t], tb.cq[t]);
-            if (tb.dimg[t] > 0) add(tb.dimg[t], tb.cAi[t], tb.cqi[t]);
-        } else if (tb.kind[t] == 1) add(tb.d[t], tb.cA[t], tb.cq[t]);
+            add(0, 0.0, tb.cA[t], tb.cq[t]);
+            if (tb.dimg[t] > 0) add(1, tb.dimg[t], tb.cAi[t], tb.cqi[t]);
+        } else if (tb.kind[t] == 1) add(0, tb.d[t], tb.cA[t], tb.cq[t]);
         // minus the centroid value used by the far operator
         {
             double r = dist(g.cent, p, q);
@@ -452,6 +462,16 @@ void near_core(const Mesh &g, const Tables &tb, const double *nodes, const int *
     }
 }
 
+// quad["stat"] (n x NEAR_STAT float64, C order: written in place) and quad["stat_ready"]: near_core's kept analytic parts
+static void near_stat(py::dict quad, int n, NearOut &o) {
+    if (!quad.contains("stat")) return;
+    py::array st = quad["stat"];
+    if (st.dtype().kind() != 'f' || st.itemsize() != 8 || !(st.flags() & py::array::c_style) || st.size() != (py::ssize_t)n * NEAR_STAT)
+        throw std::invalid_argument("quad['stat']: a C-ordered float64 array of n x 12");
+    o.stat = static_cast<double *>(st.mutable_data());
+    o.stat_ready = quad["stat_ready"].cast<bool>();
+}
+
 // mode 0: Z (dense, complex128 or complex64) += correction ; returns qcorr (per pair Q0 correction)
 py::array_t<cd> near_into_dense(py::array Z, py::dict geom, py::dict tabs, py::dict quad, arr<int> P,
                                 arr<int> Q, double w) {
@@ -463,6 +483,7 @@ py::array_t<cd> near_into_dense(py::array Z, py::dict geom, py::dict tabs, py::d
     NearOut o{};
     auto buf = Z.request(true);
     o.mode = 0; o.Z = buf.ptr; o.ld = buf.shape[1]; o.single = (buf.itemsize == 8); o.qcorr = qc.mutable_data();
+    near_stat(quad, (int)P.shape(0), o);
     {
         py::gil_scoped_release nogil;
         near_core(mh.m, th.t, nodes.data(), tris.data(), P3.data(), W3.data(), P6.data(), W6.data(),
@@ -481,6 +502,7 @@ py::array_t<cd> near_matvec(arr<cd> x, py::dict geom, py::dict tabs, py::dict qu
     std::fill(y.mutable_data(), y.mutable_data() + mh.m.Ne, cd(0));
     NearOut o{};
     o.mode = 1; o.x = x.data(); o.y = y.mutable_data();
+    near_stat(quad, (int)P.shape(0), o);
     {
         py::gil_scoped_release nogil;
         near_core(mh.m, th.t, nodes.data(), tris.data(), P3.data(), W3.data(), P6.data(), W6.data(),
@@ -499,6 +521,7 @@ py::tuple near_coo(py::dict geom, py::dict tabs, py::dict quad, arr<int> P, arr<
     py::array_t<cd> vv((size_t)9 * n), qc(n);
     NearOut o{};
     o.mode = 2; o.ri = ri.mutable_data(); o.ci = ci.mutable_data(); o.vv = vv.mutable_data(); o.qcorr = qc.mutable_data();
+    near_stat(quad, (int)P.shape(0), o);
     {
         py::gil_scoped_release nogil;
         near_core(mh.m, th.t, nodes.data(), tris.data(), P3.data(), W3.data(), P6.data(), W6.data(),

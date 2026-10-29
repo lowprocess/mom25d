@@ -271,6 +271,8 @@ class Simulation:
         self.core_mode = core               # 'compiled': the compiled core's direct solver for small boards too
         self.blr_tol, self.blr_tile, self.blr_eta = 1e-3, 512, 0.7   # solver='blr' preconditioner settings
         self.hodlr_tol, self.hodlr_leaf, self.hodlr_refine = 1e-6, 256, False   # solver='hodlr'
+        self.hodlr_symmetric = False        # Z^T = Z: half the compression (the near correction is not quite)
+        self.reuse = 'auto'                 # 'auto' | 'off': the CPU's complex64 LU kept for the next frequencies
         self.dmax, self.ncross, self.grade, self.near_fac = dmax, ncross, grade, near_fac
         self.user_ports = list(ports)
         self.ports = [m for p in ports for m in (p.modes() if isinstance(p, DiffPort) else [p])]
@@ -752,7 +754,8 @@ class Simulation:
         if self.solver == 'blr':
             return self.fast.solve_blr(f, E, tol=self.blr_tol, tile=self.blr_tile, eta=self.blr_eta)
         if self.solver == 'hodlr':
-            return self.fast.solve_hodlr(f, E, tol=self.hodlr_tol, leaf=self.hodlr_leaf, refine=self.hodlr_refine)
+            return self.fast.solve_hodlr(f, E, tol=self.hodlr_tol, leaf=self.hodlr_leaf, refine=self.hodlr_refine,
+                                         symmetric=self.hodlr_symmetric)
         if self.qT is not None:
             T = self.qT
             return T @ self.solve(np.asarray(T.T @ (T.T @ self.impedance(f).T).T), np.asarray(T.T @ E))
