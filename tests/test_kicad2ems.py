@@ -263,3 +263,15 @@ def test_whole_stack_antenna_radiates_behind_its_ground(run_cli, tmp_path):
     from mom25d.board import BoardModel
     board = json.loads((out / 'patch_board.json').read_text())
     assert not BoardModel(board, log=lambda *a: None).whole and BoardModel(board, ground='none', log=lambda *a: None).whole
+
+
+def test_factorisations_and_reused_solves_from_the_stage_records():
+    from types import SimpleNamespace
+    from mom25d.kicad2ems.mom import factorisations, reused
+    log = SimpleNamespace(records=[('LU factor', 1.0, 'N=100, complex64, kept'), ('LU factor (GPU)', 1.0, ''),
+                                   ('refinement (GMRES, reused factorisation)', 0.5, ''),
+                                   ('refinement (GMRES, reused factorisation)', 0.5, ''), ('LU factor', 1.0, 'N=100')],
+                          notes=['the LU of 1 GHz did not precondition 3 GHz in 20 iterations (residual 1e-2) - a new one'])
+    assert factorisations(log) == (1, 2)
+    assert reused(log) == 1                                         # one of the two attempts converged
+    assert reused(SimpleNamespace()) == 0

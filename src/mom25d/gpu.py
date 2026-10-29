@@ -2,8 +2,11 @@
 mom25d.gpu - GPU dense LU for the mixed-precision direct solver (AMD ROCm or NVIDIA CUDA)
 
 The matrix is still filled on the CPU (the C++ core takes ~2 s); the expensive O(N^3) part, the
-complex64 LU factorisation, and the triangular solves used as the GMRES preconditioner run on the
-GPU. Refinement products stay on the CPU in double precision, so results match the CPU solver.
+complex64 LU factorisation, runs on the GPU. The direct solver downloads the factor (download) and does the
+triangular solves of the GMRES preconditioner on the CPU: ROCm's complex64 triangular solve lost the accuracy of
+ill-conditioned factors (demo_transition at 1 GHz, smallest pivot 2e-7: a forward error of 6e3 against 0.13 for the
+same factor solved on the CPU), and the factor on the host is also kept for the next frequencies. Refinement
+products stay on the CPU in double precision, so results match the CPU solver.
 
 Backends (picked in this order by gpu='auto'; force with MOM25D_GPU=cupy|torch|off):
   cupy   CuPy built for ROCm (hipSOLVER/rocSOLVER) or CUDA. LU in place: VRAM ~ 8 N^2 bytes.
@@ -34,6 +37,10 @@ class _Backend:
 
     def release(self):
         self.lu = self.piv = None
+
+    def download(self):
+        """The factor on the host, as scipy.linalg.lu_factor's of A = Z^T: (lu, piv), Fortran order, 0-based."""
+        raise NotImplementedError
 
 
 class CupyBackend(_Backend):
@@ -66,6 +73,9 @@ class CupyBackend(_Backend):
         x = self.cla.lu_solve((self.lu, self.piv), self.cp.asarray(np.asarray(R, np.complex64)), trans=1,
                               check_finite=False)                # (Z^T)^T x = R
         return self.cp.asnumpy(x).astype(complex)
+
+    def download(self):
+        return self.cp.asnumpy(self.lu, order='F'), self.cp.asnumpy(self.piv)
 
     def release(self):
         super().release()
@@ -103,6 +113,9 @@ class TorchBackend(_Backend):
         out = np.conj(self.torch.linalg.lu_solve(self.lu, self.piv, b, adjoint=True).cpu().numpy()).astype(complex)
         return out[:, 0] if R.ndim == 1 else out
 
+    def download(self):
+        return np.asfortranarray(self.lu.cpu().numpy()), self.piv.cpu().numpy().astype(np.int32) - 1
+
     def release(self):
         super().release()
         self.torch.cuda.empty_cache()
@@ -126,6 +139,9 @@ class EmulatedBackend(_Backend):
     def solve(self, R):
         return sla.lu_solve((self.lu, self.piv), np.asarray(R, np.complex64), trans=1,
                             check_finite=False).astype(complex)
+
+    def download(self):
+        return self.lu, self.piv
 
 
 _BACKENDS = {'cupy': CupyBackend, 'torch': TorchBackend, 'emulate': EmulatedBackend}

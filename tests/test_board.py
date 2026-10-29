@@ -93,7 +93,9 @@ def test_solve_board_is_the_steps_it_wraps():
     fs, S, info = solve_band(sim, 1e9, 3e9, points=5, zref=m.port_z0, max_solves=5, afs_tol=5e-3, log=quiet)
     assert np.allclose(res.S, S) and res.names == info['names'] == ['P1', 'P2']
     assert res.solves == len(calls) and calls[-1][:2] == (res.solves, 5)
-    assert np.abs(res.S).max() <= 1 + 1e-6 and np.abs(res.S - res.S.transpose(0, 2, 1)).max() < 1e-6
+    # reciprocal to 1e-3: the core's direct solver (near pairs corrected per ordered pair) leaves Z symmetric to
+    # about 1e-4 in S, NumPy's dense one (without the core) exactly
+    assert np.abs(res.S).max() <= 1 + 1e-6 and np.abs(res.S - res.S.transpose(0, 2, 1)).max() < 1e-3
 
 
 def test_wave_ports_with_the_characterised_gamma():
@@ -117,3 +119,82 @@ def test_wall_points_skip_a_via_already_there():
     pts = wall_points(walls, 0.5)
     assert len(pts) == 9 and sum((x, y) == (0.0, 0.0) for _, x, y in pts) == 1
     assert len(wall_points(walls, 0.5, taken=[(0.0, 1.02)])) == 8
+
+
+def stripline():
+    """The demo transition made a stripline: In1.Cu and F.Cu solid ground planes (the signal via, P1 and F.Cu's
+    copper gone), the trace on In2.Cu between B.Cu and In1.Cu, its stitching vias' lone pads beside it."""
+    data = board('demo')
+    full = dict(polygon=data['outline'], net='GND')
+    data['copper']['In1.Cu'] = [dict(full)]
+    data['copper']['F.Cu'] = [dict(full)]
+    data['vias'] = [v for v in data['vias'] if v['net'] in data['ground_nets']]
+    data['ports'] = [p for p in data['ports'] if p['layer'] == 'In2.Cu']
+    return data
+
+
+def test_solid_planes_as_pec_and_lone_pads_dropped():
+    """planes='pec': the solid plane over the trace is a PEC cover (the copper above it left out), the ground
+    stays B.Cu (the trace's layer is not solid), the stitching vias run from the ground to the cover.
+    stitching_pads='drop': the pads beside the trace, and nothing else, are left out; the vias are kept."""
+    from mom25d.board import pec_planes, lone_pads
+    data = stripline()
+    assert pec_planes(data, 'B.Cu') == ('B.Cu', 'In1.Cu')
+    assert pec_planes(board('demo'), 'B.Cu') == ('B.Cu', None)         # In1.Cu has the signal via's antipad
+    m = BoardModel(data, planes='pec', stitching_pads='keep', log=quiet)
+    assert m.cover == 'In1.Cu' and m.stack.top == 'pec' and m.stack.N == 2 and m.iface == {'In2.Cu': 1}
+    assert any('above the cover (F.Cu)' in n for n in m.notes)
+    assert {(v.k_bot, v.k_top) for v in m.vias} == {(0, 2)} and [sp['kref'] for sp in m.port_specs] == [0]
+    pads = lone_pads(data, ['In2.Cu'])['In2.Cu']
+    nets = [p['net'] for p in data['copper']['In2.Cu']]
+    assert len(pads) == nets.count('GND') and all(nets[i] == 'GND' for i in pads)
+    d = BoardModel(data, planes='pec', stitching_pads='drop', log=quiet)
+    assert len(d.vias) == len(m.vias) and d.shapes[1][0].area < m.shapes[1][0].area
+    meshed = BoardModel(data, planes='mesh', stitching_pads='keep', log=quiet)
+    assert meshed.cover is None and len(meshed.iface) == 3
+    assert BoardModel(data, log=quiet).cover == 'In1.Cu' and len(BoardModel(data, log=quiet).vias) == len(m.vias)   # the defaults
+
+
+def test_a_raised_ground():
+    """planes='pec' on a stripline whose lower plane is not the board's ground (rf_stripline: B.Cu, In2.Cu
+    solid, the trace on In1.Cu): the ground moves up to In2.Cu and B.Cu is left out."""
+    from mom25d.board import pec_planes
+    data = stripline()
+    data['copper']['In2.Cu'], data['copper']['In1.Cu'] = data['copper']['In1.Cu'], data['copper']['In2.Cu']
+    for p in data['ports']:
+        p['layer'], p['ref_layer'] = 'In1.Cu', 'In2.Cu'
+    assert pec_planes(data, 'B.Cu') == ('In2.Cu', 'F.Cu')
+    m = BoardModel(data, planes='pec', log=quiet)
+    assert m.ground == 'In2.Cu' and m.cover == 'F.Cu' and m.iface == {'In1.Cu': 1} and m.stack.N == 2
+    assert [sp['kref'] for sp in m.port_specs] == [0] and {(v.k_bot, v.k_top) for v in m.vias} == {(0, 2)}
+
+
+def test_a_pad_a_part_lands_on_is_not_lone():
+    """stitching_pads='drop' keeps a ground pad that a part terminates on: a shunt part's pad with its via to the
+    ground (demo_bandpass: dropped, it cut the part off the ground, |dS| 1.98). The part's s and e are its gap's
+    corners, so its pads touch that box without containing either."""
+    from shapely.geometry import shape
+    from mom25d.board import lone_pads
+    data = stripline()
+    pads = lone_pads(data, ['In2.Cu'])['In2.Cu']
+    p = shape(data['copper']['In2.Cu'][pads[0]]['polygon'])
+    x0, y0, x1, y1 = p.bounds
+    data['parts'] = [dict(ref='C1', R=0.1, L=0.0, C=1e-12, layer='In2.Cu', z=0.0, axis=0, s=[x1, y0, 0.0],
+                          e=[x1 + 0.5, y1, 0.0])]                    # the gap beside the pad's right edge
+    kept = lone_pads(data, ['In2.Cu'])['In2.Cu']
+    assert pads[0] not in kept and len(kept) == len(pads) - 1
+
+
+def test_a_ground_via_under_a_parts_pad_is_meshed_as_a_signal_via():
+    """A shunt part's ground via is not a stitching via: squared outside the zone, its pad lost the part
+    (demo_bandpass with --mom-zone on: |dS| 1.98)."""
+    data = stripline()
+    v = next(v for v in data['vias'] if v['net'] in data['ground_nets'])
+    data['parts'] = [dict(ref='C1', R=0.1, L=0.0, C=1e-12, layer='In2.Cu', z=0.0, axis=0, s=[v['x'] + 0.3, v['y'] - 0.2, 0.0],
+                          e=[v['x'] + 0.7, v['y'] + 0.2, 0.0])]
+    from shapely.geometry import box, Point
+    from mom25d.board import PART_VIA
+    gap = box(v['x'] + 0.3, v['y'] - 0.2, v['x'] + 0.7, v['y'] + 0.2)
+    near = [gap.distance(Point(w['x'], w['y'])) < PART_VIA for w in data['vias']]
+    kinds = [w.kind for w in BoardModel(data, log=quiet).vias]
+    assert near[data['vias'].index(v)] and kinds == ['signal' if n else 'stitching' for n in near]

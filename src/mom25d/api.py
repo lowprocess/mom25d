@@ -49,7 +49,7 @@ ZONE_OUT = 5.0     # zone=: cells up to this x dmax outside the zone around the 
 def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=False, mesher='auto', metal=None,
                 ground=None, max_solves=60, afs_tol=5e-3, log=print, progress=None, tiled='auto', on_step=None,
                 core='auto', quads=False, zone=None, signal_vias='round', stitching_vias='auto', lines=None,
-                keep_at=()):
+                keep_at=(), quad_tol=35.0, coarsen=None, planes='pec', stitching_pads='drop'):
     """S-parameters of a board (a <name>_board.json path, or its content) on `freq` (Hz).
 
     dmax (m): largest cell along the copper; layers whose metal covers more than half the board (planes) get
@@ -59,8 +59,12 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     (lossless). log: lines of progress (the adaptive sweep's); progress(solves, max_solves, f): after each
     EM solve. tiled: 'auto' | 'on' | 'off', the tiled GPU solver (sim.memory_plan). on_step(entry): after each
     model of the adaptive sweep (its change and prediction error, afs.adaptive_sweep). core: 'auto' (the
-    compiled core where built; NumPy's dense solver for small boards), 'compiled' (the core for every size) or
-    'python' (NumPy only), fast.use_core."""
+    compiled core where built, NumPy's dense solver without it), 'compiled' (the core for every size) or
+    'python' (NumPy only), fast.use_core. quads: near-rectangular triangle pairs as quad cells (True, or 'centre'),
+    quad_tol: the largest deviation of their corners from 90 degrees. coarsen: cells grow from dmax at corners, vias
+    and ports to coarsen x dmax away from them (geo.mesh_polygons; None: dmax everywhere). planes: 'pec' (default:
+    solid planes as the ground and a PEC cover, not meshed: mom25d.board) or 'mesh'. stitching_pads: 'drop'
+    (default: a ground via's pad with nothing else on its layer left out, the via kept) or 'keep'."""
     from . import fast
     from .board import BoardModel
     from .geo import LinePort
@@ -73,12 +77,14 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     fmin, fmax = float(freq[0]), float(freq[-1])
     t0, prev = time.time(), fast.use_core(core)
     try:
-        model = BoardModel(board, ground=ground, port=port, pairs=pairs, log=log)
+        model = BoardModel(board, ground=ground, port=port, pairs=pairs, planes=planes, stitching_pads=stitching_pads,
+                           log=log)
         planes = {k: plane_factor * dmax for k, gs in model.shapes.items()
                   if sum(g.area for g in gs) > 0.5 * model.outline_area}
         sim = model.simulation(dmax=dmax, dmax_layer=planes, fmin=fmin, fmax=fmax, solver='auto', verbose=False,
                                wave_down_to=fmin, mesher=mesher, title=name, metal=metal, tiled=tiled, core=core,
-                               quads=quads, signal_vias=signal_vias, stitching_vias=stitching_vias,
+                               quads=quads, quad_tol=quad_tol, coarsen=coarsen, signal_vias=signal_vias,
+                               stitching_vias=stitching_vias,
                                **(dict(line_basis=lines, line_step=LINE_STEP) if lines and lines != 'off' else {}),
                                **(dict(zone=zone, dmax_out=ZONE_OUT * dmax) if zone else {}))
         f, S, info = solve_band(sim, fmin, fmax, points=len(freq), zref=model.port_z0, max_solves=max_solves,

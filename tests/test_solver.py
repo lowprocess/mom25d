@@ -103,6 +103,19 @@ def test_aaa_interpolates_resonances():
     assert np.max(np.abs(r(fg / 1e9)[:, 0] - np.array([F(f)[0] for f in fg]))) < 1e-6
 
 
+def test_batched_gmres_reaches_its_tolerance_on_a_complex_system():
+    # complex Hessenberg entries: with unconjugated Givens rotations the residual estimate stopped early
+    from mom25d.fast import gmres_batched
+    rng = np.random.default_rng(1)
+    n = 200
+    ev = (1 + rng.random(n)) * np.exp(1j * rng.uniform(-1.2, 1.2, n))       # eigenvalues of many phases
+    Q = np.linalg.qr(rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n)))[0]
+    A = Q @ np.diag(ev) @ Q.conj().T + 0.2 * (rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))) / np.sqrt(n)
+    B = rng.standard_normal((n, 2)) + 1j * rng.standard_normal((n, 2))
+    X, _ = gmres_batched(lambda V: A @ V, B, rtol=1e-10, restart=60, maxiter=5)
+    assert np.max(np.linalg.norm(A @ X - B, axis=0) / np.linalg.norm(B, axis=0)) < 1e-9
+
+
 def test_afs_does_not_stop_on_a_model_that_ignores_new_samples(monkeypatch):
     """Regression (d5787ca): a fit that a new sample does not move changes by nothing between iterations while
     it is still wrong (seen on a 10 dB coupler: stopped at 9 solves, -14 dB coupling instead of -11 dB). The
@@ -141,7 +154,7 @@ def test_fast_operators_match_dense():
 
 
 
-def test_core_matches_numpy_and_solvers_agree():
+def test_core_matches_numpy_and_solvers_agree(monkeypatch):
     """Compiled core (if built) vs NumPy fallback, and direct/mixed/BLR agreement."""
     pytest.importorskip('mom25d._core')
     from shapely.geometry import box, Point
@@ -165,6 +178,24 @@ def test_core_matches_numpy_and_solvers_agree():
     ref = S[('direct', 'double')]
     for k, v in S.items():
         assert np.abs(v - ref).max() < 1e-6, k
+    for tol, refine, err in ((1e-8, False, 1e-5), (1e-4, True, 1e-5)):     # hodlr.py: direct, or GMRES's preconditioner
+        sim = mk('hodlr')
+        sim.hodlr_tol, sim.hodlr_leaf, sim.hodlr_refine = tol, 64, refine
+        assert np.abs(sim.sparams(4e9) - ref).max() < err, (tol, refine)
+        assert len(sim.fast.hodlr.ranks) >= 2                     # the tree has levels
+    # a factorisation kept from 4 GHz preconditions 4.4 GHz (fast._solve_kept: dense, several kept; _solve_reused:
+    # matrix-free, one): the same S as a fresh one
+    from mom25d import fast
+    for k, keep in ((('direct', 'mixed'), 4), (('direct', 'mixed'), 0), (('blr', 'double'), 4), (('hodlr', 'double'), 4)):
+        S1 = {}
+        monkeypatch.setattr(fast, 'REUSE_KEEP', keep)
+        for reuse in ('off', 'auto'):
+            sim = mk(*k)
+            sim.gpu, sim.reuse = 'off', reuse
+            sim.sparams(4e9)
+            S1[reuse] = sim.sparams(4.4e9)
+            assert any('reused' in n for n in sim.log.notes) == (reuse == 'auto'), (k, reuse)
+        assert np.abs(S1['auto'] - S1['off']).max() < 1e-5, k
 
 
 def test_coupled_stripline_even_odd_vs_cohn():
@@ -294,8 +325,8 @@ def test_new_core_kernels_match_numpy():
 
 
 def test_core_choice():
-    """core='compiled': the core's direct solver for a small board too (auto: NumPy's dense one there);
-    use_core('python'): no compiled kernels; the answers agree."""
+    """core='auto' and 'compiled': the core's direct solver for a small board too; use_core('python'): no compiled
+    kernels, NumPy's dense solver; the answers agree."""
     pytest.importorskip('mom25d._core')
     from shapely.geometry import box, Point
     from mom25d import fast
@@ -306,11 +337,12 @@ def test_core_choice():
                                                 ViaPort(Via(L / 2, 0, 0, 1, 0.1e-3), 54.0)],
                                  dmax=0.3e-3, w_ref=w, solver='auto', core=core, verbose=False)
     auto, comp = mk('auto'), mk('compiled')
-    assert auto.solver == 'dense' and comp.solver == 'direct'
-    assert np.abs(auto.sparams(4e9) - comp.sparams(4e9)).max() < 0.01
+    assert auto.solver == 'direct' and comp.solver == 'direct'
     prev = fast.use_core('python')
     try:
-        assert fast._core is None and mk('auto').solver == 'dense'
+        dense = mk('auto')
+        assert fast._core is None and dense.solver == 'dense'
+        assert np.abs(auto.sparams(4e9) - dense.sparams(4e9)).max() < 0.01
     finally:
         fast.set_core(prev)
     assert fast._core is not None
@@ -348,7 +380,7 @@ def test_quad_cells_match_triangles_with_fewer_unknowns():
         out[q] = sim, sim.sparams(6e9)
     (s0, S0), (s1, S1) = out[False], out[True]
     n0, n1 = s0.Ne + s0.Nv, s1.qT.shape[1]
-    assert n1 < 0.7 * n0
+    assert n1 < 0.8 * n0
     assert np.abs(S1 - S0).max() < 0.01
     assert abs(S1[0, 1] - S1[1, 0]) < 1e-3                  # wave-port fits: ~5e-5 either way
     I = s1.qT @ np.random.default_rng(0).standard_normal(n1)

@@ -18,6 +18,7 @@ fan-distributed and enter through the same G_q interaction as the strip charges.
 """
 from types import SimpleNamespace
 
+import os
 import numpy as np
 import shapely
 from emsdev.memory import available as available_memory      # noqa: F401  (bytes; mom25d's name for it)
@@ -57,15 +58,21 @@ def rlc(R=0.0, L=0.0, C=None, parallel=False):
 
 
 MIXED_MIN_N = 3500       # above this, 'auto' precision is mixed whenever the compiled core is there
+# above this many unknowns in the LU (after quads), mixed precision on the GPU when there is one: 1.5-1.9x a solve
+# from 1.4k to 3.4k unknowns against double on 8 P-cores (RX 7800 XT), but its start-up costs ~1.5 s a run - the
+# break-even of a 15-20 solve sweep (rf_gcpw, 3.4k: 7.0 s against 8.7 s; rf_stubnotch coarsened, 1.5k: 4.5 against 3.4)
+GPU_MIN_N = int(os.environ.get('MOM25D_GPU_MIN_N', 3000))
 
 
-def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver='auto', tiled='auto', block=1024):
+def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver='auto', tiled='auto', block=1024,
+                n_lu=None):
     """How the solver of n unknowns runs and the memory it needs: dict(solver, precision, path, host, gpu)
     (bytes). gpu: None, or (backend name, free bytes). path: 'dense' (NumPy, small n), 'double' (LU on the
     CPU), 'hybrid' (complex64 LU on the GPU, the double Z on the host for the refinement), 'tiled' (the
     symmetric part as L L^T tiles on the GPU, no dense Z: fast.FastOperator._solve_tiled), 'gpu-lu' (complex64
     Z on the host and the GPU), 'cpu-mixed' (complex64 LU on the CPU), 'blr' / 'aca' (compressed, no dense Z).
-    tiled: 'auto' (where the hybrid does not fit), 'on' (whenever a CuPy GPU is there) or 'off'."""
+    tiled: 'auto' (where the hybrid does not fit), 'on' (whenever a CuPy GPU is there) or 'off'. n_lu: the unknowns
+    the LU factors (fewer with quads; default n), which the thresholds GPU_MIN_N and MIXED_MIN_N compare."""
     avail = available_memory() if avail is None else avail
     name, free = gpu if gpu else (None, 0.0)
     gpu_lu = (1 if name in ('cupy', 'emulate') else 2) * 8.0 * n * n + 0.4e9      # gpu._Backend.vram_needed
@@ -73,11 +80,13 @@ def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver
     work = 3 * 8.0 * n * block + 0.5e9                                          # fast.FastOperator._tiled_work
     can_tile = tiled != 'off' and has_core and name in ('cupy', 'emulate') and work <= 0.9 * free
     if precision == 'auto':
-        # mixed where double does not fit, and above MIXED_MIN_N: complex64 LU + GMRES refinement on the CPU too,
+        # mixed where double does not fit, and above MIXED_MIN_N (GPU_MIN_N with a GPU): complex64 LU + GMRES refinement,
         # half the LU flops and 10 N^2 bytes instead of 18 (demo transition cropped, 8.4k unknowns, 2 cores: 14.0 s
         # a solve against 18.0 s, |dS| <= 7e-6 over 1-8 GHz); where the refinement stalls, fast.solve_direct redoes
         # it in double and stays in double up to MIXED_RETRY x that frequency
-        precision = 'mixed' if n > MIXED_MIN_N or 18.0 * n * n + 0.9e9 > 0.5 * avail else 'double'
+        m = n_lu or n
+        precision = 'mixed' if m > (GPU_MIN_N if gpu_fits else MIXED_MIN_N) or 18.0 * n * n + 0.9e9 > 0.5 * avail \
+            else 'double'
     if precision == 'mixed' and not has_core:
         precision = 'double'
     hybrid = precision == 'mixed' and gpu_fits and 24.0 * n * n + 0.9e9 <= 0.8 * avail
@@ -95,10 +104,13 @@ def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver
         path, host, dev = 'cpu-mixed', 10.0 * n * n + 0.9e9, 0.0
     fits = host <= 0.8 * avail
     if solver == 'auto':
-        solver = 'dense' if n <= 3500 and fits else ('direct' if fits else ('blr' if has_core else 'aca'))
+        # NumPy's dense solver only without the core: the core's direct solver is 3-8x faster on small boards too
+        # (rf_stubnotch coarsened, 2.3k unknowns: 25.4 s against 7.3 s a sweep; docs/mom.md#core)
+        solver = 'dense' if n <= 3500 and fits and not has_core else \
+            ('direct' if fits else ('blr' if has_core else 'aca'))
     if solver == 'dense':
         path, host, dev = 'dense', 18.0 * n * n + 0.9e9, 0.0
-    elif solver in ('blr', 'aca'):
+    elif solver in ('blr', 'aca', 'hodlr'):
         path, host, dev = solver, 2e4 * n + 0.9e9, 0.0
     return dict(solver=solver, precision=precision, path=path, host=host, gpu=dev, fits=fits)
 
@@ -245,16 +257,22 @@ class Simulation:
     def __init__(self, stack, shapes, ports=(), vias=(), lumped=(), dmax=0.3e-3, dmax_layer=None,
                  w_ref=None, ncross=6, grade=1.0, near_fac=5.0, mesher='auto', metal=None,
                  solver='dense', aca_tol=1e-4, refine=1.0e-3, precision='auto', gpu='auto', verbose=True, title='',
-                 mesh_only=False, tiled='auto', core='auto', quads=False, quad_tol=25.0, zone=None, dmax_out=None,
+                 mesh_only=False, tiled='auto', core='auto', quads=False, quad_tol=35.0, zone=None, dmax_out=None,
                  signal_vias='round', stitching_vias='auto', signal=None, via_barrel=True, line_basis=None,
-                 line_w_max=2.0e-3, line_step=2.0):
+                 line_w_max=2.0e-3, line_step=2.0, coarsen=None, grow=0.5, structured='auto'):
         # mesh_only: stop once the mesh and the unknowns (Ne, Nv) are known (a cost estimate; nothing to solve with)
+        # coarsen (experimental): cells grow from dmax at the features (corners, vias, ports) to coarsen x dmax away
+        # from them, by grow x the distance (geo.mesh_polygons): straight runs and plane interiors in larger cells.
+        # structured: straight runs of trace as a grid of rectangles (geo.mesh_polygons); 'auto': with quads
         self.st, self.title, self.metal, self.solver, self.log = stack, title, metal, solver, RunLog(verbose)
         self.gpu = gpu                      # 'auto' | 'cupy' | 'torch' | 'off' (mixed direct solver LU)
         self.precision = precision          # 'auto' | 'double' | 'mixed' (direct: complex64 Z + refinement)
         self.tiled = tiled                  # 'auto' | 'on' | 'off': mixed precision as L L^T tiles on the GPU (memory_plan)
         self.core_mode = core               # 'compiled': the compiled core's direct solver for small boards too
         self.blr_tol, self.blr_tile, self.blr_eta = 1e-3, 512, 0.7   # solver='blr' preconditioner settings
+        self.hodlr_tol, self.hodlr_leaf, self.hodlr_refine = 1e-6, 256, False   # solver='hodlr'
+        self.hodlr_symmetric = False        # Z^T = Z: half the compression (the near correction is not quite)
+        self.reuse = 'auto'                 # 'auto' | 'off': the CPU's complex64 LU kept for the next frequencies
         self.dmax, self.ncross, self.grade, self.near_fac = dmax, ncross, grade, near_fac
         self.user_ports = list(ports)
         self.ports = [m for p in ports for m in (p.modes() if isinstance(p, DiffPort) else [p])]
@@ -341,12 +359,18 @@ class Simulation:
                 else:
                     wr = wr or self._guess_wref(geoms[k], lp_here)
                     seg = [lp.line(s) for lp, s in lines[k]]
+                    struct = bool(quads) if structured == 'auto' else structured
+
                     def vpt(v):
                         m = self.via_mode[id(v)]
                         if m == 'round':
                             return (v.x, v.y, v.a if v.ring else 0.0)
-                        # an n-sided via: its barrel as an n-gon (signal vias, via_barrel) or a single vertex
-                        barrel = v.ring and getattr(v, 'kind', None) == 'signal' and via_barrel
+                        # an n-sided via: its barrel as an n-gon (signal vias, via_barrel; square ones on a structured
+                        # mesh, which aligns its grid with them: geo._run_grid) or a single vertex
+                        stitch = struct and m == 4 and getattr(v, 'kind', None) == 'stitching'
+                        if stitch and v.ring:                  # may snap to a grid cell (its fan: that cell)
+                            return (v.x, v.y, v.a, 4, True)
+                        barrel = v.ring and (getattr(v, 'kind', None) == 'signal' and via_barrel or struct and m == 4)
                         return (v.x, v.y, v.a, m) if barrel else (v.x, v.y, 0.0)
                     vpts, fine = [vpt(v) for _, v in vias_here], None
                     if refine and dm > 1.2 * dmax:
@@ -365,7 +389,8 @@ class Simulation:
                             fine = zf if fine is None else shapely.unary_union([fine, zf])
                             dm_mesh, dm_fine = dmax_out, min(dm, dm_fine or dm)
                     nd, tr, vids = mesh_polygons(geoms[k], dm_mesh, wr, ncross, grade, lines=seg, vias=vpts,
-                                                 fine=fine, dmax_fine=dm_fine, **zkw)
+                                                 fine=fine, dmax_fine=dm_fine, coarsen=coarsen, grow=grow,
+                                                 structured=struct, **zkw)
                 for (i, v), vid in zip(vias_here, vids):
                     assert vid >= 0, f"via {v.name}: not on the M{k} mesh"
                     via_vertex[(i, k)] = vid + off
@@ -429,15 +454,17 @@ class Simulation:
             # unknown (quads.py); the matrix is filled on the triangles and projected before the LU
             from .quads import quad_subspace
             excl = self.F
-            if quads == 'centre':
-                # only in the middle of the lines: no triangle with a corner on the copper outline (the edge strips
-                # stay triangles) and, where the signal copper is known (BoardModel), none off it (pours, pads)
+            if quads != 'all':
+                # no triangle with a corner on the copper outline: the edge strip, where the current crowds, stays
+                # triangles (quads there: rf_gcpw 0.015 from a fine reference at 9 GHz, hairpin 0.033 at 3.35 GHz;
+                # kept: 0.002 and 0.009, the triangles' 0.0015 and 0.007). 'centre': also none off the signal copper
+                # where it is known (BoardModel): no pours or pads. 'all': quads wherever triangles pair up
                 edges, count = np.unique(np.sort(r.tris[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), 1), axis=0,
                                          return_counts=True)
                 bnode = np.zeros(len(r.nodes), bool)
                 bnode[edges[count == 1].ravel()] = True                     # the nodes on the copper outline
                 off_ = bnode[r.tris].any(1)
-                if signal is not None:
+                if quads == 'centre' and signal is not None:
                     off_ |= ~shapely.contains_xy(signal, r.cent[:, 0], r.cent[:, 1])
                 excl = np.union1d(self.F, np.nonzero(off_)[0])
             with self.log.timer('quad cells'):
@@ -457,7 +484,8 @@ class Simulation:
                               f"(line_char / line_char_xs, or BoardModel.characterize) - a wrong zc makes S "
                               f"non-reciprocal when ports differ")
         n = r.Ne + self.Nv
-        from .fast import _core                        # None without the build, or with MOM25D_NO_CORE set
+        from .fast import _core, cap_blas_threads      # None without the build, or with MOM25D_NO_CORE set
+        cap_blas_threads()
         has_core = _core is not None
         if not has_core:
             self.log.note("note: no compiled core (python -m mom25d.core.build, or MOM25D_NO_CORE is set): "
@@ -467,11 +495,12 @@ class Simulation:
         # complex64 preconditioner can stall (fine meshes, low frequency, many via chains; docs/mom.md): that
         # solve is redone in double, and the frequencies up to MIXED_RETRY x it stay in double
         from .gpu import get_backend
-        want_gpu = has_core and gpu != 'off' and (precision == 'mixed' or (precision == 'auto' and n > 3500))
+        n_lu = self.qT.shape[1] if self.qT is not None else n
+        want_gpu = has_core and gpu != 'off' and (precision == 'mixed' or (precision == 'auto' and n_lu > GPU_MIN_N))
         b = get_backend(gpu) if want_gpu else None
         g = (b.name, b.mem_free()) if b is not None else None
         avail = available_memory()
-        plan = memory_plan(n, has_core, avail, g, precision, solver, self.tiled)
+        plan = memory_plan(n, has_core, avail, g, precision, solver, self.tiled, n_lu=n_lu)
         self.plan, self.precision, precision = plan, plan['precision'], plan['precision']
         if solver in ('auto', 'direct'):
             self.log.note(f"memory: direct solver needs ~{plan['host'] / 1e9:.1f} GB ({precision} precision, "
@@ -480,7 +509,7 @@ class Simulation:
             if solver == 'auto':
                 solver = plan['solver']
                 if solver == 'dense' and self.core_mode == 'compiled' and has_core:   # the core, not NumPy's
-                    plan = memory_plan(n, has_core, avail, g, precision, 'direct', self.tiled)
+                    plan = memory_plan(n, has_core, avail, g, precision, 'direct', self.tiled, n_lu=n_lu)
                     self.precision, self.plan, solver = plan['precision'], plan, plan['solver']
             elif not plan['fits']:
                 solver = 'blr' if has_core else 'aca'
@@ -492,7 +521,7 @@ class Simulation:
                 self.log.note(f"quads: not with solver {solver} yet - ignored")
                 self.qT = None
             self.log.note(f"solver: {solver} (N = {n})")
-        if solver in ('aca', 'direct', 'blr'):
+        if solver in ('aca', 'direct', 'blr', 'hodlr'):
             from .fast import FastOperator
             self.fast = FastOperator(self, tol=aca_tol)
             return
@@ -724,6 +753,9 @@ class Simulation:
             return self.fast.solve_direct(f, E, precision=self.precision)
         if self.solver == 'blr':
             return self.fast.solve_blr(f, E, tol=self.blr_tol, tile=self.blr_tile, eta=self.blr_eta)
+        if self.solver == 'hodlr':
+            return self.fast.solve_hodlr(f, E, tol=self.hodlr_tol, leaf=self.hodlr_leaf, refine=self.hodlr_refine,
+                                         symmetric=self.hodlr_symmetric)
         if self.qT is not None:
             T = self.qT
             return T @ self.solve(np.asarray(T.T @ (T.T @ self.impedance(f).T).T), np.asarray(T.T @ E))
