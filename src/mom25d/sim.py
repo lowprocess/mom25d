@@ -110,7 +110,7 @@ def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver
             ('direct' if fits else ('blr' if has_core else 'aca'))
     if solver == 'dense':
         path, host, dev = 'dense', 18.0 * n * n + 0.9e9, 0.0
-    elif solver in ('blr', 'aca'):
+    elif solver in ('blr', 'aca', 'hodlr'):
         path, host, dev = solver, 2e4 * n + 0.9e9, 0.0
     return dict(solver=solver, precision=precision, path=path, host=host, gpu=dev, fits=fits)
 
@@ -270,6 +270,7 @@ class Simulation:
         self.tiled = tiled                  # 'auto' | 'on' | 'off': mixed precision as L L^T tiles on the GPU (memory_plan)
         self.core_mode = core               # 'compiled': the compiled core's direct solver for small boards too
         self.blr_tol, self.blr_tile, self.blr_eta = 1e-3, 512, 0.7   # solver='blr' preconditioner settings
+        self.hodlr_tol, self.hodlr_leaf, self.hodlr_refine = 1e-6, 256, False   # solver='hodlr'
         self.dmax, self.ncross, self.grade, self.near_fac = dmax, ncross, grade, near_fac
         self.user_ports = list(ports)
         self.ports = [m for p in ports for m in (p.modes() if isinstance(p, DiffPort) else [p])]
@@ -518,7 +519,7 @@ class Simulation:
                 self.log.note(f"quads: not with solver {solver} yet - ignored")
                 self.qT = None
             self.log.note(f"solver: {solver} (N = {n})")
-        if solver in ('aca', 'direct', 'blr'):
+        if solver in ('aca', 'direct', 'blr', 'hodlr'):
             from .fast import FastOperator
             self.fast = FastOperator(self, tol=aca_tol)
             return
@@ -750,6 +751,8 @@ class Simulation:
             return self.fast.solve_direct(f, E, precision=self.precision)
         if self.solver == 'blr':
             return self.fast.solve_blr(f, E, tol=self.blr_tol, tile=self.blr_tile, eta=self.blr_eta)
+        if self.solver == 'hodlr':
+            return self.fast.solve_hodlr(f, E, tol=self.hodlr_tol, leaf=self.hodlr_leaf, refine=self.hodlr_refine)
         if self.qT is not None:
             T = self.qT
             return T @ self.solve(np.asarray(T.T @ (T.T @ self.impedance(f).T).T), np.asarray(T.T @ E))

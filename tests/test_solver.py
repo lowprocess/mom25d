@@ -165,6 +165,11 @@ def test_core_matches_numpy_and_solvers_agree():
     ref = S[('direct', 'double')]
     for k, v in S.items():
         assert np.abs(v - ref).max() < 1e-6, k
+    for tol, refine, err in ((1e-8, False, 1e-5), (1e-4, True, 1e-5)):     # hodlr.py: direct, or GMRES's preconditioner
+        sim = mk('hodlr')
+        sim.hodlr_tol, sim.hodlr_leaf, sim.hodlr_refine = tol, 64, refine
+        assert np.abs(sim.sparams(4e9) - ref).max() < err, (tol, refine)
+        assert len(sim.fast.hodlr.ranks) >= 2                     # the tree has levels
 
 
 def test_coupled_stripline_even_odd_vs_cohn():

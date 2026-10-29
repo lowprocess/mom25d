@@ -824,19 +824,15 @@ class FastOperator:
         self.iters = []
         return X
 
-    def solve_blr(self, f, E, tol=1e-4, tile=256, eta=1.0, dtype=np.complex64):
-        """Block low-rank LU preconditioner + GMRES with the exact matrix-free operator (no stored Z)."""
-        from .blr import BLRFactor, cluster_tiles
-        assert self.core is not None, "solver='blr' needs the compiled core (python -m mom25d.core.build)"
+    def _points(self):
+        """Every unknown's place: the edges' midpoints, the via chains' axes."""
         sim = self.sim
-        Ne, Nv = sim.Ne, sim.Nv
-        N = Ne + Nv
-        self.setup(f, mode='sparse')
-        self.dZ_exact = self.dZ
-        Sx = self.extra_blocks(f)
-        dZx = (self.dZ + Sx[:Ne, :Ne]).tocsr()
-        tiles, boxes = cluster_tiles(np.vstack([sim.rwg.mid] + ([np.array([[v.x, v.y] for v, _, _ in sim.chains])]
-                                                                if Nv else [])), tile)
+        return np.vstack([sim.rwg.mid] + ([np.array([[v.x, v.y] for v, _, _ in sim.chains])] if sim.Nv else []))
+
+    def _raw_entry(self, dZx):
+        """entry(rows, cols): the dense block of Z (far field from the core, the sparse near correction and extra
+        blocks dZx, the via rows and columns), any unknowns, original numbering."""
+        Ne, Nv = self.sim.Ne, self.sim.Nv
 
         def raw(rows, cols):
             M = np.zeros((len(rows), len(cols)), complex)
@@ -850,6 +846,66 @@ class FastOperator:
                 M[np.ix_(~re, ce)] = self.B[cols[ce]][:, rows[~re] - Ne].T
                 M[np.ix_(~re, ~ce)] = self.C[np.ix_(rows[~re] - Ne, cols[~ce] - Ne)]
             return M
+        return raw
+
+    def solve_hodlr(self, f, E, tol=1e-6, leaf=256, refine=False):
+        """The hierarchical direct solver (hodlr.HODLR): Z compressed from its entries, factored recursively; no
+        dense Z. refine: GMRES on the exact matrix-free operator, the HODLR solve its preconditioner."""
+        from .hodlr import HODLR
+        assert self.core is not None, "solver='hodlr' needs the compiled core (python -m mom25d.core.build)"
+        sim = self.sim
+        Ne, Nv = sim.Ne, sim.Nv
+        N = Ne + Nv
+        self.setup(f, mode='sparse')
+        self.dZ_exact = self.dZ
+        Sx = self.extra_blocks(f)
+        dZx = (self.dZ + Sx[:Ne, :Ne]).tocsr()
+        raw = self._raw_entry(dZx)
+        pts = self._points()
+        # equilibration from the diagonal (via rows are ~1e6 x the strip rows)
+        d = np.empty(N, complex)
+        for s0 in range(0, N, 512):
+            idx = np.arange(s0, min(N, s0 + 512))
+            d[idx] = np.diagonal(raw(idx, idx))
+        dsc = 1.0 / np.sqrt(np.abs(d) + 1e-300)
+        # the near-field entries that matter at tol mark ACA's hot rows (hodlr.aca_checked): the correction's pattern
+        # reaches 5 cells, 15 mm under 3 mm plane cells, but beyond ~3 mm it is under 5e-4 of its largest
+        sig = sparse.diags(dsc[:Ne]) @ dZx @ sparse.diags(dsc[:Ne])
+        sig.data[np.abs(sig.data) < 0.1 * tol] = 0
+        sig.eliminate_zeros()
+        with sim.log.timer('HODLR compress + factor', f"N={N}, tol {tol:g}"):
+            self.hodlr = H = HODLR(lambda r, c: raw(r, c) * dsc[r][:, None] * dsc[c][None, :], pts, leaf=leaf, tol=tol,
+                                   near=sig, log=sim.log.note)
+        sim.log.note(f"HODLR: {H.stats()}")
+        B = dsc[:, None] * E
+        if not refine:
+            with sim.log.timer('HODLR solve'):
+                return dsc[:, None] * H.solve(B)
+        with sim.log.timer('refinement (GMRES, exact matvec)'):
+            Y, ok, rel = self._refine(lambda V: dsc[:, None] * self.matvec_exact(dsc[:, None] * V, Sx), B, H.solve,
+                                      MIXED_MAX_ITER, 1)
+        sim.log.note(f"HODLR: GMRES iterations per port {self.iters}" + ('' if ok else f", NOT converged ({rel:.1e})"))
+        if not ok and tol > 1e-9:
+            # too loose a factorisation for this matrix (fine meshes at low frequency are ill-conditioned): again at
+            # 100 x tighter, rather than an unconverged answer
+            sim.log.note(f"WARNING HODLR refinement did not converge at {f / 1e9:.4g} GHz with tol {tol:g} - "
+                         f"factoring again at {tol / 100:g}")
+            return self.solve_hodlr(f, E, tol=tol / 100, leaf=leaf, refine=True)
+        return dsc[:, None] * Y
+
+    def solve_blr(self, f, E, tol=1e-4, tile=256, eta=1.0, dtype=np.complex64):
+        """Block low-rank LU preconditioner + GMRES with the exact matrix-free operator (no stored Z)."""
+        from .blr import BLRFactor, cluster_tiles
+        assert self.core is not None, "solver='blr' needs the compiled core (python -m mom25d.core.build)"
+        sim = self.sim
+        Ne, Nv = sim.Ne, sim.Nv
+        N = Ne + Nv
+        self.setup(f, mode='sparse')
+        self.dZ_exact = self.dZ
+        Sx = self.extra_blocks(f)
+        dZx = (self.dZ + Sx[:Ne, :Ne]).tocsr()
+        tiles, boxes = cluster_tiles(self._points(), tile)
+        raw = self._raw_entry(dZx)
         with sim.log.timer('BLR assemble + factor', f"N={N}, {len(tiles)} tiles"):
             diag = np.empty(N, complex)
             for t in tiles:
