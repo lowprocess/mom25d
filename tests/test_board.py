@@ -141,7 +141,7 @@ def test_solid_planes_as_pec_and_lone_pads_dropped():
     data = stripline()
     assert pec_planes(data, 'B.Cu') == ('B.Cu', 'In1.Cu')
     assert pec_planes(board('demo'), 'B.Cu') == ('B.Cu', None)         # In1.Cu has the signal via's antipad
-    m = BoardModel(data, planes='pec', log=quiet)
+    m = BoardModel(data, planes='pec', stitching_pads='keep', log=quiet)
     assert m.cover == 'In1.Cu' and m.stack.top == 'pec' and m.stack.N == 2 and m.iface == {'In2.Cu': 1}
     assert any('above the cover (F.Cu)' in n for n in m.notes)
     assert {(v.k_bot, v.k_top) for v in m.vias} == {(0, 2)} and [sp['kref'] for sp in m.port_specs] == [0]
@@ -150,7 +150,9 @@ def test_solid_planes_as_pec_and_lone_pads_dropped():
     assert len(pads) == nets.count('GND') and all(nets[i] == 'GND' for i in pads)
     d = BoardModel(data, planes='pec', stitching_pads='drop', log=quiet)
     assert len(d.vias) == len(m.vias) and d.shapes[1][0].area < m.shapes[1][0].area
-    assert BoardModel(data, log=quiet).cover is None and len(BoardModel(data, log=quiet).iface) == 3
+    meshed = BoardModel(data, planes='mesh', stitching_pads='keep', log=quiet)
+    assert meshed.cover is None and len(meshed.iface) == 3
+    assert BoardModel(data, log=quiet).cover == 'In1.Cu' and len(BoardModel(data, log=quiet).vias) == len(m.vias)   # the defaults
 
 
 def test_a_raised_ground():
@@ -165,3 +167,34 @@ def test_a_raised_ground():
     m = BoardModel(data, planes='pec', log=quiet)
     assert m.ground == 'In2.Cu' and m.cover == 'F.Cu' and m.iface == {'In1.Cu': 1} and m.stack.N == 2
     assert [sp['kref'] for sp in m.port_specs] == [0] and {(v.k_bot, v.k_top) for v in m.vias} == {(0, 2)}
+
+
+def test_a_pad_a_part_lands_on_is_not_lone():
+    """stitching_pads='drop' keeps a ground pad that a part terminates on: a shunt part's pad with its via to the
+    ground (demo_bandpass: dropped, it cut the part off the ground, |dS| 1.98). The part's s and e are its gap's
+    corners, so its pads touch that box without containing either."""
+    from shapely.geometry import shape
+    from mom25d.board import lone_pads
+    data = stripline()
+    pads = lone_pads(data, ['In2.Cu'])['In2.Cu']
+    p = shape(data['copper']['In2.Cu'][pads[0]]['polygon'])
+    x0, y0, x1, y1 = p.bounds
+    data['parts'] = [dict(ref='C1', R=0.1, L=0.0, C=1e-12, layer='In2.Cu', z=0.0, axis=0, s=[x1, y0, 0.0],
+                          e=[x1 + 0.5, y1, 0.0])]                    # the gap beside the pad's right edge
+    kept = lone_pads(data, ['In2.Cu'])['In2.Cu']
+    assert pads[0] not in kept and len(kept) == len(pads) - 1
+
+
+def test_a_ground_via_under_a_parts_pad_is_meshed_as_a_signal_via():
+    """A shunt part's ground via is not a stitching via: squared outside the zone, its pad lost the part
+    (demo_bandpass with --mom-zone on: |dS| 1.98)."""
+    data = stripline()
+    v = next(v for v in data['vias'] if v['net'] in data['ground_nets'])
+    data['parts'] = [dict(ref='C1', R=0.1, L=0.0, C=1e-12, layer='In2.Cu', z=0.0, axis=0, s=[v['x'] + 0.3, v['y'] - 0.2, 0.0],
+                          e=[v['x'] + 0.7, v['y'] + 0.2, 0.0])]
+    from shapely.geometry import box, Point
+    from mom25d.board import PART_VIA
+    gap = box(v['x'] + 0.3, v['y'] - 0.2, v['x'] + 0.7, v['y'] + 0.2)
+    near = [gap.distance(Point(w['x'], w['y'])) < PART_VIA for w in data['vias']]
+    kinds = [w.kind for w in BoardModel(data, log=quiet).vias]
+    assert near[data['vias'].index(v)] and kinds == ['signal' if n else 'stitching' for n in near]

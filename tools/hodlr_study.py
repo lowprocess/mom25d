@@ -1,7 +1,7 @@
 """The hierarchical solver (solver='hodlr', mom25d.hodlr) against the dense direct one on kicad2ems boards: time,
 memory, the ranks per tree level and |dS| at one frequency.
 
-    python tools/hodlr_study.py board.json f_GHz [tol,tol,...] [--no-dense] [--zone] [--drop] [--whole] [--refine]
+    python tools/hodlr_study.py board.json f_GHz [tol,tol,...] [--no-dense] [--zone] [--pec] [--drop] [--whole] [--refine]
                                 [--leaf N] [--sym]
 """
 import json, sys, time
@@ -25,7 +25,8 @@ def main():
     tols = [float(t) for t in a[2].split(',')] if len(a) > 2 and not a[2].startswith('--') else [1e-4, 1e-6]
     leaf = int(a[a.index('--leaf') + 1]) if '--leaf' in a else 256
     zone = '--zone' in a
-    model = dict(stitching_pads='drop') if '--drop' in a else {}
+    # every plane and pad meshed (the measurements in ROADMAP.md item 6), unless --pec / --drop
+    model = dict(planes='pec' if '--pec' in a else 'mesh', stitching_pads='drop' if '--drop' in a else 'keep')
     if '--whole' in a:                                           # every copper layer meshed (a port on B.Cu)
         model['ground'] = 'none'
     Sref = None

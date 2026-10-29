@@ -82,7 +82,7 @@ def reused(runlog):
 def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, log=print, progress=None,
           hold=None, tiled='auto', on_step=None, core='auto', quads=False, zone=None,
           signal_vias='round', stitching_vias='auto', lines=None, keep_at=(), stack='ground', quad_tol=35.0,
-          coarsen=None, planes='mesh', stitching_pads='keep'):
+          coarsen=None, planes='pec', stitching_pads='drop'):
     """S-parameters of the board m on `freq` (Hz) from mom25d, as kicad2ems reports them: (S (nf, n, n) in
     m.user_ports order with differential pairs as (d, c) modes, names, reference impedances, info dict).
     dmax in mm (planes 3x, refined near the copper of other layers). sigma (S/m): conductor loss, as --sigma
@@ -169,7 +169,7 @@ def memory_plan_for(n, tiled='auto'):
 
 def _model_kw(s):
     """mom25d.board.BoardModel's options from kicad2ems's settings: --mom-planes, --mom-stitching-pads."""
-    return dict(planes=getattr(s, 'mom_planes', 'mesh'), stitching_pads=getattr(s, 'mom_stitching_pads', 'keep'))
+    return dict(planes=getattr(s, 'mom_planes', 'pec'), stitching_pads=getattr(s, 'mom_stitching_pads', 'drop'))
 
 
 def _solid_ground(m):
@@ -219,15 +219,14 @@ class MoM25D(Solver):
                "the ground nets): no edge rings, coarse cells and square stitching-via pads elsewhere; about a third "
                "of the unknowns at the same accuracy (docs/mom.md#zone): off (default), on", choices=('off', 'on'),
                name='zone', gui='MoM signal zone (experimental)', group=G),
-        Option('mom_planes', 'mesh', "experimental: mesh (default) or pec: solid planes (one piece over the board, "
-               "no holes, ground nets only) as perfect conductors, not meshed: the highest one under every other copper "
-               "layer the ground, the lowest one over them a PEC cover (a stripline's planes: rf_stripline 15,458 "
-               "unknowns to 8,561; docs/mom.md#planes)", choices=('mesh', 'pec'), name='planes',
-               gui='MoM solid planes (experimental)', group=G),
-        Option('mom_stitching_pads', 'keep', "experimental: keep (default) or drop: a ground via's pad with nothing "
-               "else on its layer (a stitching via through a signal layer) left out, the via kept as its barrel "
-               "(rf_stripline with --mom-planes pec: 8,561 unknowns to 1,227; docs/mom.md#planes)",
-               choices=('keep', 'drop'), name='stitching_pads', gui='MoM lone stitching-via pads (experimental)', group=G),
+        Option('mom_planes', 'pec', "pec (default): solid planes (one piece over the board, no holes, ground nets "
+               "only) as perfect conductors, not meshed: the highest one under every other copper layer the ground, "
+               "the lowest one over them a PEC cover (rf_stripline 15,563 unknowns to 8,671); or mesh: every plane "
+               "meshed (docs/mom.md#planes)", choices=('pec', 'mesh'), name='planes', gui='MoM solid planes', group=G),
+        Option('mom_stitching_pads', 'drop', "drop (default): a ground via's pad with nothing else on its layer (a "
+               "stitching via through a signal layer; not a part's or a port's pad) left out, the via kept as its "
+               "barrel (rf_stripline with the planes PEC: 8,671 unknowns to 1,337); or keep (docs/mom.md#planes)",
+               choices=('drop', 'keep'), name='stitching_pads', gui='MoM lone stitching-via pads', group=G),
         Option('mom_lines', 'off', "experimental: line basis functions on straight runs of trace - per column along "
                "the run a few functions with the edge-peaked current profile across it, in place of the triangles' "
                "unknowns inside the run (docs/mom.md#lines): off (default), on (even + odd profile: coupled lines), "
