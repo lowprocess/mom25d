@@ -1,5 +1,5 @@
-"""Build the optional compiled core mom25d._core:  python -m mom25d.core.build   (needs g++ with OpenMP and pybind11;
-also: python src/mom25d/core/build.py in a checkout).
+"""Build the optional compiled core mom25d._core:  python -m mom25d.core.build   (needs pybind11 and g++ with OpenMP,
+or on Windows MSVC: emsdev.build; also: python src/mom25d/core/build.py in a checkout).
 The solver falls back to NumPy when the module is absent."""
 from emsdev.build import build_core
 

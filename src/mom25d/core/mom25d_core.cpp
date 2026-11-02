@@ -33,6 +33,7 @@
 namespace py = pybind11;
 using cd = std::complex<double>;
 using cf = std::complex<float>;
+using i64 = std::int64_t;           // not long: 32 bits on Windows (LLP64), 64 on Linux
 template <class T> using arr = py::array_t<T, py::array::c_style | py::array::forcecast>;
 
 // ---------------------------------------------------------------------------------------------
@@ -160,7 +161,7 @@ py::array_t<cd> far_block(arr<int> rows, arr<int> cols, py::dict geom, py::dict 
     const cd jw(0, w), inv_jw = 1.0 / cd(0, w);
     {
         py::gil_scoped_release nogil;
-#pragma omp parallel for schedule(dynamic, 4) if (nr * (long)nc > 4096)
+#pragma omp parallel for schedule(dynamic, 4) if (nr * (i64)nc > 4096)
         for (int i = 0; i < nr; ++i) {
             int m = R[i];
             int pm[2] = {g.ep[m], g.em[m]};
@@ -552,27 +553,27 @@ py::tuple near_pairs(arr<double> cent, arr<double> size, arr<double> z, double f
         y0 = std::min(y0, c[2 * t + 1]); y1 = std::max(y1, c[2 * t + 1]);
     }
     double cell = std::max(fac * smax, 1e-12);
-    long nx = std::max(1L, (long)((x1 - x0) / cell) + 1), ny = std::max(1L, (long)((y1 - y0) / cell) + 1);
-    while (nx * ny > 4L * Nt + 16) { cell *= 1.5; nx = (long)((x1 - x0) / cell) + 1; ny = (long)((y1 - y0) / cell) + 1; }
-    std::vector<long> cellof(Nt), start(nx * ny + 1, 0), order(Nt);
+    i64 nx = std::max(i64(1), (i64)((x1 - x0) / cell) + 1), ny = std::max(i64(1), (i64)((y1 - y0) / cell) + 1);
+    while (nx * ny > i64(4) * Nt + 16) { cell *= 1.5; nx = (i64)((x1 - x0) / cell) + 1; ny = (i64)((y1 - y0) / cell) + 1; }
+    std::vector<i64> cellof(Nt), start(nx * ny + 1, 0), order(Nt);
     for (int t = 0; t < Nt; ++t) {
-        long i = std::min(nx - 1, (long)((c[2 * t] - x0) / cell)), j = std::min(ny - 1, (long)((c[2 * t + 1] - y0) / cell));
+        i64 i = std::min(nx - 1, (i64)((c[2 * t] - x0) / cell)), j = std::min(ny - 1, (i64)((c[2 * t + 1] - y0) / cell));
         cellof[t] = i * ny + j; start[cellof[t] + 1]++;
     }
-    for (long k = 0; k < nx * ny; ++k) start[k + 1] += start[k];
-    { std::vector<long> fill(start.begin(), start.end() - 1);
+    for (i64 k = 0; k < nx * ny; ++k) start[k + 1] += start[k];
+    { std::vector<i64> fill(start.begin(), start.end() - 1);
       for (int t = 0; t < Nt; ++t) order[fill[cellof[t]]++] = t; }
-    const long reach = (long)std::ceil(fac * smax / cell);
+    const i64 reach = (i64)std::ceil(fac * smax / cell);
     std::vector<std::vector<int>> nb(Nt);
     {
         py::gil_scoped_release nogil;
 #pragma omp parallel for schedule(dynamic, 64)
         for (int p = 0; p < Nt; ++p) {
-            long ci = cellof[p] / ny, cj = cellof[p] % ny;
+            i64 ci = cellof[p] / ny, cj = cellof[p] % ny;
             std::vector<int> &out = nb[p];
-            for (long i = std::max(0L, ci - reach); i <= std::min(nx - 1, ci + reach); ++i)
-                for (long j = std::max(0L, cj - reach); j <= std::min(ny - 1, cj + reach); ++j)
-                    for (long k = start[i * ny + j]; k < start[i * ny + j + 1]; ++k) {
+            for (i64 i = std::max(i64(0), ci - reach); i <= std::min(nx - 1, ci + reach); ++i)
+                for (i64 j = std::max(i64(0), cj - reach); j <= std::min(ny - 1, cj + reach); ++j)
+                    for (i64 k = start[i * ny + j]; k < start[i * ny + j + 1]; ++k) {
                         int q = (int)order[k];
                         double dx = c[2 * p] - c[2 * q], dy = c[2 * p + 1] - c[2 * q + 1], dz = zz[p] - zz[q];
                         double R = fac * std::max(sz[p], sz[q]);
@@ -634,7 +635,7 @@ py::array_t<cf> scale_c64(py::array_t<cd, py::array::c_style> Z, arr<double> d) 
     {
         py::gil_scoped_release nogil;
 #pragma omp parallel for schedule(static)
-        for (long i = 0; i < (long)n; ++i) {
+        for (i64 i = 0; i < (i64)n; ++i) {
             cd *zr = z + (size_t)i * m; cf *orow = o + (size_t)i * m;
             for (size_t j = 0; j < m; ++j) { zr[j] *= dd[i] * dd[j]; orow[j] = cf(zr[j]); }
         }
@@ -691,7 +692,7 @@ py::array_t<C> project_t(py::array_t<C, py::array::c_style> Z, arr<int> keep, ar
         {
             std::vector<C> ze(ne);
 #pragma omp for schedule(static)
-            for (long r = 0; r < (long)N; ++r) {
+            for (i64 r = 0; r < (i64)N; ++r) {
                 C *zr = z + (size_t)r * N;
                 for (int i = 0; i < ne; ++i) ze[i] = zr[e[i]];
                 for (int j = 0; j < nk; ++j) zr[j] = zr[k[j]];
@@ -700,7 +701,7 @@ py::array_t<C> project_t(py::array_t<C, py::array::c_style> Z, arr<int> keep, ar
                     for (int p = cpp[i]; p < cpp[i + 1]; ++p) zr[cii[p]] += (typename C::value_type)cvv[p] * ze[i];
             }
 #pragma omp for schedule(static)
-            for (long j = 0; j < (long)Nr; ++j) {
+            for (i64 j = 0; j < (i64)Nr; ++j) {
                 C *oj = o + (size_t)j * Nr;
                 if (j < nk) std::copy(z + (size_t)k[j] * N, z + (size_t)k[j] * N + Nr, oj);
                 else std::fill(oj, oj + Nr, C(0));

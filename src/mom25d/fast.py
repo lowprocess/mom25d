@@ -52,8 +52,11 @@ def set_core(module):
 
 def fast_cores():
     """The physical cores of the fastest class (a hybrid CPU's P-cores; every core of the others), from Linux's
-    /sys; None where it cannot tell."""
-    import glob
+    /sys or Windows' efficiency classes (emsdev.cpu); None where it cannot tell."""
+    import glob, sys
+    if sys.platform == 'win32':
+        from emsdev.cpu import windows_fast_cores
+        return windows_fast_cores()
     cores = {}
     for d in glob.glob('/sys/devices/system/cpu/cpu[0-9]*'):
         try:

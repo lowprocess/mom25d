@@ -14,13 +14,17 @@ covers what it models, its ports, the mesh, antenna mode, the GPU paths and its 
 
 ```bash
 pip install .                       # numpy, scipy, shapely, triangle, emsdev (the GPU and memory probes)
-pip install '.[core]'               # pybind11, then build the compiled core (g++ with OpenMP):
-python -m mom25d.core.build         # mom25d/_core*.so, about five times faster
+pip install '.[core]'               # pybind11, then build the compiled core (g++ with OpenMP; Windows: MSVC or MinGW):
+python -m mom25d.core.build         # mom25d/_core*.so (.pyd on Windows), about five times faster
 pip install '.[gpu-rocm7]'          # the GPU LU: the CuPy wheel for your stack (gpu-cuda12, gpu-cuda13, gpu-rocm7)
 ```
 
+On Windows the core builds with Visual Studio 2022 or its Build Tools (*Desktop development with C++*), or with
+MinGW-w64's g++ (MSYS2's UCRT64 toolchain) where Visual Studio is not installed; the
+CuPy wheels there are the CUDA ones (CuPy has no ROCm wheel for Windows).
+
 PyPI has no triangle 20230923 or later for every Python (none for 3.14). Where `pip install .` cannot find one,
-build it from its repository first (needs a C compiler; kicad2ems's `setup.sh` does this for you):
+build it from its repository first (needs a C compiler; kicad2ems's installer does this for you):
 
 ```bash
 pip install "triangle @ git+https://github.com/drufat/triangle.git@595b43eb6682992a0b1012b9671bf860c0e6ae56"
