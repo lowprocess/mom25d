@@ -662,11 +662,11 @@ def current_dumps(run, res, freqs, ports=None, near=(), tag='mom25d', currents=N
             units[dump.name] = f'V/m, {unit}'
         write_info(d, dumps, run.m)
         info = os.path.join(d, 'dump_info.json')                            # J: surface current, A/m
-        with open(info) as fh:
+        with open(info, encoding='utf-8') as fh:
             meta = json.load(fh)
         for x in meta['dumps']:
             x['unit'] = units[x['name']]
-        with open(info, 'w') as fh:
+        with open(info, 'w', encoding='utf-8') as fh:
             json.dump(meta, fh)
         out.append((names[j], dict(dir=d, names=[x.name for x in dumps])))
     return out

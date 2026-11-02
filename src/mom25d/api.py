@@ -71,7 +71,7 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     from .run import solve_band
     name = os.path.basename(board) if isinstance(board, str) else 'board'
     if isinstance(board, str):
-        with open(board) as fh:
+        with open(board, encoding='utf-8') as fh:
             board = json.load(fh)
     freq = np.asarray(freq, float)
     fmin, fmax = float(freq[0]), float(freq[-1])

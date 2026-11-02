@@ -60,8 +60,8 @@ def fast_cores():
     cores = {}
     for d in glob.glob('/sys/devices/system/cpu/cpu[0-9]*'):
         try:
-            f = int(open(d + '/cpufreq/cpuinfo_max_freq').read())
-            key = tuple(open(f'{d}/topology/{k}').read().strip() for k in ('physical_package_id', 'core_id'))
+            f = int(open(d + '/cpufreq/cpuinfo_max_freq', encoding='utf-8').read())
+            key = tuple(open(f'{d}/topology/{k}', encoding='utf-8').read().strip() for k in ('physical_package_id', 'core_id'))
         except (OSError, ValueError):
             return None
         cores[key] = max(cores.get(key, 0), f)
