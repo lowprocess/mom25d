@@ -52,13 +52,16 @@ def set_core(module):
 
 def fast_cores():
     """The physical cores of the fastest class (a hybrid CPU's P-cores; every core of the others), from Linux's
-    /sys; None where it cannot tell."""
-    import glob
+    /sys or Windows' efficiency classes (emsdev.cpu); None where it cannot tell."""
+    import glob, sys
+    if sys.platform == 'win32':
+        from emsdev.cpu import windows_fast_cores
+        return windows_fast_cores()
     cores = {}
     for d in glob.glob('/sys/devices/system/cpu/cpu[0-9]*'):
         try:
-            f = int(open(d + '/cpufreq/cpuinfo_max_freq').read())
-            key = tuple(open(f'{d}/topology/{k}').read().strip() for k in ('physical_package_id', 'core_id'))
+            f = int(open(d + '/cpufreq/cpuinfo_max_freq', encoding='utf-8').read())
+            key = tuple(open(f'{d}/topology/{k}', encoding='utf-8').read().strip() for k in ('physical_package_id', 'core_id'))
         except (OSError, ValueError):
             return None
         cores[key] = max(cores.get(key, 0), f)
@@ -1005,8 +1008,10 @@ class FastOperator:
         with sim.log.timer('direct fill', f"N={N}"):
             idx = np.arange(Ne)
             for r0 in range(0, Ne, block):
+                r1 = min(r0 + block, Ne)                    # the edges' block only: Z's last Nv rows are the vias'
                 for c0 in range(0, Ne, block):
-                    Z[r0:r0 + block, c0:c0 + block] = self.entry(idx[r0:r0 + block], idx[c0:c0 + block])
+                    c1 = min(c0 + block, Ne)
+                    Z[r0:r1, c0:c1] = self.entry(idx[r0:r1], idx[c0:c1])
             Dz = self.dZ + Sx[:Ne, :Ne]
             if Ne < 4000:
                 Z[:Ne, :Ne] += Dz.toarray()

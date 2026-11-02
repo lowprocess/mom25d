@@ -4,7 +4,7 @@ model: the canonical board kicad2ems gives every solver, read without kicad2ems.
 
     import json
     from mom25d.board import BoardModel
-    model = BoardModel(json.load(open('out/filter_board.json')))        # or kicad2ems's Board.to_dict()
+    model = BoardModel(json.load(open('out/filter_board.json', encoding='utf-8')))        # or kicad2ems's Board.to_dict()
     sim = model.simulation(dmax=0.3e-3, fmin=1e9, fmax=6e9)
     res = mom25d.api.solve_board('out/filter_board.json', freqs)          # the same in one call
 

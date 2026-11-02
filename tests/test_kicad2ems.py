@@ -32,7 +32,7 @@ def test_mom_run(tmp_path, run_cli, no_csxcad):
     code, so, se = run_cli(FILTER, '--solvers', 'mom25d', '--mom-dmax', '1.6', '--mom-solves', '8', '--points', '41',
                            '--out', str(out))
     assert code == 0, so + se
-    sm = json.load(open(out / 'rf_interdig_run.json'))
+    sm = json.load(open(out / 'rf_interdig_run.json', encoding='utf-8'))
     line = next(n for n in sm['solved'] if n != 'mom25d')          # qucs or scikit, whichever is installed
     for f in ('rf_interdig_mom25d.s2p', 'rf_interdig_mom25d.png', f'rf_interdig_{line}.s2p', 'rf_interdig_report.html', 'rf_interdig_board.json'):
         assert (out / f).exists(), f
@@ -86,7 +86,7 @@ def test_current_dumps(boards, run_cli, tmp_path, monkeypatch):
     assert (out / 'lowpass_mom25d_P1_dump_E_topp1mm_fd_5GHz.gif').exists()
     mesh, J = src.load(0)
     assert np.abs(J).max() > 0 and np.all(J[..., 2] == 0)                # in-plane currents only
-    sm = json.loads((out / 'lowpass_run.json').read_text())
+    sm = json.loads((out / 'lowpass_run.json').read_text(encoding='utf-8'))
     assert any(d['label'].startswith('mom25d dump_J_F_Cu_fd') for d in sm['dumps'])
     mom = sm['solved']['mom25d']
     assert {2.0, 5.0} <= set(mom['samples_ghz']) and len(calls) == mom['solves'], (calls, mom['solves'])
@@ -103,7 +103,7 @@ def test_antenna_mode(run_cli, tmp_path):
     code, so, err = run_cli(tmp_path / 'patch.kicad_pcb', '--mode', 'antenna', '--fmin', '2.3', '--fmax', '2.6',
                             '--points', '61', '--solvers', 'mom', '--mom-dmax', '2', '--mom-solves', '12', '--out', out)
     assert code == 0, so + err
-    res = json.loads((out / 'patch_mom25d_antenna.json').read_text())
+    res = json.loads((out / 'patch_mom25d_antenna.json').read_text(encoding='utf-8'))
     assert 2.38e9 < res['match']['f_res'] < 2.52e9 and res['solver'] == 'mom25d'
     row = min(res['rows'], key=lambda r: abs(r['f'] - res['f_pattern']))
     assert 0.1 < row['eff'] < 1 and 5 < row['D_dbi'] < 9
@@ -130,7 +130,7 @@ def test_phased_array(run_cli, tmp_path):
                             '2.6', '--points', '61', '--solvers', 'mom', '--mom-dmax', '3', '--mom-solves', '12',
                             '--out', out)
     assert code == 0, so + err
-    res = json.loads((out / 'arr_mom25d_antenna.json').read_text())
+    res = json.loads((out / 'arr_mom25d_antenna.json').read_text(encoding='utf-8'))
     assert res['drive'] == ['P1@0', 'P2@60'] and res['drive_base'] == ['P1@0', 'P2@20']
     assert res['grid'] == '1x2' and res['taper'] == 'taylor:30' and res['steer'] == [0.0, 40.0]
     assert 5 <= res['peak']['theta'] <= 25 and res['peak']['phi'] == 90
@@ -224,7 +224,7 @@ def test_whole_stack_ports_below_the_ground(run_cli, tmp_path):
     subprocess.check_call([sys.executable, ex, 'msvia', str(tmp_path / 'rf_msvia')], stdout=subprocess.DEVNULL)
     cfg = os.path.join(os.path.dirname(FILTER), 'rf_msvia.toml')
     toml = (tmp_path / 'msvia.toml')
-    toml.write_text(open(cfg).read().replace('rf_msvia.kicad_pcb', str(tmp_path / 'rf_msvia.kicad_pcb')))
+    toml.write_text(open(cfg, encoding='utf-8').read().replace('rf_msvia.kicad_pcb', (tmp_path / 'rf_msvia.kicad_pcb').as_posix()))
     out = tmp_path / 'out'
     code, so, err = run_cli(toml, '--solvers', 'mom25d', '--mom-stack', 'whole', '--mom-dmax', '0.8', '--out', out,
                             '--no-report')
@@ -234,7 +234,7 @@ def test_whole_stack_ports_below_the_ground(run_cli, tmp_path):
     f, S = read_touchstone(str(out / 'rf_msvia_mom25d.s2p'))
     i = int(np.argmin(np.abs(f - 5e9)))
     assert abs(20 * np.log10(abs(S[i, 1, 0])) + 0.38) < 0.15
-    board = json.loads((out / 'rf_msvia_board.json').read_text())
+    board = json.loads((out / 'rf_msvia_board.json').read_text(encoding='utf-8'))
     with pytest.raises(ValueError, match='B.Cu is not a metal interface above the ground In2.Cu'):
         BoardModel(board, port='via', log=lambda *a: None)
     m = BoardModel(board, ground='none', port='via', log=lambda *a: None)
@@ -254,14 +254,14 @@ def test_whole_stack_antenna_radiates_behind_its_ground(run_cli, tmp_path):
                             '--points', '61', '--solvers', 'mom', '--mom-dmax', '2', '--mom-solves', '12',
                             '--mom-stack', 'whole', '--out', out, '--no-report')
     assert code == 0, so + err
-    res = json.loads((out / 'patch_mom25d_antenna.json').read_text())
+    res = json.loads((out / 'patch_mom25d_antenna.json').read_text(encoding='utf-8'))
     c = res['cuts']['xz (phi = 0)']
     a, g = np.array(c['angle']), np.array(c['gain_dbi'])
     assert -25 < g[np.abs(np.abs(a) - 180) < 1.5].max() < -10                     # behind the board
     row = min(res['rows'], key=lambda r: abs(r['f'] - res['f_pattern']))
     assert 2.4 < row['G_dbi'] < 3.6 and 'whole stack' in res['model']
     from mom25d.board import BoardModel
-    board = json.loads((out / 'patch_board.json').read_text())
+    board = json.loads((out / 'patch_board.json').read_text(encoding='utf-8'))
     assert not BoardModel(board, log=lambda *a: None).whole and BoardModel(board, ground='none', log=lambda *a: None).whole
 
 
