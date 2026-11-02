@@ -16,7 +16,7 @@ BOARDS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'boards')
 def board(name):
     """A board file: demo (the transition; nets RF, GND; ground B.Cu), diff (D_P, D_N; B.Cu), launch (RF, GND;
     edge walls xmin, ymin), rlc (RF1, RF2, GND), lowpass, thru (a 3 mm line on 1.6 mm FR4)."""
-    with open(os.path.join(BOARDS, name + '.json')) as fh:
+    with open(os.path.join(BOARDS, name + '.json'), encoding='utf-8') as fh:
         return json.load(fh)
 
 

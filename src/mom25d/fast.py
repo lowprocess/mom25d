@@ -1008,8 +1008,10 @@ class FastOperator:
         with sim.log.timer('direct fill', f"N={N}"):
             idx = np.arange(Ne)
             for r0 in range(0, Ne, block):
+                r1 = min(r0 + block, Ne)                    # the edges' block only: Z's last Nv rows are the vias'
                 for c0 in range(0, Ne, block):
-                    Z[r0:r0 + block, c0:c0 + block] = self.entry(idx[r0:r0 + block], idx[c0:c0 + block])
+                    c1 = min(c0 + block, Ne)
+                    Z[r0:r1, c0:c1] = self.entry(idx[r0:r1], idx[c0:c1])
             Dz = self.dZ + Sx[:Ne, :Ne]
             if Ne < 4000:
                 Z[:Ne, :Ne] += Dz.toarray()

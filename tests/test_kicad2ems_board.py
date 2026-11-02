@@ -31,7 +31,7 @@ def _differences(a, b, path=''):
 
 @pytest.mark.parametrize('name', sorted(f[:-5] for f in os.listdir(BOARDS) if f.endswith('.json')))
 def test_board_files_are_what_kicad2ems_writes(name, tmp_path):
-    with open(os.path.join(BOARDS, name + '.json')) as fh:
+    with open(os.path.join(BOARDS, name + '.json'), encoding='utf-8') as fh:
         frozen = json.load(fh)
     base = str(tmp_path / name)
     subprocess.check_call([sys.executable, GEN, base] + ([] if name == 'demo' else [name]), stdout=subprocess.DEVNULL)

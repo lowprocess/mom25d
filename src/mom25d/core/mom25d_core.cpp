@@ -34,6 +34,16 @@ namespace py = pybind11;
 using cd = std::complex<double>;
 using cf = std::complex<float>;
 using i64 = std::int64_t;           // not long: 32 bits on Windows (LLP64), 64 on Linux
+
+// J0: POSIX's j0, which Windows' C runtime (MSVC, MinGW-w64 under -std=c++17) has only as _j0
+static inline double bessel_j0(double x)
+{
+#ifdef _WIN32
+    return _j0(x);
+#else
+    return ::j0(x);
+#endif
+}
 template <class T> using arr = py::array_t<T, py::array::c_style | py::array::forcecast>;
 
 // ---------------------------------------------------------------------------------------------
@@ -611,7 +621,7 @@ py::array_t<cd> hankel_real(arr<double> rho, arr<double> kr, arr<cd> W) {
             for (int i = 0; i < nr; ++i) {
                 std::fill(acc.begin(), acc.end(), cd(0));
                 for (int m = 0; m < nk; ++m) {
-                    double j = ::j0(r[i] * k[m]);
+                    double j = bessel_j0(r[i] * k[m]);
                     for (int s = 0; s < ns; ++s) acc[s] += j * w[(size_t)s * nk + m];
                 }
                 for (int s = 0; s < ns; ++s) o[(size_t)s * nr + i] = acc[s];
