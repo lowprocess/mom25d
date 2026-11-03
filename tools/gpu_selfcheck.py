@@ -1,5 +1,5 @@
 """
-GPU self-check for mom25d:  python tools/gpu_selfcheck.py [--backend cupy|torch|vulkan] [--n 8192]
+GPU self-check for mom25d:  python tools/gpu_selfcheck.py [--backend vulkan|cupy] [--n 8192]
 
 1. reports the detected GPU / backend and free VRAM
 2. complex64 LU + solve on the GPU vs SciPy on the CPU (accuracy and speed)
@@ -9,7 +9,6 @@ import argparse, os, sys, time
 import numpy as np
 import scipy.linalg as sla
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import mom25d.gpu as mom25d_gpu
 ap = argparse.ArgumentParser()
 ap.add_argument('--backend', default='auto')
@@ -24,7 +23,6 @@ gpu = mom25d_gpu.get_backend(a.backend)
 if gpu is None:
     print("\nNo usable GPU backend (" + "; ".join(mom25d_gpu.get_backend.why) + "). Install one of:\n"
           "  slangpy (Vulkan, any GPU; AMD on Windows): pip install slangpy\n"
-          "  PyTorch for ROCm:  pip install torch --index-url https://download.pytorch.org/whl/rocm<ver>\n"
           "  CuPy for ROCm:     see https://docs.cupy.dev/en/stable/install.html (AMD ROCm section)\n"
           "and check that the GPU is visible (rocminfo / rocm-smi). Consumer RDNA3 cards other than the\n"
           "7900 series may need HSA_OVERRIDE_GFX_VERSION=11.0.0 (RDNA2: 10.3.0).")

@@ -110,11 +110,6 @@ def radiated(Eth, Eph, theta, phi, eta=ETA0):
     return U, float(np.trapezoid(np.trapezoid(U * np.sin(th)[None, :], th, axis=1), ph))
 
 
-def port_power(sim, I, port=0):
-    """Power accepted at a port driven by mom25d's 1 V source (excitation column `port`): Re(V I*) / 2."""
-    return 0.5 * abs(np.real(np.conj(np.sum(sim.port_current(I, port)))))
-
-
 def near_field(sim, layers_J, x, y, f, height, pad=2):
     """E (V/m, (nx, ny, 3) complex) on the plane `height` (m) above the top of the stack, from the surface
     currents of each layer sampled on the grid x, y (m, uniform): layers_J = {interface: (Jx, Jy)}, each

@@ -265,7 +265,7 @@ class Simulation:
         # from them, by grow x the distance (geo.mesh_polygons): straight runs and plane interiors in larger cells.
         # structured: straight runs of trace as a grid of rectangles (geo.mesh_polygons); 'auto': with quads
         self.st, self.title, self.metal, self.solver, self.log = stack, title, metal, solver, RunLog(verbose)
-        self.gpu = gpu                      # 'auto' | 'cupy' | 'torch' | 'off' (mixed direct solver LU)
+        self.gpu = gpu                      # 'auto' | 'vulkan' | 'cupy' | 'off' (mixed direct solver LU)
         self.precision = precision          # 'auto' | 'double' | 'mixed' (direct: complex64 Z + refinement)
         self.tiled = tiled                  # 'auto' | 'on' | 'off': mixed precision as L L^T tiles on the GPU (memory_plan)
         self.core_mode = core               # 'compiled': the compiled core's direct solver for small boards too
