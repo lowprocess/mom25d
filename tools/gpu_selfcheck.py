@@ -1,5 +1,5 @@
 """
-GPU self-check for mom25d:  python tools/gpu_selfcheck.py [--backend cupy|torch] [--n 8192]
+GPU self-check for mom25d:  python tools/gpu_selfcheck.py [--backend cupy|torch|vulkan] [--n 8192]
 
 1. reports the detected GPU / backend and free VRAM
 2. complex64 LU + solve on the GPU vs SciPy on the CPU (accuracy and speed)
@@ -22,7 +22,8 @@ if a.backend != 'auto':
 print(mom25d_gpu.describe())
 gpu = mom25d_gpu.get_backend(a.backend)
 if gpu is None:
-    print("\nNo usable GPU backend. Install one of:\n"
+    print("\nNo usable GPU backend (" + "; ".join(mom25d_gpu.get_backend.why) + "). Install one of:\n"
+          "  slangpy (Vulkan, any GPU; AMD on Windows): pip install slangpy\n"
           "  PyTorch for ROCm:  pip install torch --index-url https://download.pytorch.org/whl/rocm<ver>\n"
           "  CuPy for ROCm:     see https://docs.cupy.dev/en/stable/install.html (AMD ROCm section)\n"
           "and check that the GPU is visible (rocminfo / rocm-smi). Consumer RDNA3 cards other than the\n"
