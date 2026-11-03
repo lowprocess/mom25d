@@ -66,27 +66,18 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     solid planes as the ground and a PEC cover, not meshed: mom25d.board) or 'mesh'. stitching_pads: 'drop'
     (default: a ground via's pad with nothing else on its layer left out, the via kept) or 'keep'."""
     from . import fast
-    from .board import BoardModel
     from .geo import LinePort
     from .run import solve_band
     name = os.path.basename(board) if isinstance(board, str) else 'board'
-    if isinstance(board, str):
-        with open(board, encoding='utf-8') as fh:
-            board = json.load(fh)
     freq = np.asarray(freq, float)
     fmin, fmax = float(freq[0]), float(freq[-1])
     t0, prev = time.time(), fast.use_core(core)
     try:
-        model = BoardModel(board, ground=ground, port=port, pairs=pairs, planes=planes, stitching_pads=stitching_pads,
-                           log=log)
-        planes = {k: plane_factor * dmax for k, gs in model.shapes.items()
-                  if sum(g.area for g in gs) > 0.5 * model.outline_area}
-        sim = model.simulation(dmax=dmax, dmax_layer=planes, fmin=fmin, fmax=fmax, solver='auto', verbose=False,
-                               wave_down_to=fmin, mesher=mesher, title=name, metal=metal, tiled=tiled, core=core,
-                               quads=quads, quad_tol=quad_tol, coarsen=coarsen, signal_vias=signal_vias,
-                               stitching_vias=stitching_vias,
-                               **(dict(line_basis=lines, line_step=LINE_STEP) if lines and lines != 'off' else {}),
-                               **(dict(zone=zone, dmax_out=ZONE_OUT * dmax) if zone else {}))
+        model, sim = build_board(board, fmin, fmax, dmax=dmax, plane_factor=plane_factor, port=port, pairs=pairs,
+                                 mesher=mesher, metal=metal, ground=ground, log=log, tiled=tiled, core=core,
+                                 quads=quads, zone=zone, signal_vias=signal_vias, stitching_vias=stitching_vias,
+                                 lines=lines, quad_tol=quad_tol, coarsen=coarsen, planes=planes,
+                                 stitching_pads=stitching_pads, title=name)
         f, S, info = solve_band(sim, fmin, fmax, points=len(freq), zref=model.port_z0, max_solves=max_solves,
                                 afs_tol=afs_tol, log=log, progress=progress, on_step=on_step, keep_at=keep_at)
         core_used = fast._core is not None
@@ -103,3 +94,29 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
                   solved=list(info['solved']), seconds=time.time() - t0, core=core_used,
                   notes=list(model.notes) + list(sim.log.notes), model=model, sim=sim,
                   afs=list(info.get('afs', [])), afs_tol=info.get('afs_tol'))
+
+
+def build_board(board, fmin, fmax, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=False, mesher='auto',
+                metal=None, ground=None, log=print, tiled='auto', core='auto', quads=False, zone=None,
+                signal_vias='round', stitching_vias='auto', lines=None, quad_tol=35.0, coarsen=None, planes='pec',
+                stitching_pads='drop', title=None, mesh_only=False, characterize=True):
+    """(BoardModel, Simulation) of a board as solve_board builds them, with its options (solve_board's). mesh_only:
+    stop once the mesh and its unknowns are known (a preview of the mesh solve_board would solve on; the quad
+    cells are paired only after that, so a mesh_only simulation has none)."""
+    from .board import BoardModel
+    if isinstance(board, str):
+        title = title or os.path.basename(board)
+        with open(board, encoding='utf-8') as fh:
+            board = json.load(fh)
+    model = BoardModel(board, ground=ground, port=port, pairs=pairs, planes=planes, stitching_pads=stitching_pads,
+                       log=log)
+    layer_dmax = {k: plane_factor * dmax for k, gs in model.shapes.items()
+                  if sum(g.area for g in gs) > 0.5 * model.outline_area}
+    sim = model.simulation(dmax=dmax, dmax_layer=layer_dmax, fmin=fmin, fmax=fmax, solver='auto', verbose=False,
+                           wave_down_to=fmin, mesher=mesher, title=title or 'board', metal=metal, tiled=tiled,
+                           core=core, quads=quads, quad_tol=quad_tol, coarsen=coarsen, signal_vias=signal_vias,
+                           stitching_vias=stitching_vias, mesh_only=mesh_only,
+                           characterize=characterize,
+                           **(dict(line_basis=lines, line_step=LINE_STEP) if lines and lines != 'off' else {}),
+                           **(dict(zone=zone, dmax_out=ZONE_OUT * dmax) if zone else {}))
+    return model, sim
