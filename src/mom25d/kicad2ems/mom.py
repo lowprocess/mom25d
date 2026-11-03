@@ -93,17 +93,14 @@ def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, log=print, 
     stitching_pads: mom25d.board's."""
     from mom25d.api import solve_board
     from kicad2ems.api.solver import mixed_mode
-    kind = 'via' if port == 'lumped' else port
-    pairs = any(len(legs) == 2 for _, legs in m.user_ports) and kind != 'via'
+    pairs, kw = _board_kw(m, dmax, port, quads=quads, quad_tol=quad_tol, coarsen=coarsen, zone=zone,
+                          signal_vias=signal_vias, stitching_vias=stitching_vias, lines=lines, stack=stack,
+                          planes=planes, stitching_pads=stitching_pads)
     metal, t_mm = _metal(m, sigma)
     if metal is not None:
         log(f"  mom25d: conductor loss sigma {sigma:g} S/m, {t_mm * 1e3:g} um copper")
-    kw = dict(dmax=dmax * 1e-3, port=kind, metal=metal, max_solves=max_solves,
-              log=lambda t: log(f"  mom25d:{t}") if 'AFS' in t else None,
-              progress=progress, tiled=tiled, on_step=on_step, core=core, quads=quads, quad_tol=quad_tol,
-              coarsen=coarsen, zone=zone, planes=planes, stitching_pads=stitching_pads,
-              signal_vias=signal_vias, stitching_vias=stitching_vias, lines=lines, keep_at=keep_at,
-              **(dict(ground='none') if stack == 'whole' else {}))
+    kw.update(metal=metal, max_solves=max_solves, log=lambda t: log(f"  mom25d:{t}") if 'AFS' in t else None,
+              progress=progress, tiled=tiled, on_step=on_step, core=core, keep_at=keep_at)
     try:
         res = solve_board(m.to_dict(), freq, pairs=pairs, **kw)
     except ValueError as e:
@@ -139,8 +136,48 @@ def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, log=print, 
     return S, names, zref, info
 
 
-def save_mesh(run, sim, model):
-    """mom25d's triangles for the 3D view (meshes.py): each meshed layer at its copper's height."""
+def _board_kw(m, dmax, port, quads=False, quad_tol=35.0, coarsen=None, zone=None, signal_vias='round',
+              stitching_vias='auto', lines=None, stack='ground', planes='pec', stitching_pads='drop'):
+    """(pairs, mom25d.api's board and mesh options) of solve()'s settings: what the run meshes, and the preview."""
+    kind = 'via' if port == 'lumped' else port
+    pairs = any(len(legs) == 2 for _, legs in m.user_ports) and kind != 'via'
+    return pairs, dict(dmax=dmax * 1e-3, port=kind, quads=quads, quad_tol=quad_tol, coarsen=coarsen, zone=zone,
+                       planes=planes, stitching_pads=stitching_pads, signal_vias=signal_vias,
+                       stitching_vias=stitching_vias, lines=lines,
+                       **(dict(ground='none') if stack == 'whole' else {}))
+
+
+def preview_mesh(m, fmin, fmax, dmax=0.3, port='auto', **mesh):
+    """(BoardModel, Simulation) of the mesh solve() would solve on, without solving (mesh_only: no quad cells
+    paired yet). mesh: solve()'s mesh options (quads, coarsen, zone, vias, lines, stack, planes, ...)."""
+    from mom25d.api import build_board
+    pairs, kw = _board_kw(m, dmax, port, **mesh)
+    try:
+        return build_board(m.to_dict(), fmin, fmax, pairs=pairs, log=lambda *a: None, mesh_only=True,
+                           characterize=False, **kw)
+    except ValueError as e:                     # as solve(): a pair too short for a differential wave port
+        if not (pairs and port == 'auto' and 'differential wave port' in str(e)):
+            raise
+        return build_board(m.to_dict(), fmin, fmax, pairs=False, log=lambda *a: None, mesh_only=True,
+                           characterize=False, **kw)
+
+
+def merged_diagonals(sim):
+    """The node pairs (k, 2) of the triangle edges a run merged away into quad cells (sim.quad_info['elim']),
+    for the viewers to leave out; empty without quads, or where the solver ignored them (sim.qT None)."""
+    qi = getattr(sim, 'quad_info', None)
+    if getattr(sim, 'qT', None) is None or not qi or 'quads' not in qi:
+        return np.zeros((0, 2), int)
+    r, elim = sim.rwg, np.asarray(qi['elim'], int)
+    A, B = r.tris[r.tp[elim]], r.tris[r.tm[elim]]
+    shared = (A[:, :, None] == B[:, None, :]).any(2)                # the edge's two nodes are in both triangles
+    return np.sort(A[shared].reshape(-1, 2), 1)
+
+
+def save_mesh(run, sim, model, solver='mom25d'):
+    """mom25d's mesh for the 3D view and the plan (meshes.py): each meshed layer's triangles at its copper's
+    height, and the diagonals merged into quad cells (`hidden`, a run's). solver: the file's name, 'mom25d' (the
+    preview) or 'mom25d-run' (the mesh a run solved on)."""
     from kicad2ems.api.solver import save_mesh
     lay = {k: l for l, k in model.iface.items()}
     z = np.array([run.m.cu_z.get(lay.get(int(k)), np.nan) for k in sim.tri_layer])
@@ -149,7 +186,10 @@ def save_mesh(run, sim, model):
     nz = np.zeros(len(sim.rwg.nodes))                               # each layer is meshed on its own: no shared nodes
     nz[tris[keep].ravel()] = np.repeat(z[keep], 3)
     nodes = np.column_stack([sim.rwg.nodes[:, :2] * 1e3, nz])
-    run.wrote('mom25d mesh (3D view)', save_mesh(run, 'mom25d', 'tris', nodes=nodes, tris=tris[keep]))
+    hidden = merged_diagonals(sim)
+    hidden = hidden[np.isfinite(nz[hidden]).all(1) & (nz[hidden[:, 0]] == nz[hidden[:, 1]])] if len(hidden) else hidden
+    what = 'mom25d mesh (3D view)' if solver == 'mom25d' else 'mom25d solved mesh (3D view)'
+    run.wrote(what, save_mesh(run, solver, 'tris', nodes=nodes, tris=tris[keep], hidden=hidden))
 
 
 HOW = {'dense': 'dense, NumPy', 'double': 'direct LU in double on the CPU',
@@ -170,6 +210,15 @@ def memory_plan_for(n, tiled='auto'):
 def _model_kw(s):
     """mom25d.board.BoardModel's options from kicad2ems's settings: --mom-planes, --mom-stitching-pads."""
     return dict(planes=getattr(s, 'mom_planes', 'pec'), stitching_pads=getattr(s, 'mom_stitching_pads', 'drop'))
+
+
+def _mesh_kw(s):
+    """solve()'s mesh options from kicad2ems's settings (the run's and the preview's): --mom-quads, --mom-quad-tol,
+    --mom-coarsen, --mom-zone, the vias, --mom-lines, --mom-stack and the BoardModel's."""
+    return dict(quads={'off': False, 'on': True}.get(s.mom_quads, s.mom_quads), quad_tol=s.mom_quad_tol,
+                coarsen=s.mom_coarsen or None, zone='auto' if s.mom_zone == 'on' else None,
+                signal_vias=s.mom_signal_vias, stitching_vias=s.mom_stitching_vias, lines=s.mom_lines,
+                stack=s.mom_stack, **_model_kw(s))
 
 
 def _solid_ground(m):
@@ -397,16 +446,10 @@ class MoM25D(Solver):
         what = mom25d_status()[1]
         if 'no compiled core' in what:                              # ~5x slower: say how to build it
             run.log(f"note: mom25d {what}")
-        if run.s.preview and mom25d_status()[0]:                   # the mesh alone, for the 3D view
-            from mom25d.board import BoardModel
-            s = run.s
-            bm = BoardModel(run.m.to_dict(), port='via' if s.mom_port == 'lumped' else s.mom_port, log=lambda *a: None,
-                            **_model_kw(s), **(dict(ground='none') if s.mom_stack == 'whole' else {}))
-            dmax = s.mom_dmax * 1e-3
-            planes = {k: 3 * dmax for k, gs in bm.shapes.items() if sum(g.area for g in gs) > 0.5 * bm.outline_area}
-            sim = bm.simulation(dmax=dmax, dmax_layer=planes, fmin=run.fmin, fmax=run.fmax, characterize=False,
-                                verbose=False, wave_down_to=run.fmin, mesh_only=True)
-            save_mesh(run, sim, bm)
+        if run.s.preview and mom25d_status()[0]:                   # the mesh alone, for the 3D view and the plan
+            s = run.s                                               # (the run's mesh options: its structured runs,
+            bm, sim = preview_mesh(run.m, run.fmin, run.fmax, dmax=s.mom_dmax, port=s.mom_port, **_mesh_kw(s))
+            save_mesh(run, sim, bm)                                 # coarsening and vias; the quads come with a run)
 
     def solve(self, run, prep):
         s = run.s
@@ -420,11 +463,7 @@ class MoM25D(Solver):
             run.log("mom25d: antenna mode: lumped ports (--mom-port wave for de-embedded ones)")
         S, names, zref, info = solve(run.m, run.freq, dmax=s.mom_dmax, port=port,
                                      max_solves=s.mom_solves, sigma=s.sigma, log=run.log, hold=self._held, tiled=s.mom_tiled,
-                                     core=s.mom_core, quads={'off': False, 'on': True}.get(s.mom_quads, s.mom_quads),
-                                     quad_tol=s.mom_quad_tol, coarsen=s.mom_coarsen or None,
-                                     zone='auto' if s.mom_zone == 'on' else None, **_model_kw(s),
-                                     signal_vias=s.mom_signal_vias, stitching_vias=s.mom_stitching_vias,
-                                     lines=s.mom_lines, keep_at=[f * 1e9 for f in s.mom_dump or []], stack=s.mom_stack,
+                                     core=s.mom_core, **_mesh_kw(s), keep_at=[f * 1e9 for f in s.mom_dump or []],
                                      progress=lambda k, n, f: (run.status('mom25d', dict(fraction=k / n, solves=k,
                                                                                          f_ghz=f / 1e9)), stop.check()),
                                      on_step=lambda h: run.status('mom25d', dict(afs_solves=h['solves'],
@@ -442,8 +481,8 @@ class MoM25D(Solver):
 
     def outputs(self, run, prep, res):
         held = getattr(self, '_held', {}).get('res')
-        if held is not None:
-            save_mesh(run, held.sim, held.model)
+        if held is not None:                                        # beside the preview's: the mesh it solved on
+            save_mesh(run, held.sim, held.model, 'mom25d-run')
         if run.antenna and held is not None:
             self._antenna(run, held, res)
         self._dumps(run, held)
