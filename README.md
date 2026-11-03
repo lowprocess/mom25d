@@ -3,7 +3,8 @@
 A 2.5D method-of-moments solver for circuit boards: copper as zero-thickness sheets on the interfaces of a
 layered dielectric over an infinite ground plane, vias as vertical wires, lumped parts as series elements.
 It takes a board file and gives its S-parameters, and runs on the CPU (NumPy, or a compiled C++ / OpenMP
-core) with an optional GPU LU (CuPy or PyTorch, on NVIDIA CUDA or AMD ROCm).
+core) with an optional GPU LU (Vulkan through slangpy, on any GPU with a Vulkan driver, Windows or Linux; or
+CuPy, on NVIDIA CUDA or AMD ROCm).
 
 It is the planar solver of [kicad2ems](https://github.com/lowprocess/kicad2ems), which reads KiCad and
 Gerber files and writes the board file (`<name>_board.json`) every solver gets. mom25d reads that file
@@ -16,7 +17,8 @@ covers what it models, its ports, the mesh, antenna mode, the GPU paths and its 
 pip install .                       # numpy, scipy, shapely, triangle, emsdev (the GPU and memory probes)
 pip install '.[core]'               # pybind11, then build the compiled core (g++ with OpenMP):
 python -m mom25d.core.build         # mom25d/_core*.so, about five times faster
-pip install '.[gpu-rocm7]'          # the GPU LU: the CuPy wheel for your stack (gpu-cuda12, gpu-cuda13, gpu-rocm7)
+pip install '.[gpu-vulkan]'         # the GPU LU through Vulkan: slangpy (any GPU)
+pip install '.[gpu-cuda12]'         # optional: the CuPy wheel for your stack (gpu-cuda12, gpu-cuda13, gpu-rocm7)
 ```
 
 PyPI has no triangle 20230923 or later for every Python (none for 3.14). Where `pip install .` cannot find one,
@@ -26,8 +28,9 @@ build it from its repository first (needs a C compiler; kicad2ems's `setup.sh` d
 pip install "triangle @ git+https://github.com/drufat/triangle.git@595b43eb6682992a0b1012b9671bf860c0e6ae56"
 ```
 
-`MOM25D_GPU=off` turns the GPU off. Consumer AMD cards outside ROCm's support list may need
-`HSA_OVERRIDE_GFX_VERSION=11.0.0` (RDNA3) or `10.3.0` (RDNA2).
+`MOM25D_GPU=off` turns the GPU off; `MOM25D_GPU=vulkan|cupy` picks a backend (`auto`, the default, tries Vulkan
+first, and CuPy first only where it runs on CUDA). Consumer AMD cards outside ROCm's support list may need `HSA_OVERRIDE_GFX_VERSION=11.0.0`
+(RDNA3) or `10.3.0` (RDNA2); the Vulkan backend needs only the GPU's driver.
 
 ## Use
 
@@ -66,6 +69,7 @@ f, S, info = solve_band(sim, 1e9, 6e9, points=101, zref=m.port_z0)
 | `line.py`, `quads.py` | line basis functions on straight runs; quad cells |
 | `fast.py` | the matrix fill and the solvers |
 | `gpu.py`, `ldlt.py` | the GPU backends and the tiled solver |
+| `gpu_vk.py` | the Vulkan backend: a hybrid LU (panels on the CPU, updates on the GPU) and its GPU solves |
 | `blr.py` | the block low-rank solver |
 | `afs.py`, `run.py` | the adaptive frequency sweep |
 | `farfield.py` | far and near fields from the currents |

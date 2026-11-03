@@ -1,5 +1,5 @@
 """
-mom25d.gpu - GPU dense LU for the mixed-precision direct solver (AMD ROCm or NVIDIA CUDA)
+mom25d.gpu - GPU dense LU for the mixed-precision direct solver (AMD ROCm, NVIDIA CUDA, or any GPU through Vulkan)
 
 The matrix is still filled on the CPU (the C++ core takes ~2 s); the expensive O(N^3) part, the
 complex64 LU factorisation, runs on the GPU. The direct solver downloads the factor (download) and does the
@@ -8,13 +8,14 @@ ill-conditioned factors (demo_transition at 1 GHz, smallest pivot 2e-7: a forwar
 same factor solved on the CPU), and the factor on the host is also kept for the next frequencies. Refinement
 products stay on the CPU in double precision, so results match the CPU solver.
 
-Backends (picked in this order by gpu='auto'; force with MOM25D_GPU=cupy|torch|off):
-  cupy   CuPy built for ROCm (hipSOLVER/rocSOLVER) or CUDA. LU in place: VRAM ~ 8 N^2 bytes.
-  torch  PyTorch ROCm or CUDA build (torch.cuda.* also covers HIP). VRAM ~ 16 N^2 bytes
-         (torch keeps input and factors).
+Backends (force one with MOM25D_GPU=vulkan|cupy|off; gpu='auto' tries them in emsdev.gpu.auto_order's order:
+Vulkan first, CuPy first only where it runs on CUDA):
+  vulkan slangpy on any Vulkan GPU (gpu_vk.py): a hybrid LU, the panels on the CPU (LAPACK), the updates on the
+         GPU. LU in place: VRAM ~ 8 N^2 bytes. On an RX 7800 XT it factors faster than rocSOLVER from N = 4096.
+  cupy   CuPy built for CUDA (cuSOLVER) or ROCm (hipSOLVER/rocSOLVER). LU in place: VRAM ~ 8 N^2 bytes.
   emulate  NumPy stand-in with the same interface (tests / development without a GPU).
 
-Typical capacity with 16 GB of VRAM: ~41k unknowns with cupy, ~29k with torch.
+Typical capacity with 16 GB of VRAM: ~41k unknowns.
 """
 import numpy as np
 import scipy.linalg as sla
@@ -26,6 +27,10 @@ GPUUnavailable = devices.Unavailable
 
 class _Backend:
     name, device, hip = '?', 'GPU', False
+
+    @property
+    def api(self):
+        return 'ROCm/HIP' if self.hip else ('CUDA' if self.name == 'cupy' else 'none')
     inplace = False          # LU overwrites the uploaded matrix (VRAM = 1 x N^2 complex64)
     lu = piv = None
 
@@ -82,45 +87,6 @@ class CupyBackend(_Backend):
         self.cp.get_default_memory_pool().free_all_blocks()
 
 
-class TorchBackend(_Backend):
-    name = 'torch'
-
-    def __init__(self):
-        d = devices.torch_device()                               # ROCm builds report through torch.cuda
-        import torch
-        self.torch, self.dev, self.info = torch, torch.device('cuda'), d
-        self.device, self.hip = d.name, d.hip
-
-    def mem_free(self):
-        return self.info.free()
-
-    def mem_total(self):
-        return self.info.total
-
-    def factor(self, Z):
-        """Upload Z (row-major), factor A = Z^T (a column-major view: no extra transpose copy)."""
-        self.release()
-        T = self.torch.from_numpy(Z).to(self.dev)
-        self.lu, self.piv = self.torch.linalg.lu_factor(T.mT)
-        del T
-        self.torch.cuda.synchronize()
-        self.torch.cuda.empty_cache()
-
-    def solve(self, R):
-        """Z x = R with LU(A = Z^T):  A^T x = R  <=>  A^H conj(x) = conj(R)."""
-        R = np.asarray(R, np.complex64)
-        b = self.torch.from_numpy(np.ascontiguousarray(np.conj(R.reshape(len(R), -1)))).to(self.dev)
-        out = np.conj(self.torch.linalg.lu_solve(self.lu, self.piv, b, adjoint=True).cpu().numpy()).astype(complex)
-        return out[:, 0] if R.ndim == 1 else out
-
-    def download(self):
-        return np.asfortranarray(self.lu.cpu().numpy()), self.piv.cpu().numpy().astype(np.int32) - 1
-
-    def release(self):
-        super().release()
-        self.torch.cuda.empty_cache()
-
-
 class EmulatedBackend(_Backend):
     """NumPy/SciPy implementation of the backend interface (no GPU; for tests)."""
     name, inplace, device = 'emulate', True, 'CPU emulation'
@@ -144,19 +110,24 @@ class EmulatedBackend(_Backend):
         return self.lu, self.piv
 
 
-_BACKENDS = {'cupy': CupyBackend, 'torch': TorchBackend, 'emulate': EmulatedBackend}
+def _vulkan():
+    from .gpu_vk import VulkanBackend
+    return VulkanBackend()
+
+
+_BACKENDS = {'cupy': CupyBackend, 'vulkan': _vulkan, 'emulate': EmulatedBackend}
 _cache = {}
 
 
 def get_backend(pref='auto'):
-    """Return a backend instance or None. pref: 'auto' | 'cupy' | 'torch' | 'emulate' | 'off'.
+    """Return a backend instance or None. pref: 'auto' | 'vulkan' | 'cupy' | 'emulate' | 'off'.
     The environment variable MOM25D_GPU overrides pref. Reasons for failures are kept in
     get_backend.why for logging."""
     pref = devices.preference(pref, 'MOM25D_GPU')
     get_backend.why = []
     if pref == 'off':
         return None
-    names = ['cupy', 'torch'] if pref == 'auto' else [pref]
+    names = list(devices.auto_order()) if pref == 'auto' else [pref]
     for n in names:
         if n not in _BACKENDS:
             get_backend.why.append(f"unknown GPU backend {n!r}")
@@ -167,6 +138,8 @@ def get_backend(pref='auto'):
             return _cache[n]
         except GPUUnavailable as e:
             get_backend.why.append(str(e))
+        except ImportError as e:                                # vulkan: no slangpy
+            get_backend.why.append(f"{n}: {e}")
     return None
 
 
@@ -178,5 +151,4 @@ def describe():
     b = get_backend()
     if b is None:
         return "GPU: none (" + "; ".join(get_backend.why or ['disabled']) + ")"
-    api = 'ROCm/HIP' if b.hip else ('CUDA' if b.name != 'emulate' else 'none')
-    return f"GPU: {b.device} via {b.name} ({api}), {b.mem_free() / 1e9:.1f} GB free"
+    return f"GPU: {b.device} via {b.name} ({b.api}), {b.mem_free() / 1e9:.1f} GB free"

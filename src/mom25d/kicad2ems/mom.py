@@ -276,7 +276,7 @@ class MoM25D(Solver):
         if b is None:
             return dict(gpus=[], why='; '.join(get_backend.why) or 'disabled (MOM25D_GPU=off)')
         total = b.mem_total() if hasattr(b, 'mem_total') else None
-        return dict(gpus=[dict(device=b.device, backend=b.name, api='ROCm/HIP' if b.hip else 'CUDA',
+        return dict(gpus=[dict(device=b.device, backend=b.name, api=b.api,
                                free=b.mem_free() / 1e9, total=total / 1e9 if total else None)], why='')
 
     def check(self, s=None):

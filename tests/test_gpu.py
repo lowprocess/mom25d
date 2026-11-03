@@ -1,6 +1,6 @@
-"""GPU LU path: every backend's code runs end to end against NumPy stand-ins for the exact CuPy /
-PyTorch calls it makes, and must reproduce the CPU mixed-precision solver. (Real hardware: run
-tools/gpu_selfcheck.py on the GPU machine.)"""
+"""GPU LU path: every backend's code runs end to end against NumPy stand-ins for the exact CuPy
+calls it makes, and must reproduce the CPU mixed-precision solver. The Vulkan backend runs on the real GPU
+where there is one (slangpy and a Vulkan driver). (Real hardware: run tools/gpu_selfcheck.py on the GPU machine.)"""
 import sys, types
 import numpy as np
 import pytest
@@ -42,32 +42,6 @@ def fake_cupy(mem=8e9):
     cupyx = types.ModuleType('cupyx'); scipy_ = types.ModuleType('cupyx.scipy')
     cupyx.scipy = scipy_; scipy_.linalg = cla
     return {'cupy': cp, 'cupyx': cupyx, 'cupyx.scipy': scipy_, 'cupyx.scipy.linalg': cla}, calls
-
-
-def fake_torch(mem=8e9):
-    class T:                                            # minimal tensor: wraps an ndarray
-        def __init__(self, a): self.a = a
-        def to(self, dev): return T(np.array(self.a))   # "upload" = copy
-        @property
-        def mT(self): return T(self.a.T)
-        def cpu(self): return self
-        def numpy(self): return self.a
-    torch = types.ModuleType('torch')
-    torch.from_numpy = lambda a: T(a)
-    torch.device = lambda s: s
-    torch.version = types.SimpleNamespace(hip='6.2')
-    torch.cuda = types.SimpleNamespace(is_available=lambda: True, get_device_name=lambda i: 'Fake Radeon',
-                                       mem_get_info=lambda: (mem, 16e9), synchronize=lambda: None,
-                                       empty_cache=lambda: None)
-
-    def lu_factor(A):                                   # factors A exactly as given (torch semantics: 1-based pivots)
-        lu, piv = sla.lu_factor(np.array(A.a), check_finite=False)
-        return T(lu), T(piv + 1)
-
-    def lu_solve(LU, piv, B, adjoint=False):            # A X = B, or A^H X = B
-        return T(sla.lu_solve((LU.a, piv.a - 1), B.a, trans=2 if adjoint else 0, check_finite=False))
-    torch.linalg = types.SimpleNamespace(lu_factor=lu_factor, lu_solve=lu_solve)
-    return {'torch': torch}
 
 
 def test_gpu_solves_that_stall_are_done_on_the_cpu(clean, S_cpu):
@@ -124,13 +98,11 @@ def clean(monkeypatch):
     mom25d_gpu._cache.clear()
 
 
-@pytest.mark.parametrize('backend', ['cupy', 'torch', 'emulate'])
+@pytest.mark.parametrize('backend', ['cupy', 'emulate'])
 def test_gpu_backends_match_cpu(clean, S_cpu, backend):
     calls = {}
     if backend == 'cupy':
         mods, calls = fake_cupy()
-    elif backend == 'torch':
-        mods = fake_torch()
     else:
         mods = {}
     for k, v in mods.items():
@@ -156,7 +128,7 @@ def test_gpu_too_small_falls_back_to_cpu(clean, S_cpu):
 
 def test_auto_without_gpu_is_silent_cpu(clean, S_cpu):
     clean.setitem(sys.modules, 'cupy', None)            # import fails
-    clean.setitem(sys.modules, 'torch', None)
+    clean.setitem(sys.modules, 'slangpy', None)
     assert mom25d_gpu.get_backend('auto') is None
     S = make_sim('auto').sparams(4e9)
     assert np.abs(S - S_cpu).max() < 1e-6
@@ -270,3 +242,54 @@ def test_a_nan_solve_is_redone_on_the_cpu_or_refused(clean, S_cpu):
     clean.setattr(sim, '_currents', lambda f, E: real(sim, f, E) * np.nan)
     with pytest.raises(FloatingPointError, match='not finite'):
         sim.sparams(4e9)
+
+
+# ---- the Vulkan backend on the real GPU --------------------------------------------------------------------------
+def _vulkan_ok():
+    try:
+        from emsdev import gpu as devices
+        devices.vulkan_device()
+        return True
+    except Exception:
+        return False
+
+
+vulkan = pytest.mark.skipif(not _vulkan_ok(), reason='no Vulkan GPU (slangpy and a driver)')
+
+
+@vulkan
+@pytest.mark.parametrize('max_buffer', [None, 64 * 1024])
+def test_vulkan_lu_matches_lapack(clean, max_buffer):
+    """The hybrid LU against LAPACK: the same pivots and factor (complex64 round-off), the GPU's solves, the
+    factor downloaded in lu_factor's layout; a last panel narrower than the rest, rows interchanged; and (max_buffer)
+    the matrix over many buffers, as a large one is."""
+    from mom25d import gpu_vk
+    clean.setenv('MOM25D_VK_NB', '64')
+    if max_buffer:
+        clean.setattr(gpu_vk, 'MAX_BUFFER', max_buffer)
+    be = gpu_vk.VulkanBackend()
+    rng = np.random.default_rng(3)
+    N = 300
+    Z = (rng.standard_normal((N, N)) + 1j * rng.standard_normal((N, N))).astype(np.complex64)
+    Z += 4 * np.sqrt(N) * np.eye(N, dtype=np.complex64)
+    Z[[0, 7]] = Z[[7, 0]]                                         # pivots away from the diagonal
+    be.factor(Z)
+    if max_buffer:
+        assert len(be.lu[0].bufs) > 4
+    lu, piv = be.download()
+    ref, rpiv = sla.lu_factor(Z.T.astype(complex))
+    assert np.array_equal(piv, rpiv) and lu.flags.f_contiguous
+    assert np.abs(lu - ref).max() < 1e-4 * np.abs(ref).max()
+    R = rng.standard_normal((N, 3)) + 1j * rng.standard_normal((N, 3))
+    x = np.linalg.solve(Z.astype(complex), R)
+    assert np.abs(be.solve(R) - x).max() < 1e-4 * np.abs(x).max()
+    assert np.abs(be.solve(R[:, 0]) - x[:, 0]).max() < 1e-4 * np.abs(x).max()
+    be.release()
+
+
+@vulkan
+def test_vulkan_backend_matches_cpu(clean, S_cpu):
+    sim = make_sim('vulkan')
+    S = sim.sparams(4e9)
+    assert any(r[0] == 'LU factor (GPU)' for r in sim.log.records), "GPU path not taken"
+    assert np.abs(S - S_cpu).max() < 1e-6
