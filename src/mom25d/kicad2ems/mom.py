@@ -44,16 +44,33 @@ def mom25d_status():
     return True, f"{mom25d.__version__} ({os.path.dirname(mom25d.__file__)}), {core}"
 
 
-def _metal(m, sigma, rough=None):
+def run_finish(run):
+    """The run's surface finish (kicad2ems.api 2.4: resolve_finish), or None with an older kicad2ems."""
+    fin = getattr(run, 'finish', None)
+    if fin is not None or not getattr(run.s, 'sigma', None):
+        return fin
+    try:
+        from kicad2ems.api.solver import resolve_finish
+    except ImportError:
+        return None
+    return resolve_finish(run.s, run.m)
+
+
+def _metal(m, sigma, rough=None, finish=None):
     """mom25d's conductor loss for --sigma: the conductivity with the copper thickness of the ports' layer
-    (openEMS models the same copper as conducting sheets of that conductivity), and --rough (um RMS: Hammerstad at
-    each frequency). None without sigma."""
+    (openEMS models the same copper as conducting sheets of that conductivity), --rough (um RMS: Hammerstad at
+    each frequency) and the surface finish (kicad2ems.finish.Finish: on the outer copper, weighted by its finished
+    faces' share of the strip's loss at each frequency). None without sigma."""
     if not sigma:
         return None, None
     from mom25d.sim import Metal
     lays = [p.layer for p in m.ports if p.layer in m.cu_t] or [l for l in m.cu_order if l in m.copper]
     t_mm = m.cu_t.get(lays[0], 0.035) if lays else 0.035
-    return Metal(float(sigma), t_mm * 1e-3, float(rough or 0.0) * 1e-6), t_mm
+    fin, on = (), {}
+    if finish:
+        fin = [(s, t) for _, s, t in finish.layers]
+        on = {lay: finish.share(lay) for lay in finish.faces if finish.share(lay)}
+    return Metal(float(sigma), t_mm * 1e-3, float(rough or 0.0) * 1e-6, finish=fin, on=on), t_mm
 
 
 def _via_sides(v, words):
@@ -80,7 +97,7 @@ def reused(runlog):
     return tried - sum('did not precondition' in n for n in getattr(runlog, "notes", ()))
 
 
-def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, rough=None, log=print, progress=None,
+def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, rough=None, finish=None, log=print, progress=None,
           hold=None, tiled='auto', on_step=None, core='auto', quads=False, zone=None,
           signal_vias='round', stitching_vias='auto', lines=None, keep_at=(), stack='ground', quad_tol=35.0,
           coarsen=None, planes='pec', stitching_pads='drop'):
@@ -97,10 +114,11 @@ def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, rough=None,
     pairs, kw = _board_kw(m, dmax, port, quads=quads, quad_tol=quad_tol, coarsen=coarsen, zone=zone,
                           signal_vias=signal_vias, stitching_vias=stitching_vias, lines=lines, stack=stack,
                           planes=planes, stitching_pads=stitching_pads)
-    metal, t_mm = _metal(m, sigma, rough)
+    metal, t_mm = _metal(m, sigma, rough, finish)
     if metal is not None:
         log(f"  mom25d: conductor loss sigma {sigma:g} S/m, {t_mm * 1e3:g} um copper" +
-            (f", {rough:g} um RMS rough (Hammerstad)" if rough else ""))
+            (f", {rough:g} um RMS rough (Hammerstad)" if rough else "") +
+            (f", {finish.name} on {', '.join(sorted(metal.on))}" if metal.on else ""))
     kw.update(metal=metal, max_solves=max_solves, log=lambda t: log(f"  mom25d:{t}") if 'AFS' in t else None,
               progress=progress, tiled=tiled, on_step=on_step, core=core, keep_at=keep_at)
     try:
@@ -242,6 +260,7 @@ class MoM25D(Solver):
                         outline='ignored: laterally infinite dielectric', planes='yes: meshed (slow on plane-heavy boards)',
                         edge_walls='approximated: via rows every 0.5 mm', thickness='ignored: sheets',
                         conductor_loss='yes', roughness='yes: Hammerstad at each frequency',
+                        finish='approximated: on the outer copper, weighted by the finished faces\' share of the strip\'s loss (the port trace\'s), at each frequency',
                         dispersion='no: constant tan d', radiation='yes', cavity='no',
                         antenna='approximated: over an infinite ground plane (patches, arrays; not an antenna that '
                                 'uses the board edge or a finite ground)')
@@ -465,7 +484,7 @@ class MoM25D(Solver):
             port = 'lumped'
             run.log("mom25d: antenna mode: lumped ports (--mom-port wave for de-embedded ones)")
         S, names, zref, info = solve(run.m, run.freq, dmax=s.mom_dmax, port=port,
-                                     max_solves=s.mom_solves, sigma=s.sigma, rough=getattr(s, 'rough', None),
+                                     max_solves=s.mom_solves, sigma=s.sigma, rough=getattr(s, 'rough', None), finish=run_finish(run),
                                      log=run.log, hold=self._held, tiled=s.mom_tiled,
                                      core=s.mom_core, **_mesh_kw(s), keep_at=[f * 1e9 for f in s.mom_dump or []],
                                      progress=lambda k, n, f: (run.status('mom25d', dict(fraction=k / n, solves=k,

@@ -110,6 +110,11 @@ def build_board(board, fmin, fmax, dmax=0.3e-3, plane_factor=3.0, port='auto', p
             board = json.load(fh)
     model = BoardModel(board, ground=ground, port=port, pairs=pairs, planes=planes, stitching_pads=stitching_pads,
                        log=log)
+    if metal is not None and metal.on and any(isinstance(k, str) for k in metal.on):
+        import copy                                         # a finish named by copper layer: on its interface
+        metal = copy.copy(metal)
+        metal.on = {model.iface.get(k, k) if isinstance(k, str) else k: v for k, v in metal.on.items()}
+        metal.on = {k: v for k, v in metal.on.items() if not isinstance(k, str)}    # layers not modelled: none
     layer_dmax = {k: plane_factor * dmax for k, gs in model.shapes.items()
                   if sum(g.area for g in gs) > 0.5 * model.outline_area}
     sim = model.simulation(dmax=dmax, dmax_layer=layer_dmax, fmin=fmin, fmax=fmax, solver='auto', verbose=False,

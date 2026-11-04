@@ -556,7 +556,9 @@ class FastOperator:
         if sim.metal is not None:
             if sim._gram is None:
                 sim._gram = sparse.csr_matrix(gram_matrix(sim.rwg))
-            S[:Ne, :Ne] = S[:Ne, :Ne] + sim.metal.zs(f) * sparse.csr_matrix(sim._gram)
+            zs = sim.metal.zs_edges(f, sim.edge_layer)        # per edge where a finish covers some layers
+            S[:Ne, :Ne] = S[:Ne, :Ne] + (sparse.diags(zs) @ sparse.csr_matrix(sim._gram) if np.ndim(zs)
+                                          else zs * sparse.csr_matrix(sim._gram))
         return S.tocsr()
 
     def _gmres_columns(self, A, M, B, tol, restart, maxiter):

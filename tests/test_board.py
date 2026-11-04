@@ -198,3 +198,19 @@ def test_a_ground_via_under_a_parts_pad_is_meshed_as_a_signal_via():
     near = [gap.distance(Point(w['x'], w['y'])) < PART_VIA for w in data['vias']]
     kinds = [w.kind for w in BoardModel(data, log=quiet).vias]
     assert near[data['vias'].index(v)] and kinds == ['signal' if n else 'stitching' for n in near]
+
+
+def test_metal_finish_per_layer():
+    """A surface finish on some interfaces: Zs there times 1 + share (F - 1), elsewhere bare (sim.Metal)."""
+    import numpy as np
+    from mom25d.sim import Metal
+    enig = [(4.1e7, 0.08e-6), (1.45e6, 5e-6)]
+    m = Metal(5.8e7, 35e-6, finish=enig, on={2: 0.4})
+    f = 3e9
+    F = m.face_factor(f)
+    assert 4 < F.real < 6
+    assert m.zs(f, 2) == pytest.approx(m.zs(f) * (1 + 0.4 * (F - 1)))
+    assert m.zs(f, 1) == m.zs(f)
+    zs = m.zs_edges(f, np.array([1, 2, 2, 1]))
+    assert zs[0] == m.zs(f) and zs[1] == m.zs(f, 2)
+    assert np.ndim(Metal(5.8e7, 35e-6).zs_edges(f, np.array([1, 2]))) == 0     # no finish: one value

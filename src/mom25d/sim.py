@@ -187,17 +187,46 @@ class SeriesLumped:
 
 class Metal:
     """Conductor loss: Zs = (gamma/sigma) coth(gamma t), gamma = (1+j)/delta  (-> 1/(sigma t) at DC). rough (m RMS):
-    its resistance times Hammerstad and Jensen's factor 1 + 2/pi atan(1.4 (rough / delta)^2) at each frequency."""
-    def __init__(self, sigma=5.8e7, t=35e-6, rough=0.0):
+    its resistance times Hammerstad and Jensen's factor 1 + 2/pi atan(1.4 (rough / delta)^2) at each frequency.
+    finish: a surface finish's metal layers, outermost first, [(sigma, t m), ...], on the interfaces of `on`
+    ({interface: share}): there Zs times 1 + share (F - 1), F the finished face's impedance over the bare one's
+    (each finish layer a line section Z_i = gamma_i / sigma_i loading the one beneath, down to the copper), share
+    the part of the strip's loss on its finished faces (the outer face and the sides)."""
+    def __init__(self, sigma=5.8e7, t=35e-6, rough=0.0, finish=(), on=None):
         self.sigma, self.t, self.rough = sigma, t, rough
+        self.finish, self.on = [tuple(x) for x in finish], dict(on or {})
 
-    def zs(self, f):
+    def zs(self, f, k=None):
+        """Zs at f; k: the interface (its finish, if any)."""
         g = (1 + 1j) * np.sqrt(2 * np.pi * f * MU0 * self.sigma / 2)
         z = g / self.sigma / np.tanh(g * self.t)
         if self.rough:
             delta = 1 / np.sqrt(np.pi * f * MU0 * self.sigma)
             z = z.real * (1 + 2 / np.pi * np.arctan(1.4 * (self.rough / delta) ** 2)) + 1j * z.imag
+        share = self.on.get(k, 0.0) if self.finish else 0.0
+        if share:
+            z = z * (1 + share * (self.face_factor(f) - 1))
         return z
+
+    def face_factor(self, f):
+        """The finished face's impedance over the bare copper face's at f."""
+        w = 2 * np.pi * f
+        gam = lambda s: (1 + 1j) * np.sqrt(w * MU0 * s / 2)
+        bare = gam(self.sigma) / self.sigma / np.tanh(gam(self.sigma) * self.t)
+        z = bare
+        for s, tl in reversed(self.finish):
+            zc, th = gam(s) / s, np.tanh(gam(s) * tl)
+            z = zc * (z + zc * th) / (zc + z * th)
+        return z / bare
+
+    def zs_edges(self, f, edge_layer):
+        """Zs per RWG edge (by its layer's interface): one value unless a finish covers some interfaces."""
+        if not (self.finish and self.on):
+            return self.zs(f)
+        out = np.full(len(edge_layer), self.zs(f), complex)
+        for k in self.on:
+            out[edge_layer == k] = self.zs(f, k)
+        return out
 
 
 def _same_area(x, y, area, sides):
@@ -630,7 +659,8 @@ class Simulation:
             Z += el.Z(f) * np.outer(u, u)
         if self.metal is not None:
             self._gram = gram_matrix(r) if self._gram is None else self._gram
-            Z[:self.Ne, :self.Ne] += self.metal.zs(f) * self._gram
+            zs = self.metal.zs_edges(f, self.edge_layer)      # the Gram matrix couples edges of one layer only:
+            Z[:self.Ne, :self.Ne] += (zs[:, None] if np.ndim(zs) else zs) * self._gram    # still symmetric
         return _sym(Z)
 
     VIA_TABLE_PAIRS = 64                 # via pairs of one span pair above which R comes from a table
