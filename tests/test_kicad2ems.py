@@ -59,6 +59,13 @@ def test_sigma_reaches_mom(demo_files):
     assert metal.sigma == 5.8e7 and t == pytest.approx(m.cu_t[m.ports[0].layer]) and metal.t == pytest.approx(t * 1e-3)
     zs = metal.zs(np.array([1e9]))
     assert zs.real[0] > 0                                           # a lossy surface impedance
+    rough, _ = _metal(m, 5.8e7, 1.0)                                # --rough 1 um: Hammerstad on the resistance
+    f = np.array([1e6, 5e9, 1e12])
+    k = rough.zs(f).real / metal.zs(f).real
+    delta = 1 / np.sqrt(np.pi * f * 4e-7 * np.pi * 5.8e7)
+    np.testing.assert_allclose(k, 1 + 2 / np.pi * np.arctan(1.4 * (1e-6 / delta) ** 2))
+    assert k[0] == pytest.approx(1, abs=0.01) and k[2] == pytest.approx(2, abs=0.01)
+    np.testing.assert_allclose(rough.zs(f).imag, metal.zs(f).imag)
 
 
 def test_current_dumps(boards, run_cli, tmp_path, monkeypatch):

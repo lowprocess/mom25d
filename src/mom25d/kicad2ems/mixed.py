@@ -122,7 +122,7 @@ def line_S(gamma, zc, length, z0):
     return np.array([[s11, s21], [s21, s11]])
 
 
-def solve_mixed(m, freq, dmax=0.3, sigma=None, max_solves=60, cut_min=CUT_MIN, keep_out=None, log=print,
+def solve_mixed(m, freq, dmax=0.3, sigma=None, rough=None, max_solves=60, cut_min=CUT_MIN, keep_out=None, log=print,
                 progress=None, on_step=None, port='auto', hold=None, **mom_kw):
     """S over the board's ports (kicad2ems order, as mom.solve returns them), with the long straight runs cut out of
     mom25d's model and put back as lines. mom_kw: the mom25d mesh options (quads, zone, lines, signal_vias, ...)."""
@@ -136,7 +136,7 @@ def solve_mixed(m, freq, dmax=0.3, sigma=None, max_solves=60, cut_min=CUT_MIN, k
     freq = np.asarray(freq, float)
     fmin, fmax = float(freq[0]), float(freq[-1])
     dm = dmax * 1e-3
-    metal, t_mm = _metal(m, sigma)
+    metal, t_mm = _metal(m, sigma, rough)
     model = BoardModel(data, port='via' if port == 'lumped' else port, log=lambda *a: None)
     # the board's own ports, from the uncut copper: a cut would shorten their straight feeds (wave ports turned
     # lumped, and so different terminations); the cuts keep out of their feeds
@@ -343,7 +343,8 @@ class Mixed(MoM25D):
         s = run.s
         self._held = {}
         S, names, zref, info = solve_mixed(
-            run.m, run.freq, dmax=s.mom_dmax, sigma=s.sigma, max_solves=s.mom_solves, cut_min=s.mixed_cut, log=run.log,
+            run.m, run.freq, dmax=s.mom_dmax, sigma=s.sigma, rough=getattr(s, 'rough', None), max_solves=s.mom_solves,
+            cut_min=s.mixed_cut, log=run.log,
             port=s.mom_port, hold=self._held,
             quads={'off': False, 'on': True}.get(s.mom_quads, s.mom_quads),
             zone='auto' if s.mom_zone == 'on' else None, lines=s.mom_lines,
