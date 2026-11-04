@@ -96,7 +96,7 @@ stripline impedance to 0.6 %, coupled-line couplers to 0.1 dB, plane cavity reso
 files they read (`tests/boards`) are kicad2ems's example boards. `tools/` holds the GPU self-check and the studies
 behind kicad2ems's mom25d page (mesher, zone, quad cells, the HODLR solver).
 
-**Limits**: copper is zero-thickness, there is no surface-roughness model, and wave ports need a straight
+**Limits**: copper is zero-thickness (`Metal(rough=)` scales its loss by Hammerstad's roughness factor), and wave ports need a straight
 feed line.
 
 ## Licence

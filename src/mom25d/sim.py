@@ -10,7 +10,7 @@ ports   : LinePort (wave port, de-embedded to a reference plane, any direction)
           ViaPort  (lumped port in a via, e.g. pad-to-ground)
 vias    : Via(x, y, k_bot, k_top, radius)   k = 0 the bottom ground (an open bottom: metal there), k = N a PEC cover
 lumped  : SeriesLumped (element across a strip); Via(..., Z=...) puts an element inside a via
-metal   : Metal(sigma, t) -> surface impedance on strips, wall loss on vias (optional)
+metal   : Metal(sigma, t, rough) -> surface impedance on strips, wall loss on vias (optional)
 
 Unknowns: RWG edges on all metal layers, then one per via chain. Via-related matrix blocks use
 the kernels from mom25d.via (validated against exact image solutions); the via end charges are
@@ -186,13 +186,18 @@ class SeriesLumped:
 
 
 class Metal:
-    """Conductor loss: Zs = (gamma/sigma) coth(gamma t), gamma = (1+j)/delta  (-> 1/(sigma t) at DC)."""
-    def __init__(self, sigma=5.8e7, t=35e-6):
-        self.sigma, self.t = sigma, t
+    """Conductor loss: Zs = (gamma/sigma) coth(gamma t), gamma = (1+j)/delta  (-> 1/(sigma t) at DC). rough (m RMS):
+    its resistance times Hammerstad and Jensen's factor 1 + 2/pi atan(1.4 (rough / delta)^2) at each frequency."""
+    def __init__(self, sigma=5.8e7, t=35e-6, rough=0.0):
+        self.sigma, self.t, self.rough = sigma, t, rough
 
     def zs(self, f):
         g = (1 + 1j) * np.sqrt(2 * np.pi * f * MU0 * self.sigma / 2)
-        return g / self.sigma / np.tanh(g * self.t)
+        z = g / self.sigma / np.tanh(g * self.t)
+        if self.rough:
+            delta = 1 / np.sqrt(np.pi * f * MU0 * self.sigma)
+            z = z.real * (1 + 2 / np.pi * np.arctan(1.4 * (self.rough / delta) ** 2)) + 1j * z.imag
+        return z
 
 
 def _same_area(x, y, area, sides):
