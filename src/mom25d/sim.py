@@ -571,6 +571,26 @@ class Simulation:
                 Qs[ix] = M0[ix] / (2 * np.pi * EPS0 * stack.eps_sum(k))
             self.SA = _sym(MU0 / (4 * np.pi) * combine(r, Mrr, Mr[..., 0], Mr[..., 1], M0))
             self.SQ, self.Qs_F = _sym(qform(r.D, Qs, r.D)), Qs[:, self.F].copy()
+            # a wideband stack: the static charge part scales as 1 / eps_sum of its layer, each layer's kept apart
+            # to rescale at each frequency (_static_q); the tables extract theirs at that frequency
+            self._SQk = {}
+            if stack.dispersive:
+                for k in self.layers:
+                    Qk = np.zeros((Nt, Nt), complex)
+                    ix = np.ix_(self.tri_idx[k], self.tri_idx[k])
+                    Qk[ix] = Qs[ix]
+                    self._SQk[k] = (_sym(qform(r.D, Qk, r.D)), Qk[:, self.F].copy(), stack.eps_sum(k))
+
+    def _static_q(self, f):
+        """(SQ, Qs_F): the static charge parts at f (a wideband stack's rescaled to its permittivities there)."""
+        if not self._SQk:
+            return self.SQ, self.Qs_F
+        st = self.st.at(f)
+        SQ, QF = 0, 0
+        for k, (sq, qf, e0) in self._SQk.items():
+            s = e0 / st.eps_sum(k)
+            SQ, QF = SQ + s * sq, QF + s * qf
+        return SQ, QF
 
     @staticmethod
     def _guess_wref(g, lps):
@@ -623,7 +643,7 @@ class Simulation:
         for i, a in enumerate(self.layers):
             for b in self.layers[i:]:
                 xs = a != b and abs(self.st.z[a] - self.st.z[b]) < 3 * self.dmax
-                im = a == b and self.st.nearest_discontinuity(a) < 1.5 * self.dmax
+                im = a == b and self.st.at(f).nearest_discontinuity(a) < 1.5 * self.dmax
                 with self.log.timer('Green tables', f"M{a}-M{b} @ {f / 1e9:.2f} GHz"):
                     self.tables[(a, b)] = GreenTableML(f, self.st, a, b, self.rho_max, cross_sing=xs, image_sing=im)
         return self.tables
@@ -644,13 +664,14 @@ class Simulation:
                 A0[jx], Axo[jx], Ayo[jx], Arr[jx], Q0[jx] = a0.T, axs.T, ays.T, arr.T, q0.T
         N = self.Ne + self.Nv
         Z = np.zeros((N, N), complex)
+        SQ, Qs_F = self._static_q(f)
         with self.log.timer('assemble'):
             Q0 = _sym(Q0)
             Z[:self.Ne, :self.Ne] = (1j * w * (self.SA + combine(r, _sym(Arr), Axo, Ayo, _sym(A0)))
-                                     + (self.SQ + qform(r.D, Q0, r.D)) / (1j * w))
+                                     + (SQ + qform(r.D, Q0, r.D)) / (1j * w))
         if self.Nv:
             with self.log.timer('via kernels', f"{self.Nv} chains"):
-                B, C = self._via_blocks(f, Q0[:, self.F] + self.Qs_F)
+                B, C = self._via_blocks(f, Q0[:, self.F] + Qs_F)
             Z[:self.Ne, self.Ne:] = B
             Z[self.Ne:, :self.Ne] = B.T
             Z[self.Ne:, self.Ne:] = C

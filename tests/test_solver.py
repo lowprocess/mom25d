@@ -178,6 +178,30 @@ def test_fast_operators_match_dense():
 
 
 
+def test_a_wideband_stack_is_its_constant_stack_at_each_frequency():
+    """A Djordjevic-Sarkar stack (Layer(fref=)) solved at f: the S of the constant stack with that frequency's
+    permittivity, on the dense path (its static charge part rescaled per layer) and the direct one (two layers:
+    a via between them, the via kernels), and not the S at fref's permittivity."""
+    from shapely.geometry import box, Point
+    from mom25d.multilayer import djordjevic_sarkar
+    w, L, f = 0.35e-3, 8e-3, 9e9
+    v1 = Via(L / 2, 0, 0, 2, 0.1e-3)
+    geo2 = [box(-L / 2, -w / 2, L / 2, w / 2), Point(L / 2, 0).buffer(0.25e-3)]
+    geo1 = [box(-L / 2, -2e-3, L / 2 + 1e-3, 2e-3).difference(Point(L / 2, 0).buffer(0.5e-3))]
+
+    def S(layers, solver):
+        sim = Simulation(LayerStack(layers), {1: geo1, 2: geo2}, [ViaPort(Via(-L / 2, 0, 1, 2, 0.1e-3)), ViaPort(v1)],
+                         dmax=0.4e-3, dmax_layer={1: 0.6e-3}, w_ref={2: w, 1: 1e-3}, solver=solver, verbose=False)
+        return sim.sparams(f)
+    e1, e2 = djordjevic_sarkar(4.4, 0.02, 1e9, f), djordjevic_sarkar(3.5, 0.004, 1e9, f)
+    wide = [Layer(0.2e-3, 4.4, 0.02, fref=1e9), Layer(0.3e-3, 3.5, 0.004, fref=1e9)]
+    fixed = [Layer(0.2e-3, e1.real, -e1.imag / e1.real), Layer(0.3e-3, e2.real, -e2.imag / e2.real)]
+    for solver in ('dense', 'direct'):
+        Sw, Sf = S(wide, solver), S(fixed, solver)
+        assert np.abs(Sw - Sf).max() < 1e-9, solver
+        assert np.abs(Sw - S([Layer(0.2e-3, 4.4, 0.02), Layer(0.3e-3, 3.5, 0.004)], solver)).max() > 0.01
+
+
 def test_core_matches_numpy_and_solvers_agree(monkeypatch):
     """Compiled core (if built) vs NumPy fallback, and direct/mixed/BLR agreement."""
     pytest.importorskip('mom25d._core')

@@ -100,7 +100,7 @@ def reused(runlog):
 def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, rough=None, finish=None, log=print, progress=None,
           hold=None, tiled='auto', on_step=None, core='auto', quads=False, zone=None,
           signal_vias='round', stitching_vias='auto', lines=None, keep_at=(), stack='ground', quad_tol=35.0,
-          coarsen=None, planes='pec', stitching_pads='drop'):
+          coarsen=None, planes='pec', stitching_pads='drop', wideband=None):
     """S-parameters of the board m on `freq` (Hz) from mom25d, as kicad2ems reports them: (S (nf, n, n) in
     m.user_ports order with differential pairs as (d, c) modes, names, reference impedances, info dict).
     dmax in mm (planes 3x, refined near the copper of other layers). sigma (S/m): conductor loss, as --sigma
@@ -108,12 +108,20 @@ def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, rough=None,
     dict that receives mom25d's result as 'res' (its model and simulation, for the current dumps). keep_at:
     frequencies (Hz) the sweep solves and keeps the currents of (sim.kept: the current dumps'). stack: 'ground'
     (an infinite ground plane) or 'whole' (every copper layer meshed, mom25d.board ground='none'). planes,
-    stitching_pads: mom25d.board's."""
+    stitching_pads, wideband: mom25d.board's (wideband: the frequency, Hz, of a Djordjevic-Sarkar stack's er and
+    tand, or None)."""
     from mom25d.api import solve_board
     from kicad2ems.api.solver import mixed_mode
     pairs, kw = _board_kw(m, dmax, port, quads=quads, quad_tol=quad_tol, coarsen=coarsen, zone=zone,
                           signal_vias=signal_vias, stitching_vias=stitching_vias, lines=lines, stack=stack,
-                          planes=planes, stitching_pads=stitching_pads)
+                          planes=planes, stitching_pads=stitching_pads, wideband=wideband)
+    if wideband:
+        from mom25d.multilayer import djordjevic_sarkar
+        for l in m.layers:
+            e = djordjevic_sarkar(l['er'], l['tand'], wideband, np.array([freq[0], freq[-1]]))
+            log(f"  mom25d: wideband dielectric {l['name']}: er {e[0].real:.3f} -> {e[1].real:.3f}, tand "
+                f"{-e[0].imag / e[0].real:.4f} -> {-e[1].imag / e[1].real:.4f} ({freq[0] / 1e9:g} -> "
+                f"{freq[-1] / 1e9:g} GHz; Djordjevic-Sarkar, matched at {wideband / 1e9:g} GHz)")
     metal, t_mm = _metal(m, sigma, rough, finish)
     if metal is not None:
         log(f"  mom25d: conductor loss sigma {sigma:g} S/m, {t_mm * 1e3:g} um copper" +
@@ -157,12 +165,13 @@ def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, rough=None,
 
 
 def _board_kw(m, dmax, port, quads=False, quad_tol=35.0, coarsen=None, zone=None, signal_vias='round',
-              stitching_vias='auto', lines=None, stack='ground', planes='pec', stitching_pads='drop'):
+              stitching_vias='auto', lines=None, stack='ground', planes='pec', stitching_pads='drop',
+              wideband=None):
     """(pairs, mom25d.api's board and mesh options) of solve()'s settings: what the run meshes, and the preview."""
     kind = 'via' if port == 'lumped' else port
     pairs = any(len(legs) == 2 for _, legs in m.user_ports) and kind != 'via'
     return pairs, dict(dmax=dmax * 1e-3, port=kind, quads=quads, quad_tol=quad_tol, coarsen=coarsen, zone=zone,
-                       planes=planes, stitching_pads=stitching_pads, signal_vias=signal_vias,
+                       planes=planes, stitching_pads=stitching_pads, wideband=wideband, signal_vias=signal_vias,
                        stitching_vias=stitching_vias, lines=lines,
                        **(dict(ground='none') if stack == 'whole' else {}))
 
@@ -228,8 +237,12 @@ def memory_plan_for(n, tiled='auto'):
 
 
 def _model_kw(s):
-    """mom25d.board.BoardModel's options from kicad2ems's settings: --mom-planes, --mom-stitching-pads."""
-    return dict(planes=getattr(s, 'mom_planes', 'pec'), stitching_pads=getattr(s, 'mom_stitching_pads', 'drop'))
+    """mom25d.board.BoardModel's options from kicad2ems's settings: --mom-planes, --mom-stitching-pads, and --diel
+    (the FDTD solvers' option, which kicad2ems's examples set: wideband is the Djordjevic-Sarkar model matched at
+    --diel-fref; fixed, mom25d's constant er and tand)."""
+    wide = getattr(s, 'diel', 'fixed') == 'wideband'
+    return dict(planes=getattr(s, 'mom_planes', 'pec'), stitching_pads=getattr(s, 'mom_stitching_pads', 'drop'),
+                wideband=getattr(s, 'diel_fref', 1.0) * 1e9 if wide else None)
 
 
 def _mesh_kw(s, m):
@@ -262,18 +275,34 @@ def apertures(m, s):
     return out
 
 
+def ports_below(m, s):
+    """The ports on copper below the ground mom25d would put its infinite plane at (which the ground stack cannot
+    have: rf_msvia's P2 on B.Cu under the In2.Cu ground)."""
+    g = _solid_ground(m)
+    if g is None:
+        return []
+    if _model_kw(s)['planes'] == 'pec':
+        from mom25d.board import pec_planes
+        g, _ = pec_planes(m.to_dict(), g)
+    return [p.name for p in m.ports if m.cu_z.get(p.layer, np.inf) < m.cu_z[g] - 1e-9]
+
+
 def _stack(s, m):
     """--mom-stack for the board m: auto is whole where the ground has apertures under the signal copper (a slot,
-    a defected or partial ground: apertures()), which the infinite plane would fill in, else ground."""
+    a defected or partial ground: apertures()), which the infinite plane would fill in, or a port is below the
+    ground (ports_below), else ground."""
     if s.mom_stack != 'auto':
         return s.mom_stack
-    return 'whole' if apertures(m, s) else 'ground'
+    return 'whole' if apertures(m, s) or ports_below(m, s) else 'ground'
 
 
 def _apertures_said(m, s):
     """One line on the ground's apertures for the log, or None: why auto chose the whole stack, or a warning
     that --mom-stack ground fills them in."""
     ap = apertures(m, s)
+    if s.mom_stack == 'auto' and not ap and ports_below(m, s):
+        return (f"mom25d: stack auto: whole, every copper layer meshed: port(s) {', '.join(ports_below(m, s))} below "
+                f"the ground")
     if not ap or s.mom_stack == 'whole':
         return None
     where = aperture_text(ap)
@@ -310,7 +339,7 @@ class MoM25D(Solver):
                         edge_walls='approximated: via rows every 0.5 mm', thickness='ignored: sheets',
                         conductor_loss='yes', roughness='yes: Hammerstad at each frequency',
                         finish='approximated: on the outer copper, weighted by the finished faces\' share of the strip\'s loss (the port trace\'s), at each frequency',
-                        dispersion='no: constant tan d', radiation='yes', cavity='no',
+                        dispersion='yes with --diel wideband (Djordjevic-Sarkar at each frequency), else constant er and tan d', radiation='yes', cavity='no',
                         antenna='approximated: over an infinite ground plane (patches, arrays; not an antenna that '
                                 'uses the board edge or a finite ground)')
     options = [

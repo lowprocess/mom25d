@@ -18,7 +18,7 @@ import time
 import numpy as np
 
 from kicad2ems.api.solver import Result, Option
-from .mom import MoM25D, _metal, run_finish, _stack, apertures, aperture_text
+from .mom import MoM25D, _metal, run_finish, _stack, apertures, aperture_text, ports_below
 from ..base import C0
 from kicad2ems.api.solver import stop
 
@@ -325,7 +325,8 @@ class Mixed(MoM25D):
     order = 30
     capabilities = dict(MoM25D.capabilities, ports='yes: as mom25d',
                         diff_pairs='yes: as mom25d (coupled stretches are not cut)',
-                        radiation='approximated: as mom25d, except from the stretches put back as lines')
+                        radiation='approximated: as mom25d, except from the stretches put back as lines',
+                        dispersion='no: constant er and tan d (--diel wideband is mom25d\'s alone)')
     options = [
         Option('mixed_cut', CUT_MIN, "mixed: the shortest stretch of straight trace put back as a line, mm (default "
                "{default}); its mom25d mesh options are mom25d's (--mom-dmax, --mom-zone, ...)", float, name='cut',
@@ -338,9 +339,10 @@ class Mixed(MoM25D):
             out.append("mom_stack = whole: mixed cuts its lines over the infinite ground (mom25d models the whole "
                        "stack)")
         elif run.s.mom_stack == 'auto' and _stack(run.s, run.m) == 'whole':
-            out.append(f"the ground has apertures under the signal copper ({aperture_text(apertures(run.m, run.s))}"
-                       f"): mixed cuts its lines over an infinite ground, which would fill them in (mom25d models them "
-                       f"with the whole stack; --mom-stack ground forces mixed anyway)")
+            ap = apertures(run.m, run.s)
+            why = aperture_text(ap) if ap else f"port(s) {', '.join(ports_below(run.m, run.s))} below the ground"
+            out.append(f"{why}: mixed cuts its lines over an infinite ground (mom25d models the board with the whole "
+                       f"stack; --mom-stack ground forces mixed anyway)")
         return out
 
     def solve(self, run, prep):

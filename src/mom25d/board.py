@@ -156,12 +156,13 @@ def lone_pads(data, layers):
 
 class BoardModel(PlanarModel):
     def __init__(self, data, ground=None, port='auto', pairs=False, wall_pitch=0.5e-3, planes='pec',
-                 stitching_pads='drop', log=print):
+                 stitching_pads='drop', wideband=None, log=print):
         """data: the board (board.json's content). ground: a copper layer name (default: the board's own,
         else the lowest solid one). port: 'auto' | 'wave' | 'via' (lumped). pairs: P<n>+ / P<n>- legs as
         one mixed-mode port. wall_pitch (m): via spacing along edge walls. planes: 'pec' (default: solid planes
         as the ground and a PEC cover) | 'mesh'. stitching_pads: 'drop' (default: lone pads of ground vias left out)
-        | 'keep'."""
+        | 'keep'. wideband: None (default: each dielectric's er and tand constant over frequency) or a frequency
+        (Hz) at which they hold, the Djordjevic-Sarkar model elsewhere (multilayer.djordjevic_sarkar)."""
         from .multilayer import Layer, LayerStack
         if data.get('format') != FORMAT:
             raise ValueError(f"not a {FORMAT} file (format {data.get('format')!r})")
@@ -196,7 +197,7 @@ class BoardModel(PlanarModel):
         ztop = cu_z[self.cover] if self.cover else max(cu_z.values())
         diels = sorted([l for l in st['layers'] if l['z0'] >= zg - 1e-9
                         and (not (self.whole or self.cover) or l['z1'] <= ztop + 1e-9)], key=lambda l: l['z0'])
-        self.stack = LayerStack([Layer((l['z1'] - l['z0']) * MM, l['er'], l['tand'], l['name']) for l in diels],
+        self.stack = LayerStack([Layer((l['z1'] - l['z0']) * MM, l['er'], l['tand'], l['name'], fref=wideband) for l in diels],
                                 top='pec' if self.cover else 'open', bottom='open' if self.whole else 'pec')
         if self.whole:
             self.notes.append(f"whole stack: no infinite ground, {len(cu_z)} copper layers meshed (planes too), "

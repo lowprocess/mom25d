@@ -54,13 +54,37 @@ class RunLog:
 
 
 # ---- Stackup and spectral-domain transmission-line network ------------------
+DS_M1, DS_M2 = 3.0, 12.0        # the Djordjevic-Sarkar model's corners: 1 kHz and 1 THz (log10 Hz)
+
+
+def _ds_k(f):
+    w = 2 * np.pi * np.asarray(f, float)
+    return np.log10((2 * np.pi * 10 ** DS_M2 + 1j * w) / (2 * np.pi * 10 ** DS_M1 + 1j * w)) / (DS_M2 - DS_M1)
+
+
+def djordjevic_sarkar(er, tand, fref, f):
+    """The Djordjevic-Sarkar (wideband Debye) relative permittivity eps' - j eps'' at f (Hz), equal to
+    er (1 - j tand) at fref: eps_inf + d_eps / (m2 - m1) log10((w2 + j w) / (w1 + j w)), as kicad2ems's FDTD
+    solvers fit it (their wideband dielectric), here exact at every frequency."""
+    kr = _ds_k(fref)
+    d_eps = -er * tand / kr.imag
+    return er - d_eps * kr.real + d_eps * _ds_k(f)
+
+
 class Layer:
-    def __init__(self, h, er, tand=0.0, name=None):
-        self.h, self.er, self.tand, self.name = h, er, tand, name
+    """A dielectric layer: h (m), er and tand. fref (Hz): a wideband (Djordjevic-Sarkar) layer, er and tand
+    holding at fref; None: both constant over frequency."""
+    def __init__(self, h, er, tand=0.0, name=None, fref=None):
+        self.h, self.er, self.tand, self.name, self.fref = h, er, tand, name, fref
 
     @property
     def er_c(self):
+        """The complex permittivity (at fref, for a wideband layer: LayerStack.at for another frequency)."""
         return self.er * (1 - 1j * self.tand)
+
+    def er_at(self, f):
+        """The complex permittivity at f (Hz)."""
+        return self.er_c if self.fref is None else complex(djordjevic_sarkar(self.er, self.tand, self.fref, f))
 
 
 class LayerStack:
@@ -81,6 +105,26 @@ class LayerStack:
         for i, l in enumerate(self.layers):
             if l.name is None:
                 l.name = f"D{i + 1}"
+
+    @property
+    def dispersive(self):
+        """Any layer is wideband (Layer.fref): the stack's permittivities depend on the frequency."""
+        return any(l.fref is not None for l in self.layers)
+
+    def at(self, f):
+        """The stack at f (Hz): itself if no layer is wideband, else a copy whose layers hold their permittivity at
+        f (Layer.er_at) as constants. Everything built for one frequency (the Green tables, via kernels, far
+        field) takes this, so the rest of mom25d is unchanged by dispersion."""
+        if not self.dispersive:
+            return self
+        import copy
+        out = copy.copy(self)
+        out.layers = []
+        for l in self.layers:
+            e = l.er_at(f)
+            out.layers.append(Layer(l.h, e.real, -e.imag / e.real, l.name))
+        out.f = f
+        return out
 
     @property
     def metal_interfaces(self):
@@ -173,6 +217,7 @@ class GreenTableML:
     def __init__(self, f, stack, o, s, rho_max, nrho=260, nfine=8192, K=None, nq=8, cross_sing=False,
                  image_sing=None):
         w = 2 * np.pi * f
+        stack = stack.at(f)                         # a wideband stack's permittivities at f
         self.o, self.s, self.f = o, s, f
         same, self.d = o == s, abs(stack.z[o] - stack.z[s])
         self.cA, self.cq = (MU0 / (4 * np.pi), 1.0 / (2 * np.pi * EPS0 * stack.eps_sum(o))) if same else (0.0, 0.0)

@@ -49,7 +49,7 @@ ZONE_OUT = 5.0     # zone=: cells up to this x dmax outside the zone around the 
 def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=False, mesher='auto', metal=None,
                 ground=None, max_solves=60, afs_tol=5e-3, log=print, progress=None, tiled='auto', on_step=None,
                 core='auto', quads=False, zone=None, signal_vias='round', stitching_vias='auto', lines=None,
-                keep_at=(), quad_tol=35.0, coarsen=None, planes='pec', stitching_pads='drop'):
+                keep_at=(), quad_tol=35.0, coarsen=None, planes='pec', stitching_pads='drop', wideband=None):
     """S-parameters of a board (a <name>_board.json path, or its content) on `freq` (Hz).
 
     dmax (m): largest cell along the copper; layers whose metal covers more than half the board (planes) get
@@ -64,7 +64,8 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     quad_tol: the largest deviation of their corners from 90 degrees. coarsen: cells grow from dmax at corners, vias
     and ports to coarsen x dmax away from them (geo.mesh_polygons; None: dmax everywhere). planes: 'pec' (default:
     solid planes as the ground and a PEC cover, not meshed: mom25d.board) or 'mesh'. stitching_pads: 'drop'
-    (default: a ground via's pad with nothing else on its layer left out, the via kept) or 'keep'."""
+    (default: a ground via's pad with nothing else on its layer left out, the via kept) or 'keep'. wideband: None
+    (constant er, tand) or the frequency (Hz) the stack's er and tand hold at, Djordjevic-Sarkar elsewhere."""
     from . import fast
     from .geo import LinePort
     from .run import solve_band
@@ -77,7 +78,7 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
                                  mesher=mesher, metal=metal, ground=ground, log=log, tiled=tiled, core=core,
                                  quads=quads, zone=zone, signal_vias=signal_vias, stitching_vias=stitching_vias,
                                  lines=lines, quad_tol=quad_tol, coarsen=coarsen, planes=planes,
-                                 stitching_pads=stitching_pads, title=name)
+                                 stitching_pads=stitching_pads, wideband=wideband, title=name)
         f, S, info = solve_band(sim, fmin, fmax, points=len(freq), zref=model.port_z0, max_solves=max_solves,
                                 afs_tol=afs_tol, log=log, progress=progress, on_step=on_step, keep_at=keep_at)
         core_used = fast._core is not None
@@ -99,7 +100,7 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
 def build_board(board, fmin, fmax, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=False, mesher='auto',
                 metal=None, ground=None, log=print, tiled='auto', core='auto', quads=False, zone=None,
                 signal_vias='round', stitching_vias='auto', lines=None, quad_tol=35.0, coarsen=None, planes='pec',
-                stitching_pads='drop', title=None, mesh_only=False, characterize=True):
+                stitching_pads='drop', wideband=None, title=None, mesh_only=False, characterize=True):
     """(BoardModel, Simulation) of a board as solve_board builds them, with its options (solve_board's). mesh_only:
     stop once the mesh and its unknowns are known (a preview of the mesh solve_board would solve on; the quad
     cells are paired only after that, so a mesh_only simulation has none)."""
@@ -109,7 +110,7 @@ def build_board(board, fmin, fmax, dmax=0.3e-3, plane_factor=3.0, port='auto', p
         with open(board, encoding='utf-8') as fh:
             board = json.load(fh)
     model = BoardModel(board, ground=ground, port=port, pairs=pairs, planes=planes, stitching_pads=stitching_pads,
-                       log=log)
+                       wideband=wideband, log=log)
     if metal is not None and metal.on and any(isinstance(k, str) for k in metal.on):
         import copy                                         # a finish named by copper layer: on its interface
         metal = copy.copy(metal)

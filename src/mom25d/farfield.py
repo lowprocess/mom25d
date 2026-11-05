@@ -49,7 +49,7 @@ def _via_Eu(st, kr, w, o, layers):
 def _tangential(sim, I, w, o, kr, cphi, sphi):
     """E_u, E_v on interface o at the plane-wave directions (kr, cos / sin phi) from all the currents: the surface
     currents of every layer, and the via chains' (sim.chains, unknowns after the Ne edges, when the sim has them)."""
-    st = sim.st
+    st = sim.st.at(w / (2 * np.pi))
     kx, ky = kr * cphi, kr * sphi
     jx, jy = sim.current_density(I)                                      # per triangle (A/m)
     cen, area = sim.rwg.cent[:, :2], sim.rwg.area
@@ -82,7 +82,7 @@ def far_field(sim, I, f, theta, phi):
     """r E_theta, r E_phi (V, complex, shape (len(phi), len(theta))) of the currents I (one excitation column)
     at f (Hz), the surface currents and the vias'; theta from the board normal (0..180 deg: above the board to 90,
     below it beyond; zero below the PEC ground), phi from +x (degrees)."""
-    st = sim.st
+    st = sim.st.at(f)
     th, ph = np.radians(np.asarray(theta, float)), np.radians(np.asarray(phi, float))
     TH, PH = np.meshgrid(th, ph)                                         # (nphi, ntheta)
     if st.top != 'open' and (TH < np.pi / 2).any():
@@ -117,7 +117,7 @@ def near_field(sim, layers_J, x, y, f, height, pad=2):
     to the top surface (as far_field), then up by e^{-j kz height}; E_z from the divergence. The FFT is
     periodic: the currents are zero-padded to `pad` x the grid (a port's strong field otherwise reappeared on
     the far side of a 10 mm margin) and the result cropped back."""
-    st, w = sim.st, 2 * np.pi * f
+    st, w = sim.st.at(f), 2 * np.pi * f
     k_top = w / C0 * np.sqrt(complex(st.top_er)).real
     nx0, ny0 = len(x), len(y)
     nx, ny = pad * nx0, pad * ny0

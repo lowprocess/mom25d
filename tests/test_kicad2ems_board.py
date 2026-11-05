@@ -47,3 +47,28 @@ def test_board_files_are_what_kicad2ems_writes(name, tmp_path):
     diffs = _differences(frozen, now)
     assert not diffs, (f"tests/boards/{name}.json is not what kicad2ems writes now (write it again from "
                        f"make_demo_board.py): " + '; '.join(diffs[:5]))
+
+
+def test_stack_auto():
+    """--mom-stack auto: the ground stack on the demo transition; the whole stack once a slot is cut into its ground
+    under the trace, or with a port below the ground (In1.Cu as the ground: P2 on In2.Cu under it); an explicit
+    ground or whole is kept."""
+    from types import SimpleNamespace as NS
+    from shapely.geometry import box, mapping, shape
+    from mom25d.kicad2ems.mom import _stack, apertures, ports_below
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'boards', 'demo.json'), encoding='utf-8') as fh:
+        demo = fh.read()
+    s = lambda st: NS(mom_stack=st, mom_planes='pec', mom_stitching_pads='drop')
+    m = Board.from_dict(json.loads(demo))
+    assert _stack(s('auto'), m) == 'ground' and not ports_below(m, s('auto'))
+    data = json.loads(demo)
+    gnd = data['copper']['B.Cu'][0]
+    gnd['polygon'] = mapping(shape(gnd['polygon']).difference(box(5.0, -5.8, 5.4, -4.2)))
+    m = Board.from_dict(data)
+    assert _stack(s('auto'), m) == 'whole' and len(apertures(m, s('auto'))) == 1
+    assert _stack(s('ground'), m) == 'ground'
+    data = json.loads(demo)
+    data['ground'] = 'In1.Cu'
+    m = Board.from_dict(data)
+    assert ports_below(m, s('auto')) == ['P2'] and _stack(s('auto'), m) == 'whole'
+    assert _stack(s('whole'), Board.from_dict(json.loads(demo))) == 'whole'

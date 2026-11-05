@@ -162,6 +162,7 @@ class ViaKernels:
     """
     def __init__(self, f, stack, spans, interfaces, rho_max, nrho=200):
         w = 2 * np.pi * f
+        stack = stack.at(f)                         # a wideband stack's permittivities at f
         kr, dk, _ = sommerfeld_contour(f, stack, rho_max)
         net = TMNetwork(stack, kr, w)
         self.f, self.st, self.w, self.kr, self.dk, self.net = f, stack, w, kr, dk, net
