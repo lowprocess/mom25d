@@ -18,7 +18,7 @@ import time
 import numpy as np
 
 from kicad2ems.api.solver import Result, Option
-from .mom import MoM25D, _metal, run_finish
+from .mom import MoM25D, _metal, run_finish, _stack, apertures, aperture_text
 from ..base import C0
 from kicad2ems.api.solver import stop
 
@@ -337,6 +337,10 @@ class Mixed(MoM25D):
         if run.s.mom_stack == 'whole':                              # its lines are cut against the ground plane
             out.append("mom_stack = whole: mixed cuts its lines over the infinite ground (mom25d models the whole "
                        "stack)")
+        elif run.s.mom_stack == 'auto' and _stack(run.s, run.m) == 'whole':
+            out.append(f"the ground has apertures under the signal copper ({aperture_text(apertures(run.m, run.s))}"
+                       f"): mixed cuts its lines over an infinite ground, which would fill them in (mom25d models them "
+                       f"with the whole stack; --mom-stack ground forces mixed anyway)")
         return out
 
     def solve(self, run, prep):

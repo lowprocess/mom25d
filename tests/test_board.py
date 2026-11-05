@@ -214,3 +214,18 @@ def test_metal_finish_per_layer():
     zs = m.zs_edges(f, np.array([1, 2, 2, 1]))
     assert zs[0] == m.zs(f) and zs[1] == m.zs(f, 2)
     assert np.ndim(Metal(5.8e7, 35e-6).zs_edges(f, np.array([1, 2]))) == 0     # no finish: one value
+
+
+def test_ground_apertures():
+    """ground_apertures: a slot cut into the ground under the trace is found, with its area; a via's antipad
+    (In1.Cu's, the signal via through it) and a pour pulled back from the board edge are not."""
+    from shapely.geometry import box, mapping, shape
+    from mom25d.board import ground_apertures
+    data = board('demo')
+    assert ground_apertures(data, 'B.Cu') == [] and ground_apertures(data, 'In1.Cu') == []
+    gnd = data['copper']['B.Cu'][0]
+    gnd['polygon'] = mapping(shape(gnd['polygon']).buffer(-0.3, join_style='mitre'))     # the pour's pullback
+    assert ground_apertures(data, 'B.Cu') == []
+    gnd['polygon'] = mapping(shape(gnd['polygon']).difference(box(5.0, -5.8, 5.4, -4.2)))  # a slot across the trace
+    (slot, area), = ground_apertures(data, 'B.Cu')
+    assert area == pytest.approx(0.4 * 1.6, rel=1e-3) and slot.centroid.x == pytest.approx(5.2)

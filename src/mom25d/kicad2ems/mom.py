@@ -232,13 +232,62 @@ def _model_kw(s):
     return dict(planes=getattr(s, 'mom_planes', 'pec'), stitching_pads=getattr(s, 'mom_stitching_pads', 'drop'))
 
 
-def _mesh_kw(s):
-    """solve()'s mesh options from kicad2ems's settings (the run's and the preview's): --mom-quads, --mom-quad-tol,
-    --mom-coarsen, --mom-zone, the vias, --mom-lines, --mom-stack and the BoardModel's."""
+def _mesh_kw(s, m):
+    """solve()'s mesh options from kicad2ems's settings (the run's and the preview's) for the board m: --mom-quads,
+    --mom-quad-tol, --mom-coarsen, --mom-zone, the vias, --mom-lines, --mom-stack (resolved: _stack) and the
+    BoardModel's."""
     return dict(quads={'off': False, 'on': True}.get(s.mom_quads, s.mom_quads), quad_tol=s.mom_quad_tol,
                 coarsen=s.mom_coarsen or None, zone='auto' if s.mom_zone == 'on' else None,
                 signal_vias=s.mom_signal_vias, stitching_vias=s.mom_stitching_vias, lines=s.mom_lines,
-                stack=s.mom_stack, **_model_kw(s))
+                stack=_stack(s, m), **_model_kw(s))
+
+
+_held_apertures = [None, None]                  # (board, its apertures): the last board's, asked for several times
+
+
+def apertures(m, s):
+    """mom25d.board.ground_apertures of the ground mom25d would put its infinite plane at (the board's ground
+    layer, moved up by --mom-planes pec as mom25d.board.pec_planes does): [(polygon, mm2, layer)], [] for a complete
+    ground or none."""
+    if _held_apertures[0] is m and _held_apertures[1][0] == _model_kw(s)['planes']:
+        return _held_apertures[1][1]
+    from mom25d.board import ground_apertures, pec_planes
+    g, out = _solid_ground(m), []
+    if g is not None:
+        data = m.to_dict()
+        if _model_kw(s)['planes'] == 'pec':
+            g, _ = pec_planes(data, g)
+        out = [(poly, a, g) for poly, a in ground_apertures(data, g)]
+    _held_apertures[:] = [m, (_model_kw(s)['planes'], out)]
+    return out
+
+
+def _stack(s, m):
+    """--mom-stack for the board m: auto is whole where the ground has apertures under the signal copper (a slot,
+    a defected or partial ground: apertures()), which the infinite plane would fill in, else ground."""
+    if s.mom_stack != 'auto':
+        return s.mom_stack
+    return 'whole' if apertures(m, s) else 'ground'
+
+
+def _apertures_said(m, s):
+    """One line on the ground's apertures for the log, or None: why auto chose the whole stack, or a warning
+    that --mom-stack ground fills them in."""
+    ap = apertures(m, s)
+    if not ap or s.mom_stack == 'whole':
+        return None
+    where = aperture_text(ap)
+    if s.mom_stack == 'auto':
+        return f"mom25d: stack auto: whole, every copper layer meshed: {where}; --mom-stack ground fills them in"
+    return (f"WARNING: mom25d: {where}: --mom-stack ground puts a solid infinite plane there, so what they do is "
+            f"not modelled (rf_dgs |dS| 0.74 against FDTD); --mom-stack whole or auto models them")
+
+
+def aperture_text(ap):
+    """apertures()' result in a few words."""
+    return f"{len(ap)} aperture{'s' if len(ap) > 1 else ''} in the ground {ap[0][2]} under the signal copper " \
+            f"({sum(a for _, a, _ in ap):.1f} mm2; the largest {ap[0][1]:.1f} mm2 at " \
+            f"({ap[0][0].centroid.x:.1f}, {-ap[0][0].centroid.y:.1f}) mm)"
 
 
 def _solid_ground(m):
@@ -269,10 +318,11 @@ class MoM25D(Solver):
                "traces)", float, name='dmax', gui='Largest cell along the copper (mm)', group=G, cli=dict(metavar='MM')),
         Option('mom_port', 'auto', "auto (default): de-embedded wave ports where a straight feed allows, else lumped",
                choices=('auto', 'wave', 'lumped'), name='port', gui='Ports', group=G),
-        Option('mom_stack', 'ground', "the stack mom25d models: ground (default: an infinite plane at the ground "
-               "layer, its copper not meshed, the copper below it left out) or whole (every copper layer meshed, the "
+        Option('mom_stack', 'auto', "the stack mom25d models: auto (default: whole where the ground layer has "
+               "apertures under the signal copper - a slot, a defected or partial ground - else ground), ground (an "
+               "infinite plane at the ground layer, its copper not meshed, the copper below it left out) or whole (every copper layer meshed, the "
                "planes too, air above and below: ports and copper on any layer, radiation below the board and a "
-               "finite ground in antenna mode; lumped ports; more unknowns)", choices=('ground', 'whole'),
+               "finite ground in antenna mode; lumped ports; more unknowns)", choices=('auto', 'ground', 'whole'),
                name='stack', gui='MoM stack', group=G),
         Option('mom_quads', 'off', "experimental: merge near-rectangular triangle pairs into quad cells, a "
                "constant-divergence subspace with fewer unknowns and a cheaper LU (docs/mom.md#quads): off (default), "
@@ -358,7 +408,7 @@ class MoM25D(Solver):
         gaps = [p.name for p in m.ports if p.kind == 'gap']
         if gaps:
             out.append(f"gap port(s) {', '.join(gaps)}: no planar equivalent")
-        if run.s.mom_stack != 'whole' and _solid_ground(m) is None:
+        if _stack(run.s, m) != 'whole' and _solid_ground(m) is None:
             out.append("no solid ground plane (no copper layer covers half the board): set ground = <layer>, or "
                        "mom_stack = whole")
         return out
@@ -373,7 +423,7 @@ class MoM25D(Solver):
         from shapely.geometry import Point, box
         from shapely.ops import unary_union
         m, out = run.m, []
-        whole = run.s.mom_stack == 'whole'                           # every copper layer meshed: no ground plane
+        whole = _stack(run.s, m) == 'whole'                          # every copper layer meshed: no ground plane
         g = None if whole else _solid_ground(m)
         if g is None and not whole:
             return out
@@ -386,6 +436,9 @@ class MoM25D(Solver):
         out.append(Deviation('outline', 'outline', 'ignored: laterally infinite dielectric'))
         if not whole:
             out.append(Deviation(f"copper:{g}", 'planes', 'the infinite ground plane (not meshed)', dropped=True))
+            out += [Deviation(f"aperture:{g}:{i}", 'planes', 'an aperture in the ground under the signal copper: '
+                              'filled in by the infinite plane', layer=g, area=a)
+                    for i, (_, a, _) in enumerate(apertures(m, run.s))]
             out += [Deviation(f"copper:{l}", 'planes', 'below the ground: left out', dropped=True)
                     for l in m.copper if m.cu_z[l] < zg - 1e-9]
         if cover:
@@ -437,7 +490,8 @@ class MoM25D(Solver):
     def readback(self, run, prep):
         """mom25d's planar model of the board (mom25d.board.BoardModel), in board terms."""
         from mom25d.board import BoardModel
-        bm = BoardModel(run.m.to_dict(), log=lambda *a: None, **_model_kw(run.s))
+        bm = BoardModel(run.m.to_dict(), log=lambda *a: None, **_model_kw(run.s),
+                        **(dict(ground='none') if _stack(run.s, run.m) == 'whole' else {}))
         zk, lay = bm._zk, {k: l for l, k in bm.iface.items()}
         ports = [leg['name'] for sp in bm.port_specs for leg in (sp['legs'].values() if 'legs' in sp else [sp])]
         return dict(vias=[[v.x * 1e3, v.y * 1e3, v.a * 1e3, float(zk[v.k_bot]), float(zk[v.k_top])] for v in bm.vias],
@@ -449,7 +503,8 @@ class MoM25D(Solver):
         a sweep of up to SOLVES solves."""
         from mom25d.board import BoardModel
         s = run.s
-        bm = BoardModel(run.m.to_dict(), log=lambda *a: None, **_model_kw(s))
+        bm = BoardModel(run.m.to_dict(), log=lambda *a: None, **_model_kw(s),
+                        **(dict(ground='none') if _stack(s, run.m) == 'whole' else {}))
         dmax = s.mom_dmax * 1e-3
         planes = {k: 3 * dmax for k, gs in bm.shapes.items() if sum(g.area for g in gs) > 0.5 * bm.outline_area}
         sim = bm.simulation(dmax=dmax, dmax_layer=planes, fmin=run.fmin, fmax=run.fmax, characterize=False,
@@ -465,12 +520,15 @@ class MoM25D(Solver):
                     what=f"{n:,} unknowns, ~{solves} EM solves")
 
     def prepare(self, run):
+        said = _apertures_said(run.m, run.s)
+        if said:
+            run.log(said)
         what = mom25d_status()[1]
         if 'no compiled core' in what:                              # ~5x slower: say how to build it
             run.log(f"note: mom25d {what}")
         if run.s.preview and mom25d_status()[0]:                   # the mesh alone, for the 3D view and the plan
             s = run.s                                               # (the run's mesh options: its structured runs,
-            bm, sim = preview_mesh(run.m, run.fmin, run.fmax, dmax=s.mom_dmax, port=s.mom_port, **_mesh_kw(s))
+            bm, sim = preview_mesh(run.m, run.fmin, run.fmax, dmax=s.mom_dmax, port=s.mom_port, **_mesh_kw(s, run.m))
             save_mesh(run, sim, bm)                                 # coarsening and vias; the quads come with a run)
 
     def solve(self, run, prep):
@@ -486,7 +544,7 @@ class MoM25D(Solver):
         S, names, zref, info = solve(run.m, run.freq, dmax=s.mom_dmax, port=port,
                                      max_solves=s.mom_solves, sigma=s.sigma, rough=getattr(s, 'rough', None), finish=run_finish(run),
                                      log=run.log, hold=self._held, tiled=s.mom_tiled,
-                                     core=s.mom_core, **_mesh_kw(s), keep_at=[f * 1e9 for f in s.mom_dump or []],
+                                     core=s.mom_core, **_mesh_kw(s, run.m), keep_at=[f * 1e9 for f in s.mom_dump or []],
                                      progress=lambda k, n, f: (run.status('mom25d', dict(fraction=k / n, solves=k,
                                                                                          f_ghz=f / 1e9)), stop.check()),
                                      on_step=lambda h: run.status('mom25d', dict(afs_solves=h['solves'],

@@ -46,6 +46,9 @@ WALL_R = 0.05                       # mm: the barrel radius of an edge-wall via
 WALL_GAP = 0.1                      # mm: a wall via closer than this to a via already placed is left out
 SOLID = 0.98                        # planes='pec': a solid plane covers this much of the outline
 PAD_AREA = 2.0                      # mm2: stitching_pads='drop': a lone pad is smaller than this
+APERTURE_REACH = 3.0                # ground_apertures: the signal copper's reach, in heights over the ground
+APERTURE_EDGE = 1.0                 # mm: missing ground this near the outline is a pour's pullback, not counted
+APERTURE_AREA = 0.25                # mm2: a smaller aperture is not counted
 PART_VIA = 0.75                     # mm: a ground via this near a part's gap is under its pad (sim.PAD_MAX)
 
 
@@ -76,6 +79,31 @@ def _solid(data, lay, gnets, outline):
         return False
     u = unary_union([shape(p['polygon']) for p in ps]).buffer(0)
     return u.geom_type == 'Polygon' and not u.interiors and u.area >= SOLID * outline.area
+
+
+def ground_apertures(data, ground):
+    """Where the copper of layer `ground` is missing under the signal copper above it (every net but the ground
+    nets): a slot, a defected ground, a patterned or partial ground, which mom25d's infinite ground plane fills in.
+    Counted within APERTURE_REACH heights (the dielectric between the ground and the lowest signal copper, at least
+    1 mm) of the signal copper, and leaving out a via's antipad (within max(3 r, r + 0.75 mm) of a via through the
+    layer), a pour's pullback (within APERTURE_EDGE of the outline) and pieces under APERTURE_AREA.
+    [(polygon, mm2)], largest first; [] for a complete ground."""
+    cu_z = {c['name']: c['z'] for c in data['stack']['copper']}
+    gnets, outline = set(data.get('ground_nets') or []), shape(data['outline'])
+    z = cu_z[ground]
+    sig = [(shape(p['polygon']), cu_z[l]) for l, ps in (data.get('copper') or {}).items() if cu_z.get(l, z) > z + 1e-9
+           for p in ps if not gnets or p.get('net') not in gnets]
+    if not sig:
+        return []
+    h = max(min(zs for _, zs in sig) - z, 1.0 / APERTURE_REACH)
+    near = unary_union([g for g, _ in sig]).buffer(APERTURE_REACH * h)
+    have = unary_union([shape(p['polygon']) for p in (data.get('copper') or {}).get(ground) or []])
+    holes = [Point(v['x'], v['y']).buffer(max(3 * v['r'], v['r'] + 0.75), 16) for v in data.get('vias', [])
+             if v['z0'] - 1e-9 <= z <= v['z1'] + 1e-9]
+    miss = outline.buffer(-APERTURE_EDGE).intersection(near).difference(have).difference(unary_union(holes))
+    miss = miss.buffer(-0.01).buffer(0.01)                          # no slivers of the polygons' joins
+    parts = getattr(miss, 'geoms', [miss])
+    return sorted(((g, g.area) for g in parts if g.area >= APERTURE_AREA), key=lambda t: -t[1])
 
 
 def pec_planes(data, ground):
