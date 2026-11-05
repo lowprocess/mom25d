@@ -293,7 +293,7 @@ class Simulation:
                  solver='dense', aca_tol=1e-4, refine=1.0e-3, precision='auto', gpu='auto', verbose=True, title='',
                  mesh_only=False, tiled='auto', core='auto', quads=False, quad_tol=35.0, zone=None, dmax_out=None,
                  signal_vias='round', stitching_vias='auto', signal=None, via_barrel=True, line_basis=None,
-                 line_w_max=2.0e-3, line_step=2.0, coarsen=None, grow=0.5, structured='auto'):
+                 line_w_max=2.0e-3, line_step=2.0, coarsen=None, grow=0.5, structured='auto', gap_rings=(1/4, 1/8, 1/16)):
         # mesh_only: stop once the mesh and the unknowns (Ne, Nv) are known (a cost estimate; nothing to solve with)
         # coarsen (experimental): cells grow from dmax at the features (corners, vias, ports) to coarsen x dmax away
         # from them, by grow x the distance (geo.mesh_polygons): straight runs and plane interiors in larger cells.
@@ -424,7 +424,7 @@ class Simulation:
                             dm_mesh, dm_fine = dmax_out, min(dm, dm_fine or dm)
                     nd, tr, vids = mesh_polygons(geoms[k], dm_mesh, wr, ncross, grade, lines=seg, vias=vpts,
                                                  fine=fine, dmax_fine=dm_fine, coarsen=coarsen, grow=grow,
-                                                 structured=struct, **zkw)
+                                                 structured=struct, gap_rings=gap_rings, **zkw)
                 for (i, v), vid in zip(vias_here, vids):
                     assert vid >= 0, f"via {v.name}: not on the M{k} mesh"
                     via_vertex[(i, k)] = vid + off

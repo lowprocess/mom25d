@@ -222,10 +222,76 @@ def _rings(g):
     return [LineString(r.coords) for p in polys for r in [p.exterior, *p.interiors]]
 
 
+def gap_zones(geom, gmax, step, tol=1e-9):
+    """The copper edges facing other copper across a gap narrower than gmax: [(zone, g)], each zone the copper
+    within reach of the edges whose gap falls in one band (about 1.4x wide), g the narrowest gap of that band.
+    The gap at an edge: a ray out of the copper along its normal, from points `step` apart, to the copper it hits,
+    counted only where the edge it hits faces back (within 60 degrees) and is not the same outline within 20 gaps
+    of the ray's start: the wedge where a track's round end meets a pad or strip at a tangent is no gap
+    (rf_combline's bridged parts: gaps of 8 um, and rings that far in left its complex64 LU unable to precondition)."""
+    from shapely.geometry.polygon import orient
+    polys = [p for p in ([geom] if isinstance(geom, Polygon) else getattr(geom, 'geoms', [])) if isinstance(p, Polygon)]
+    mids, normals, segs, rings, ring_of, along = [], [], [], [], [], []
+    for p in polys:
+        p = orient(p, 1.0)                                          # exterior ccw, holes cw: copper on the left
+        for ring in [p.exterior, *p.interiors]:
+            r = np.asarray(ring.coords)[:, :2]
+            segs.append(np.stack([r[:-1], r[1:]], 1))
+            c = np.asarray(shapely.segmentize(LineString(ring.coords), step).coords)[:, :2]
+            d = np.diff(c, axis=0)
+            ln = np.hypot(d[:, 0], d[:, 1])
+            ok = ln > tol
+            ring_of.append(np.full(ok.sum(), len(rings)))
+            along.append((np.cumsum(ln) - 0.5 * ln)[ok])
+            rings.append(LineString(ring.coords))
+            mids.append(0.5 * (c[1:] + c[:-1])[ok])
+            normals.append(np.c_[d[ok, 1], -d[ok, 0]] / ln[ok, None])   # to the right: out of the copper
+    if not mids:
+        return []
+    M, N = np.vstack(mids), np.vstack(normals)
+    eps = 1e-3 * gmax
+    rays = shapely.linestrings(np.stack([M + eps * N, M + gmax * N], 1))
+    hits = shapely.intersection(rays, geom)
+    hit = ~shapely.is_empty(hits)
+    gap = np.full(len(M), np.inf)
+    pts = shapely.points(M[hit])
+    gap[hit] = shapely.distance(pts, hits[hit])
+    if hit.any():                                                   # the edge hit: its direction against the ray
+        Sg = np.vstack(segs)
+        Sg = Sg[np.hypot(*(Sg[:, 1] - Sg[:, 0]).T) > tol]
+        tree = shapely.STRtree(shapely.linestrings(Sg))
+        H = shapely.get_coordinates(shapely.get_point(shapely.shortest_line(pts, hits[hit]), 1))
+        j = tree.query_nearest(shapely.points(H), all_matches=False)[1]
+        dv = Sg[j, 1] - Sg[j, 0]
+        dv /= np.hypot(dv[:, 0], dv[:, 1])[:, None]
+        oblique = np.abs(np.einsum('ij,ij->i', dv, N[hit])) > 0.5
+        R, A = np.concatenate(ring_of)[hit], np.concatenate(along)[hit]
+        wedge = np.zeros(len(H), bool)
+        for k in np.unique(R):                                      # the hit on the ray's own outline, close along it
+            i = np.flatnonzero(R == k)
+            ring = rings[k]
+            on = shapely.distance(ring, shapely.points(H[i])) < 1e-6 * gmax + tol
+            ds = np.abs(shapely.line_locate_point(ring, shapely.points(H[i])) - A[i])
+            ds = np.minimum(ds, ring.length - ds)
+            wedge[i] = on & (ds < 20 * gap[np.flatnonzero(hit)[i]])
+        gap[np.flatnonzero(hit)[oblique | wedge]] = np.inf
+    near = np.isfinite(gap) & (gap < gmax)
+    if not near.any():
+        return []
+    band = np.round(2 * np.log2(gap[near])).astype(int)
+    out = []
+    for b in np.unique(band):
+        sel = np.flatnonzero(near)[band == b]
+        g = float(gap[sel].min())
+        zone = shapely.union_all(shapely.buffer(shapely.points(M[sel]), max(0.6 * step, g)))
+        out.append((zone, g))
+    return out
+
+
 # ---- Mesher -----------------------------------------------------------------
 def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), amax=None,
                   max_offset_frac=0.45, tol=1e-9, fine=None, dmax_fine=None, edge_zone=None, split_chains=False,
-                  coarsen=None, grow=0.5, structured=False, struct_w_max=20e-3):
+                  coarsen=None, grow=0.5, structured=False, struct_w_max=20e-3, gap_rings=None):
     """
     geom   : shapely (Multi)Polygon of one metal layer
     dmax   : max edge length along conductors / in open regions
@@ -247,6 +313,11 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
              longitudinal ones across its middle (inside the edge rings), so its cells are rectangles - one diagonal
              each, quad cells of 0 degrees. Port / cut lines on a run are stations; square vias join the grid (_run_grid),
              around other vias it is left as is
+    gap_rings : fractions of the gap (e.g. (1/4, 1/8, 1/16)): rings that far in from the copper edges facing other
+             copper across a gap g (gap_zones), where the width-graded rings are too coarse for the edge charge
+             across it (g/4 under the first ring at w_ref's grading). Coupled lines: on the 10 dB coupler (0.14 mm
+             gap, 1.28 mm strips) S31 -10.64 dB, against -10.24 to -10.29 from refined FDTD, until the edge cells
+             came down to the gap's scale; isolated traces and planes keep their cost
     Returns nodes (N,2), tris (M,3) counter-clockwise, and the list of via vertex ids.
     """
     if geom.is_empty:
@@ -256,6 +327,15 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
     for d in offsets[offsets < 0.5 * w_ref - 1e-12]:
         linework += [r if edge_zone is None else r.intersection(edge_zone)
                      for r in _rings(geom.buffer(-d, join_style='mitre', mitre_limit=2.0))]
+    if gap_rings:
+        first = offsets[0] if len(offsets) else 0.5 * w_ref
+        for zone, g in gap_zones(geom, 4 * first, dmax if dmax_fine is None else min(dmax, dmax_fine), tol):
+            if edge_zone is not None:
+                zone = zone.intersection(edge_zone)
+            for d in sorted({fr * g for fr in gap_rings}):
+                if d < 0.75 * first:
+                    linework += [r.intersection(zone)
+                                 for r in _rings(geom.buffer(-d, join_style='mitre', mitre_limit=2.0))]
     linework += [LineString([p0, p1]).intersection(geom) for p0, p1 in lines]
     fine_parts = []
     if fine is not None and dmax_fine:
