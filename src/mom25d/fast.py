@@ -92,6 +92,32 @@ def cap_blas_threads():
     n = int(env) if env else fast_cores()
     if n:
         threadpool_limits(limits=n, user_api='blas')
+    cap_core_threads()
+
+
+_omp_capped = False
+
+
+def cap_core_threads():
+    """Once: the compiled core's OpenMP (the matrix fill, the near-field correction) on the fast physical cores
+    only, as the BLAS. Its schedule splits the rows over every thread, and on an i7-13700K the E-cores and the
+    hyperthreads held the fill back: antenna_vivaldi's (21.9k unknowns) took 1.5-3.1 s a frequency on 24 threads,
+    0.87 s on 8 and 0.79 s on 16, the whole fresh solve 8.5 s against 6.9-7.1 s. MOM25D_OMP_THREADS (or
+    OMP_NUM_THREADS) sets it instead; without threadpoolctl nothing is changed."""
+    global _omp_capped
+    if _omp_capped:
+        return
+    _omp_capped = True
+    env = os.environ.get('MOM25D_OMP_THREADS')
+    if not env and os.environ.get('OMP_NUM_THREADS'):
+        return
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        return
+    n = int(env) if env else fast_cores()
+    if n:
+        threadpool_limits(limits=n, user_api='openmp')
 
 
 NEAR_CHUNK = 8_000_000      # near-field triplets per piece of the sum into the sparse matrix (_near_csr)
