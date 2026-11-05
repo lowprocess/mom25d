@@ -10,7 +10,7 @@ from mom25d.base import C0, MU0, EPS0
 from mom25d.multilayer import Layer, LayerStack
 from mom25d.via import ViaKernels
 from mom25d.sing import offplane_pairs
-from mom25d.geo import mesh_polygons, LinePort
+from mom25d.geo import mesh_polygons, gap_zones, LinePort
 from mom25d.sim import Simulation, SeriesLumped, Via, ViaPort, line_char_xs
 from mom25d.afs import aaa
 
@@ -66,6 +66,30 @@ def test_mesher_t_junction_port_lines():
     nodes, tris, _ = mesh_polygons(g, 0.3e-3, w, 4, lines=lines)
     near = (np.abs(nodes[:, 0] - 17.95e-3) < 0.02e-3) & (np.abs(nodes[:, 1] + 5.075e-3) < 1e-6)
     assert near.sum() <= 2
+
+
+def test_gap_rings_only_along_narrow_gaps():
+    """gap_zones: two strips 0.14 mm apart are one gap (0.14 mm, along the coupled length); a track's round end
+    meeting a strip at a tangent (a bridged part, rf_combline) and a lone strip are none. The rings it adds stay
+    in the gap's zone."""
+    import shapely
+    from shapely.geometry import LineString, box
+    w, g = 1.28e-3, 0.14e-3
+    pair = shapely.union_all([box(0, 0, 10e-3, w), box(0, w + g, 10e-3, 2 * w + g)])
+    z = gap_zones(pair, 0.35e-3, 0.3e-3)
+    assert len(z) == 1 and abs(z[0][1] - g) < 1e-9
+    assert z[0][0].bounds[2] - z[0][0].bounds[0] > 9e-3
+    track = LineString([(0, 0), (0, 3e-3)]).buffer(0.45e-3, quad_segs=4)      # its round end at y = -0.45 mm
+    bridged = shapely.union_all([track, box(-0.45e-3, -0.65e-3, 0.45e-3, -0.25e-3)])
+    assert gap_zones(bridged, 0.35e-3, 0.3e-3) == []
+    assert gap_zones(box(0, 0, 10e-3, w), 0.35e-3, 0.3e-3) == []
+    n0 = len(mesh_polygons(pair, 0.3e-3, w)[0])
+    nodes = mesh_polygons(pair, 0.3e-3, w, gap_rings=(1 / 4, 1 / 8, 1 / 16))[0]
+    extra = len(nodes) - n0
+    assert 150 < extra < 300                                                 # 3 rings on 2 edges, ~34 points each
+    y = nodes[:, 1]
+    for d in (g / 4, g / 8, g / 16):                                          # each ring, on both facing edges
+        assert np.sum(np.abs(y - (w - d)) < 1e-9) > 20 and np.sum(np.abs(y - (w + g + d)) < 1e-9) > 20
 
 
 def test_series_resistor_matches_circuit_theory():
