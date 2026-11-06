@@ -48,8 +48,9 @@ def filament_mutual(z0a, z1a, z0b, z1b, s):
 class Result:
     f: np.ndarray
     i: np.ndarray                   # (nf, nbranch) branch currents (A): edges (total current across), vias, parts
-    z: dict                         # {source: Z (nf,) complex}: the copper loop each source drives
+    z: dict                         # {source: Z (nf,) complex}: the loop each source drives, its parts included
     names: list
+    zc: dict = None                 # {source: Z (nf,)}: the copper of that loop alone (the parts' own Z left out)
 
 
 class MQS:
@@ -235,6 +236,9 @@ class MQS:
         col = 0
         for k in np.flatnonzero(~tree):
             a, b = ends[k]
+            if find(a) != find(b):                                # its ends on copper joined only through it
+                dead.append(k)
+                continue
             # the loop: branch k from a to b, then the tree from b back to a
             path = []
             u, v = b, a
@@ -244,13 +248,8 @@ class MQS:
             while depth[v] > depth[u]:
                 pv.append((upb[v], ups[v])); v = up[v]
             while u != v:
-                if u < 0 or v < 0:
-                    break
                 pu.append((upb[u], -ups[u])); u = up[u]
                 pv.append((upb[v], ups[v])); v = up[v]
-            if u != v or (find(a) != find(b) and not is_src[k]):
-                dead.append(k)                                    # a source between two islands: no loop
-                continue
             path = pu + pv[::-1]
             rows.append(k); cols.append(col); vals.append(1.0)
             for kb, sg in path:
@@ -259,8 +258,11 @@ class MQS:
                 src_cols[k] = col
             col += 1
         C = coo_matrix((vals, (rows, cols)), shape=(nb, col)).tocsc()
-        if dead:
-            raise ValueError("a source's terminals are on copper not joined but through it: no loop to drive")
+        bad = [k for k in dead if is_src[k]]
+        if bad:
+            names = [self.parts[k - len(self.br)]['name'] for k in bad]
+            raise ValueError(f"source(s) {', '.join(names)}: their terminals are on copper joined only through them "
+                             f"(an island: a pad with no via or path to the rest): no loop to drive")
         return C, src_cols, is_src
 
     def _assemble(self):
@@ -292,6 +294,8 @@ class MQS:
         free = [c for c in range(Cd.shape[1]) if c not in src.values()]
         I = np.zeros((len(f), nb), complex)
         Z = {n: np.zeros(len(f), complex) for n in src}
+        Zc = {n: np.zeros(len(f), complex) for n in src}
+        cu = np.r_[np.ones(ne + nv), np.zeros(nb - ne - nv)]           # the copper's branches
         for i, fi in enumerate(f):
             w = 2 * np.pi * fi
             zp = np.zeros(nb, complex)                           # the parts' own impedances
@@ -311,28 +315,62 @@ class MQS:
                 k = next(kk for kk, cc in m['src'].items() if cc == c)
                 # Kirchhoff's voltage law round its loop: the drops in the rest of it are the copper loop's Z x I
                 Z[n][i] = (Cd[:, c] @ v - Cd[k, c] * v[k]) / x[c]
-        return Result(f, I, Z, [p['name'] for p in self.parts])
+                Zc[n][i] = (Cd[:, c] * cu) @ v / x[c]
+        return Result(f, I, Z, [p['name'] for p in self.parts], Zc)
 
-    # ---- the field ----
-    def h_field(self, res, fi, pts):
-        """H (n, 3) complex, A/m, at points (n, 3), m, at the frequency index fi: the sheets' currents (Biot-Savart),
-        the vias' and the parts' filaments."""
+    def moment(self, res, fi):
+        """The magnetic dipole moment (A m^2, (3,) complex) of the currents at frequency index fi: m = 1/2 int r x J
+        dV over the sheets, the vias and the parts. It sets the field far from the loop (|H| ~ |m| / 2 pi r^3 on its
+        axis): the layout's figure of merit for what it radiates at a distance, as the loop's L is for its noise."""
+        from .base import _BAR6, _W6
         i = res.i[fi]
         r = self.rwg
         a, b = rwg_currents(r, i[:self.ne] / r.l)
+        V = self.nodes[self.tris]
+        area = r.area
+        Q = np.einsum('qk,tkc->tqc', _BAR6, V)
+        J = a[:, None, None] * Q + b[:, None, :]
+        w = area[:, None] * _W6[None]
+        z = self.z_of[:, None]
+        # r x J with J horizontal: (y Jz - z Jy, z Jx - x Jz, x Jy - y Jx), Jz = 0
+        mx = (-(z * J[..., 1]) * w).sum()
+        my = ((z * J[..., 0]) * w).sum()
+        mz = ((Q[..., 0] * J[..., 1] - Q[..., 1] * J[..., 0]) * w).sum()
+        m = 0.5 * np.array([mx, my, mz])
+        segs = []
+        for (x, y, rr, z0, z1), ii in zip(self.vseg, i[self.ne:self.ne + self.nv]):
+            segs.append((np.array([x, y, z0]), np.array([x, y, z1]), ii))
+        for k, p in enumerate(self.parts):
+            ca, cb = self._term_centre(p['a']), self._term_centre(p['b'])
+            hgt = np.array([0, 0, p['part_h'] * 1e-3])
+            segs.append((ca + hgt, cb + hgt, i[self.ne + self.nv + k]))
+        for p0, p1, ii in segs:                                   # a filament: 1/2 I (r0 x r1)
+            m = m + 0.5 * ii * np.cross(p0, p1)
+        return m
+
+    # ---- the field ----
+    def h_field(self, res, fi, pts):
+        """H (n, 3) complex, A/m, at points (n, 3), m, at frequency index fi (or a list of them: H (n, 3, k), the
+        geometry made once for all): the sheets' currents (Biot-Savart), the vias' and the parts' filaments."""
+        multi = np.ndim(fi) > 0
+        fis = list(np.atleast_1d(fi))
+        i = res.i[fis].T                                        # (nbranch, k)
+        r = self.rwg
+        a, b = rwg_currents(r, i[:self.ne] / r.l[:, None])
         sheets = [(self.nodes, self.tris[idx], a[idx], b[idx], float(self.z_of[idx[0]])) for idx in self.layer_tris.values()]
         H = h_sheets(sheets, pts)
         if self.nv:
             v = np.array(self.vseg)
-            H += h_segments(np.c_[v[:, 0], v[:, 1], v[:, 3]], np.c_[v[:, 0], v[:, 1], v[:, 4]], i[self.ne:self.ne + self.nv], pts)
+            H = H + h_segments(np.c_[v[:, 0], v[:, 1], v[:, 3]], np.c_[v[:, 0], v[:, 1], v[:, 4]],
+                               i[self.ne:self.ne + self.nv], pts)
         p0, p1, ip = [], [], []
         for k, p in enumerate(self.parts):
             ca, cb = self._term_centre(p['a']), self._term_centre(p['b'])
             p0.append(ca + np.array([0, 0, p['part_h'] * 1e-3])); p1.append(cb + np.array([0, 0, p['part_h'] * 1e-3]))
             ip.append(i[self.ne + self.nv + k])
         if p0:
-            H += h_segments(np.array(p0), np.array(p1), np.array(ip), pts)
-        return H
+            H = H + h_segments(np.array(p0), np.array(p1), np.array(ip), pts)
+        return H if multi else H[:, :, 0]
 
     def _term_centre(self, name):
         ts = self.term_tris[name]
