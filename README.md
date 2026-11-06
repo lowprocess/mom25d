@@ -44,6 +44,11 @@ CFLAGS="-O2 -ffp-contract=off" pip install --no-cache-dir \
 first only where it runs on CUDA). Consumer AMD cards outside ROCm's support list may need
 `HSA_OVERRIDE_GFX_VERSION=11.0.0` (RDNA3) or `10.3.0` (RDNA2) for CuPy; Vulkan needs only the GPU's driver.
 
+The compiled core's threads (the matrix fill, OpenMP) and the LU's BLAS run on the fastest physical cores only: a
+hybrid CPU's E-cores and hyperthreads held them back (an i7-13700K's fill took 1.5-3.1 s a frequency on 24 threads,
+0.87 s on 8). `MOM25D_OMP_THREADS` and `MOM25D_BLAS_THREADS` (or `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`) set
+them instead.
+
 ## Use
 
 ```python
