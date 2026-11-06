@@ -87,9 +87,10 @@ def test_current_dumps(boards, run_cli, tmp_path, monkeypatch):
     for f in (2, 5):
         for ext in ('png', 'gif'):
             assert (out / f"lowpass_mom25d_P1_dump_J_F_Cu_fd_{f}GHz.{ext}").exists()
-    E, src = F.find_dumps(str(out))                                  # sorted by name: E@top+1mm, J@F.Cu
+    E, Hn, src = F.find_dumps(str(out))                          # sorted by name: E@top+1mm, H@top+1mm, J@F.Cu
     assert src.solver == 'mom25d' and src.freqs == [2e9, 5e9] and 'A/m' in src.unit
     assert E.field == 'E' and 'V/m' in E.unit and np.abs(E.load(0)[1]).max() > 0
+    assert Hn.field == 'H' and 'A/m' in Hn.unit and np.abs(Hn.load(0)[1]).max() > 0     # --mom-near: H as well
     assert (out / 'lowpass_mom25d_P1_dump_E_topp1mm_fd_5GHz.gif').exists()
     mesh, J = src.load(0)
     assert np.abs(J).max() > 0 and np.all(J[..., 2] == 0)                # in-plane currents only
