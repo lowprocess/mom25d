@@ -418,9 +418,13 @@ class MoM25D(Solver):
                "with --dump-animate one period of Re(J e^jphi), the standing waves; the ports driven: --dump-port "
                "(default: the first)", list, conv=floatlist, name='dump', gui='Current dumps (GHz, comma-separated)',
                group=G, cli=dict(metavar='GHz,...')),
-        Option('mom_near', [], "with --mom-dump: also the E field on planes this far (mm) above the top of the board, "
-               "from the currents (e.g. 0.5,2); at least about --mom-dmax above the copper to resolve it", list,
+        Option('mom_near', [], "with --mom-dump: also the E and H fields on planes this far (mm) above the top of the "
+               "board, from the currents (e.g. 0.5,2); at least about --mom-dmax above the copper to resolve it", list,
                conv=floatlist, name='near', gui='Near-field planes (mm above the top)', group=G, cli=dict(metavar='MM,...')),
+        Option('mom_near_volume', [], "with --mom-dump: also E and H in a volume above the board, from H0 to H1 mm above "
+               "its top in N planes (H0,H1[,N]; N default 12): the GUI's 3D view", list, conv=floatlist,
+               name='near_volume', gui='Near-field volume (mm above the top: from,to[,planes])', group=G,
+               cli=dict(metavar='H0,H1[,N]')),
     ]
 
     def validate(self, s):
@@ -745,7 +749,7 @@ class MoM25D(Solver):
         from kicad2ems.api.solver import DumpSource, save_fd_outputs
         tag = self.name
         for port, d in current_dumps(run, held, [f * 1e9 for f in run.s.mom_dump], run.s.dump_port, run.s.mom_near,
-                                     tag=tag, **kw):
+                                     tag=tag, volume=getattr(run.s, 'mom_near_volume', None), **kw):
             for name in d['names']:
                 src = DumpSource(d['dir'], name, 'FD')
                 ptag = port.replace('+', 'p').replace('-', 'n')
@@ -764,15 +768,16 @@ def _grid(nodes, tris, step, nmax=600):
 
 
 def current_dumps(run, res, freqs, ports=None, near=(), tag='mom25d', currents=None, extra=None,
-                  unit='1 V gap source'):
+                  unit='1 V gap source', volume=None):
     """mom25d's surface current density J (A/m) on each meshed layer at `freqs` (Hz), its RWG basis functions
     sampled onto a grid (0 off the copper), and with `near` (mm) the E field on planes that far above the top
-    of the stack (mom25d.farfield.near_field), for the ports driven (names, default the first) by mom25d's 1 V
+    of the stack, with H too, and with `volume` (h0, h1[, n] mm) E and H in that box above the top (mom25d.farfield.
+    near_fields), for the ports driven (names, default the first) by mom25d's 1 V
     gap sources. Writes dump_*_fd.npz and dump_info.json per port under <out>/mom25d/exc_<port>/; returns
     [(port, dict(dir, names))]. tag: the solver (the directory under <out>). currents(f) -> (N x len(sim.ports)) the
     RWG currents of each port driven (default: sim.currents of the excitations); extra(k, f_index, column, gx, gy, Jx,
     Jy) -> (Jx, Jy): layer k's grid with what the solver adds (mixed: the stretches put back as lines)."""
-    from mom25d.farfield import current_on_grid, near_field
+    from mom25d.farfield import current_on_grid, current_deposit, near_fields
     from kicad2ems.api.solver import Dump, write_info
     from kicad2ems.api.solver import write_npz
     sim, model = res.sim, res.model
@@ -807,24 +812,45 @@ def current_dumps(run, res, freqs, ports=None, near=(), tag='mom25d', currents=N
             write_npz(os.path.join(d, dump.name + '.npz'), dict(x=gx, y=gy, z=np.array([z])), freqs, data)
             dumps.append(dump)
             units[dump.name] = f'A/m, {unit}'
-        for h in near or ():
+        allt = np.concatenate([sim.tri_idx[k] for k in layers])
+
+        def grid(h, most=1023):
             # one grid over all the copper, padded so the FFT's wrap-around stays far from the board
-            allt = np.concatenate([sim.tri_idx[k] for k in layers])
             pad = max(5.0, 3 * h)
             lo = nodes[sim.rwg.tris[allt]].reshape(-1, 2).min(0) - pad
             hi = nodes[sim.rwg.tris[allt]].reshape(-1, 2).max(0) + pad
-            st_ = max(step, (hi - lo).max() / 1023, h / 4)              # near_field pads to 2x for its FFT
-            gx, gy = np.arange(lo[0], hi[0], st_), np.arange(lo[1], hi[1], st_)
-            data = np.zeros((len(freqs), len(gx), len(gy), 1, 3), complex)
+            st_ = max(step, (hi - lo).max() / most, h / 4)               # near_fields pads to 2x for its FFT
+            return np.arange(lo[0], hi[0], st_), np.arange(lo[1], hi[1], st_)
+
+        def fields(gx, gy, hs):
+            E = np.zeros((len(freqs), len(gx), len(gy), len(hs), 3), complex)
+            H = np.zeros_like(E)
             for i, (f, I) in enumerate(zip(freqs, I_f)):
-                LJ = {k: current_on_grid(sim, I[:, j], gx * 1e-3, gy * 1e-3, k)[:2] for k in layers}
-                data[i, :, :, 0, :] = near_field(sim, LJ, gx * 1e-3, gy * 1e-3, f, h * 1e-3)
-            z = ztop + h
-            label = f"top+{h:g}mm"
-            dump = Dump(f"E@{label}", 'E', (gx[0], gy[0], z), (gx[-1], gy[-1], z), list(freqs), 2, label)
-            write_npz(os.path.join(d, dump.name + '.npz'), dict(x=gx, y=gy, z=np.array([z])), freqs, data)
+                stop.check()
+                LJ = {k: current_deposit(sim, I[:, j], gx * 1e-3, gy * 1e-3, k) for k in layers}
+                E[i], H[i] = near_fields(sim, LJ, gx * 1e-3, gy * 1e-3, f, [h * 1e-3 for h in hs])
+            return E, H
+
+        def add(field, label, gx, gy, zs, data, normal, u):
+            dump = Dump(f"{field}@{label}", field, (gx[0], gy[0], zs[0]), (gx[-1], gy[-1], zs[-1]), list(freqs),
+                        normal, label)
+            write_npz(os.path.join(d, dump.name + '.npz'), dict(x=gx, y=gy, z=np.asarray(zs, float)), freqs, data)
             dumps.append(dump)
-            units[dump.name] = f'V/m, {unit}'
+            units[dump.name] = f'{u}, {unit}'
+        for h in near or ():
+            gx, gy = grid(h)
+            E, H = fields(gx, gy, [h])
+            label = f"top+{h:g}mm"
+            add('E', label, gx, gy, [ztop + h], E, 2, 'V/m')
+            add('H', label, gx, gy, [ztop + h], H, 2, 'A/m')
+        if volume:
+            h0, h1 = float(volume[0]), float(volume[1])
+            n = int(volume[2]) if len(volume) > 2 else 12
+            hs = list(np.linspace(h0, h1, max(n, 2)))
+            gx, gy = grid(h0, most=160)                                  # a volume: about 160 x 160 x n points
+            E, H = fields(gx, gy, hs)
+            add('E', 'volume', gx, gy, [ztop + h for h in hs], E, None, 'V/m')
+            add('H', 'volume', gx, gy, [ztop + h for h in hs], H, None, 'A/m')
         write_info(d, dumps, run.m)
         info = os.path.join(d, 'dump_info.json')                            # J: surface current, A/m
         with open(info, encoding='utf-8') as fh:
