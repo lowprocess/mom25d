@@ -802,12 +802,16 @@ class FastOperator:
             Y, ok, rel = self._refine(lambda V: dsc[:, None] * down(self.matvec_exact(up(dsc[:, None] * V), Sx)), B,
                                       gpu.solve if gpu is not None else (lambda R: _lu_solve(lu, R)), MIXED_MAX_ITER, 1)
             self._t_iter = (time.time() - t) / max(1, max(self.iters, default=1))
-        if gpu is not None:
-            gpu.release()
         sim.log.note(f"mixed precision: GMRES iterations per port {self.iters}")
+        if ok and sim.reuse != 'off':
+            # kept for the next frequencies (_solve_reused): the CPU's, or the GPU's on the GPU, which the next fresh
+            # solve frees first (_keep_max 0). The GPU's was released here: antenna_slot (28.6k unknowns, the host
+            # short of the hybrid's double Z) made 15 fresh LUs where the hybrid, reusing, made 1
+            self._kept = [(f, _Kept(lu) if gpu is None else _GPUKept(gpu, gpu.vram_needed(len(dsc))), dsc,
+                           time.time() - t_fresh)]
+        elif gpu is not None:
+            gpu.release()
         if ok:
-            if gpu is None and sim.reuse != 'off':
-                self._kept = [(f, _Kept(lu), dsc, time.time() - t_fresh)]
             return up(dsc[:, None] * Y)
         # the single-precision LU can be too weak a preconditioner (fine meshes at low frequency: the MPIE matrix is
         # ill-conditioned); an unconverged refinement returns garbage: this solve, and those up to MIXED_RETRY x f,
