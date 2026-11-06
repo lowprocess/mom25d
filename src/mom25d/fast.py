@@ -695,7 +695,8 @@ class FastOperator:
         host = max(16.0 * (N * N + Nq * Nq), 24.0 * Nq * Nq) if quads else 24.0 * N * N
         on_gpu = sum(getattr(k[1], 'device_bytes', 0) for k in self._kept)        # LUs kept there (theirs to free)
         gpu_fits = gpu is not None and gpu.fits(Nq, on_gpu)
-        hybrid = gpu_fits and host + 0.9e9 <= 0.8 * available_memory()
+        from .sim import HYBRID_MAX_N
+        hybrid = gpu_fits and host + 0.9e9 <= 0.8 * available_memory() and Nq <= HYBRID_MAX_N
         if hybrid and f <= HYBRID_RETRY * self._hybrid_failed:
             # the complex64 LU failed to precondition at or above this frequency: double up to HYBRID_RETRY x
             # the highest failure, the GPU again above it (it fails at the low end of a band, where the MPIE

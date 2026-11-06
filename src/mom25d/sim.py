@@ -62,6 +62,12 @@ MIXED_MIN_N = 3500       # above this, 'auto' precision is mixed whenever the co
 # from 1.4k to 3.4k unknowns against double on 8 P-cores (RX 7800 XT), but its start-up costs ~1.5 s a run - the
 # break-even of a 15-20 solve sweep (rf_gcpw, 3.4k: 7.0 s against 8.7 s; rf_stubnotch coarsened, 1.5k: 4.5 against 3.4)
 GPU_MIN_N = int(os.environ.get('MOM25D_GPU_MIN_N', 3000))
+# the hybrid (the double Z on the host for the refinement's products, several complex64 LUs kept on the GPU) up to
+# this many unknowns; past it the GPU path with the complex64 Z (the refinement matrix-free, one LU kept): the double
+# Z's memory traffic (24 N^2 bytes, 20 GB at 28.7k) outgrew what its products save. RX 7800 XT, i7-13700K: rf_siw
+# (28.7k) 456 s hybrid against 296 s, antenna_slot (28.6k) 165 s against 139 s; antenna_vivaldi (21.9k) 148 s
+# hybrid against 171 s
+HYBRID_MAX_N = int(os.environ.get('MOM25D_HYBRID_MAX_N', 25000))
 
 
 def gpu_info(b, n):
@@ -99,7 +105,7 @@ def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver
             else 'double'
     if precision == 'mixed' and not has_core:
         precision = 'double'
-    hybrid = precision == 'mixed' and gpu_fits and 24.0 * n * n + 0.9e9 <= 0.8 * avail
+    hybrid = precision == 'mixed' and gpu_fits and 24.0 * n * n + 0.9e9 <= 0.8 * avail and (n_lu or n) <= HYBRID_MAX_N
     if precision == 'double':
         path, host, dev = 'double', 18.0 * n * n + 0.9e9, 0.0
     elif can_tile and (tiled == 'on' or not hybrid):
