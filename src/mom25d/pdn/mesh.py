@@ -49,13 +49,16 @@ def stack_z(board):
     return {c['name']: (c['z'], c['t']) for c in board['stack']['copper']}
 
 
-def mesh_sheet(geom, points=(), dmax=1.0, w_ref=None):
+def mesh_sheet(geom, points=(), dmax=1.0, w_ref=None, coarsen=None):
     """Mesh one piece of copper (mm): (nodes mm, tris, [vertex ids of each point: centre + ring]) for the points
-    (x, y, r) inside it, None where one is not."""
-    inside = [i for i, (x, y, r) in enumerate(points) if geom.buffer(1e-6).contains(shapely.Point(x, y))]
+    (x, y, r) inside it, None where one is not. coarsen: mesh_polygons' (cells grow away from the features to coarsen x
+    dmax)."""
+    xy = np.asarray([(x, y) for x, y, _ in points], float).reshape(-1, 2)
+    hit = shapely.contains_xy(geom.buffer(1e-6), xy[:, 0], xy[:, 1]) if len(xy) else np.zeros(0, bool)
+    inside = list(np.flatnonzero(hit))                     # the copper buffered once: not per point
     vias = [(points[i][0] * 1e-3, points[i][1] * 1e-3, points[i][2] * 1e-3) for i in inside]
     g = scale(geom, 1e-3, 1e-3, origin=(0, 0))
-    nodes, tris, vid = mesh_polygons(g, dmax * 1e-3, (w_ref or dmax) * 1e-3, ncross=1, vias=vias)
+    nodes, tris, vid = mesh_polygons(g, dmax * 1e-3, (w_ref or dmax) * 1e-3, ncross=1, vias=vias, coarsen=coarsen)
     nodes = nodes * 1e3
     rings = [None] * len(points)
     for i, v in zip(inside, vid):
@@ -67,7 +70,7 @@ def mesh_sheet(geom, points=(), dmax=1.0, w_ref=None):
     return nodes, tris, rings
 
 
-def net_sheets(board, net, points=(), dmax=1.0, layers=None):
+def net_sheets(board, net, points=(), dmax=1.0, layers=None, coarsen=None):
     """{layer: Sheet} of the copper of `net` on each copper layer (or `layers`), every point (x, y, r) of `points`
     that lies on a layer's copper made a vertex with its ring."""
     zt = stack_z(board)
@@ -76,7 +79,7 @@ def net_sheets(board, net, points=(), dmax=1.0, layers=None):
         g = copper_of(board, net, lay)
         if g is None:
             continue
-        nodes, tris, rings = mesh_sheet(g, points, dmax)
+        nodes, tris, rings = mesh_sheet(g, points, dmax, coarsen=coarsen)
         key = [i for i, r in enumerate(rings) if r is not None]
         out[lay] = Sheet(lay, zt[lay][0], zt[lay][1], g, nodes, tris, [points[i] for i in key],
                          [rings[i] for i in key], key)

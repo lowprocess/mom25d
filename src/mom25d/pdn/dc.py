@@ -49,14 +49,14 @@ def _barrel_g(r_mm, dz_mm, plating_mm, sigma):
     return sigma * area / (dz_mm * 1e-3)
 
 
-def solve(board, net, source, loads, dmax=1.0, sigma=SIGMA_CU, plating=0.025, ground=False, log=print):
+def solve(board, net, source, loads, dmax=1.0, sigma=SIGMA_CU, plating=0.025, ground=False, log=print, coarsen=None):
     """The DC solution of `net` (see the module docstring). source: dict(x, y, r, layer, V); loads: [dict(name, x, y,
     r, layer, I)], amps drawn (ground=True: returned, the source at 0 V)."""
     vias = [v for v in board['vias'] if v.get('net') == net]
     pts = [(source['x'], source['y'], source['r'])] + [(l['x'], l['y'], l['r']) for l in loads] + \
           [(v['x'], v['y'], v['r']) for v in vias]
     nl = 1 + len(loads)
-    sheets = net_sheets(board, net, pts, dmax=dmax)
+    sheets = net_sheets(board, net, pts, dmax=dmax, coarsen=coarsen)
     if not sheets:
         raise ValueError(f"no copper of net {net!r}")
     off = 0
