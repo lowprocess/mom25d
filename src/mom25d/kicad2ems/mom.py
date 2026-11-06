@@ -28,6 +28,18 @@ LU_GPU_N3, LU_TILED_N3 = 1.5e-12, 2.5e-12
 ANT_FREQS = 11                  # antenna mode: frequencies of the far field over the band (+ the pattern one)
 
 
+def _far_field_grid(run):
+    """Antenna mode: the far field's frequencies over the band (Hz; the pattern's is added after the sweep)."""
+    return np.linspace(run.fmin, run.fmax, ANT_FREQS)
+
+
+def _far_field_seeds(run):
+    """The frequencies the sweep solves among its own samples and keeps the currents of, so the far field needs no
+    solves of its own (the pattern frequency's aside, when it is the resonance): ANT_FREQS solves fewer on an
+    antenna, antenna_vivaldi's 37 -> 26."""
+    return list(_far_field_grid(run)) if run.antenna else []
+
+
 def mom25d_status():
     """(usable, one-line description) of mom25d for --check and the solver checks before a run: where it
     comes from, its version and whether its compiled core is built (the NumPy fallback is ~5x slower)."""
@@ -229,11 +241,11 @@ HOW = {'dense': 'dense, NumPy', 'double': 'direct LU in double on the CPU',
 
 def memory_plan_for(n, tiled='auto'):
     """mom25d.sim.memory_plan of n unknowns on this machine: the memory available now, the GPU mom25d would use."""
-    from mom25d.sim import memory_plan
+    from mom25d.sim import memory_plan, gpu_info
     from mom25d.fast import _core
     from mom25d.gpu import get_backend
     g = get_backend('auto') if _core is not None else None
-    return memory_plan(n, _core is not None, None, (g.name, g.mem_free()) if g is not None else None, tiled=tiled)
+    return memory_plan(n, _core is not None, None, gpu_info(g, n) if g is not None else None, tiled=tiled)
 
 
 def _model_kw(s):
@@ -573,7 +585,8 @@ class MoM25D(Solver):
         S, names, zref, info = solve(run.m, run.freq, dmax=s.mom_dmax, port=port,
                                      max_solves=s.mom_solves, sigma=s.sigma, rough=getattr(s, 'rough', None), finish=run_finish(run),
                                      log=run.log, hold=self._held, tiled=s.mom_tiled,
-                                     core=s.mom_core, **_mesh_kw(s, run.m), keep_at=[f * 1e9 for f in s.mom_dump or []],
+                                     core=s.mom_core, **_mesh_kw(s, run.m),
+                                     keep_at=[f * 1e9 for f in s.mom_dump or []] + _far_field_seeds(run),
                                      progress=lambda k, n, f: (run.status('mom25d', dict(fraction=k / n, solves=k,
                                                                                          f_ghz=f / 1e9)), stop.check()),
                                      on_step=lambda h: run.status('mom25d', dict(afs_solves=h['solves'],
@@ -632,7 +645,7 @@ class MoM25D(Solver):
             Sa = result.S @ a
             s11 = Sa[:, k] / a[k]
             match = match_summary(run.freq, s11, m.ports[k].z0)
-        ffr = np.unique(np.concatenate([np.linspace(run.fmin, run.fmax, ANT_FREQS), [f_pat]]))
+        ffr = np.unique(np.concatenate([_far_field_grid(run), [f_pat]]))
         th, ph = np.arange(0, 181, 5.0), np.arange(0, 361, 5.0)
         up = th <= 90 if sim.st.bottom == 'pec' else np.ones(len(th), bool)   # the whole stack radiates below too
         what = ', '.join(phased.format_drive(a, names)) if len(driven) > 1 else names[k]
@@ -640,9 +653,12 @@ class MoM25D(Solver):
                 f"frequencies")
         Ys, Eth, Eph = [], [], []
         ip = int(np.argmin(np.abs(ffr - f_pat)))
+        kept = getattr(sim, 'kept', {})
         for i, f in enumerate(ffr):
             stop.check()
-            I = sim.currents(f, sim.excitation())
+            I = kept.get(float(f))                                  # solved in the sweep (_far_field_seeds)
+            if I is None:
+                I = sim.currents(f, sim.excitation())
             Ys.append(np.array([np.atleast_1d(sim.port_current(I, j)) for j in range(n)]))
             ee = [far_field(sim, I[:, c], f, th[up], ph) for c in range(n)]
             Eth.append([e[0] for e in ee])

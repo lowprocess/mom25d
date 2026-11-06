@@ -267,14 +267,45 @@ REUSE_KEEP = 4           # complex64 LUs the CPU keeps at most, memory allowing 
 
 
 
+def _row_blocks(Z, fn):
+    """fn(a, b) over blocks of Z's rows (about 32 MB each) on the fast cores: NumPy's in-place arithmetic and copies
+    release the GIL, and one block's two passes stay in cache. A pass over a dense Z is bound by memory bandwidth,
+    which one thread does not fill: at 16k unknowns (4 GB) the equilibration took 0.48 s on one, 0.27 s on 8."""
+    n = Z.shape[0]
+    rows = max(1, (1 << 25) // max(1, Z.shape[1] * Z.itemsize))
+    blocks = [(a, min(a + rows, n)) for a in range(0, n, rows)]
+    nt = min(len(blocks), fast_cores() or 4)
+    if nt <= 1:
+        for a, b in blocks:
+            fn(a, b)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(nt) as ex:
+        list(ex.map(lambda ab: fn(*ab), blocks))
+
+
 def _equilibrate(Z, dsc=None):
     """Symmetric diagonal equilibration of Z in place (via fan-charge rows dwarf strip rows, most at low f), by
     dsc or 1 / sqrt|Z_ii|; returns the scales."""
     if dsc is None:
         dsc = 1.0 / np.sqrt(np.abs(np.diagonal(Z)).astype(float) + 1e-300)
-    Z *= dsc[:, None].astype(Z.dtype)
-    Z *= dsc[None, :].astype(Z.dtype)
+    dr = dsc.astype(Z.real.dtype)
+
+    def scale(a, b):
+        Z[a:b] *= dr[a:b, None]
+        Z[a:b] *= dr[None, :]
+    _row_blocks(Z, scale)
     return dsc
+
+
+def _c64(Z):
+    """Z's complex64 copy (the single-precision LU's input), row blocks in parallel: 0.34 s -> 0.14 s at 16k."""
+    out = np.empty(Z.shape, np.complex64)
+
+    def copy(a, b):
+        out[a:b] = Z[a:b]
+    _row_blocks(Z, copy)
+    return out
 
 
 def _lu(Z):
@@ -663,7 +694,7 @@ class FastOperator:
         gpu = self._backend() if precision == 'mixed' else None
         host = max(16.0 * (N * N + Nq * Nq), 24.0 * Nq * Nq) if quads else 24.0 * N * N
         on_gpu = sum(getattr(k[1], 'device_bytes', 0) for k in self._kept)        # LUs kept there (theirs to free)
-        gpu_fits = gpu is not None and gpu.vram_needed(Nq) <= 0.9 * (gpu.mem_free() + on_gpu)
+        gpu_fits = gpu is not None and gpu.fits(Nq, on_gpu)
         hybrid = gpu_fits and host + 0.9e9 <= 0.8 * available_memory()
         if hybrid and f <= HYBRID_RETRY * self._hybrid_failed:
             # the complex64 LU failed to precondition at or above this frequency: double up to HYBRID_RETRY x
@@ -682,6 +713,13 @@ class FastOperator:
             X = self._solve_tiled(f, E, Sx, gpu, self.tiled_block)
             if X is not None:
                 return X
+        if precision == 'mixed' and gpu_fits and not quads and hasattr(gpu, 'factor_rows') and (sim.stream == 'on' or (
+                sim.stream != 'off' and not hybrid and 10.0 * N * N + 0.9e9 > 0.8 * available_memory())):
+            # the GPU holds the complex64 LU, the host not even a complex64 Z: Z filled in row blocks straight into
+            # the GPU's factor, the refinement matrix-free. Slower than a host Z (antenna_cp_patch, 40.8k unknowns:
+            # 46 s a solve against 30 s; the row blocks cannot use Z's symmetry as the dense fill does), but in a
+            # tenth of the host memory (5.8 GB against 18.8 GB), where the host's paths would fall back to BLR
+            return self._solve_streamed(f, E, Sx, gpu)
         # mixed precision on the CPU, with room for a double Z, its complex64 LU and one more: Z in double, solved
         # with the kept LU nearest in frequency where that preconditions it (_solve_kept), the refinement's products
         # dense; otherwise one LU kept, the products matrix-free (_solve_reused)
@@ -844,7 +882,7 @@ class FastOperator:
                 gpu.release()
             with sim.log.timer('LU factor (GPU)', f"N={n}, {gpu.name}"):
                 try:
-                    gpu.factor(Z.astype(np.complex64))
+                    gpu.factor(_c64(Z))
                     if bad:
                         lu = gpu.download()
                     else:
@@ -855,7 +893,7 @@ class FastOperator:
                     gpu.release()
         if lu is None and held is None:
             with sim.log.timer('LU factor', f"N={len(dsc)}, complex64"):
-                lu = _lu(Z.astype(np.complex64))
+                lu = _lu(_c64(Z))
         with sim.log.timer('refinement (GMRES, dense double)'):
             t = time.time()
             Y, ok, rel = self._refine(A, B, held if held is not None else (lambda R: _lu_solve(lu, R)), MIXED_MAX_ITER, 1)
@@ -922,6 +960,112 @@ class FastOperator:
                      f"(residual {rel:.1e}) - a new one")
         self._kept, self._ready = [], f                     # the fresh solve keeps this near field and these vias
         return None
+
+    STREAM_ROWS = 2048       # rows of Z a block of the streamed fill (_solve_streamed): 0.7 GB at 40k unknowns
+
+    def _streamed_rows(self, Sx):
+        """(rows(r0, r1) -> Z[r0:r1] (complex128, N wide), the diagonal of Z): the far field from the core, the exact
+        near correction (dZ_exact), the via rows and columns (B, C) and the extra blocks (Sx), as solve_direct's
+        dense Z has them."""
+        sim, core = self.sim, self.core
+        Ne, Nv = sim.Ne, sim.Nv
+        N = Ne + Nv
+        allc = np.arange(Ne, dtype=np.int32)
+        dZ, Sxr = self.dZ_exact.tocsr(), Sx.tocsr()
+        Bt = self.B.T if Nv else None
+
+        def rows(r0, r1):
+            out = np.zeros((r1 - r0, N), complex)
+            e1 = min(r1, Ne)
+            if r0 < e1:
+                out[:e1 - r0, :Ne] = core.far_block(np.arange(r0, e1, dtype=np.int32), allc, self.g, self.tb, self.w)
+                c = dZ[r0:e1].tocoo()                       # one entry per (row, col): a scatter, not a dense add
+                out[c.row, c.col] += c.data
+                if Nv:
+                    out[:e1 - r0, Ne:] = self.B[r0:e1]
+            if r1 > Ne:
+                v0, off = max(r0, Ne) - Ne, max(r0, Ne) - r0
+                out[off:, :Ne] = Bt[v0:r1 - Ne]
+                out[off:, Ne:] = self.C[v0:r1 - Ne]
+            if Sxr.nnz:
+                c = Sxr[r0:r1].tocoo()
+                np.add.at(out, (c.row, c.col), c.data)
+            return out
+        diag = np.zeros(N, complex)
+        for c0 in range(0, Ne, 1024):
+            idx = np.arange(c0, min(c0 + 1024, Ne), dtype=np.int32)
+            diag[idx] = np.diagonal(core.far_block(idx, idx, self.g, self.tb, self.w))
+        diag[:Ne] += dZ.diagonal()
+        if Nv:
+            diag[Ne:] += np.diagonal(self.C)
+        diag += Sxr.diagonal()
+        return rows, diag
+
+    def _solve_streamed(self, f, E, Sx, gpu):
+        """Mixed precision with the complex64 LU on the GPU and no dense Z anywhere on the host: Z's rows filled in
+        blocks (_streamed_rows), equilibrated and sent up as they come (gpu.factor_rows), GMRES on the matrix-free
+        double operator with the factor as the preconditioner (as solve_direct's GPU path refines, which held a
+        complex64 Z on the host: 8 N^2 bytes, 13.3 GB at antenna_cp_patch's 40.8k unknowns, where a host short of
+        that fell back to BLR and took more than 30 minutes a frequency). The factor is kept on the GPU, and the
+        next frequency tries it first as a preconditioner (_solve_reused)."""
+        sim = self.sim
+        N = sim.Ne + sim.Nv
+        if self._reusable(f) and isinstance(self._kept[0][1], _GPUKept):
+            X = self._solve_reused(f, E, Sx)
+            if X is not None:
+                return X
+        self._kept = []                                     # the kept factor's GPU memory is the new one's
+        t_fresh = time.time()
+        if self._ready != f:
+            with sim.log.timer('near-field correction'):
+                self.dZ_exact = self._near_exact()
+            self._vias(f)
+        self._ready = None
+        rows, diag = self._streamed_rows(Sx)
+        dsc = 1.0 / np.sqrt(np.abs(diag) + 1e-300)
+        block = self.STREAM_ROWS
+
+        def scaled(r0, r1):                                 # equilibrated, complex64, row blocks in parallel
+            Zr = rows(r0, r1)
+            out = np.empty(Zr.shape, np.complex64)
+            dr = dsc[r0:r1]
+
+            def one(a, b):
+                Zr[a:b] *= dr[a:b, None]
+                Zr[a:b] *= dsc[None, :]
+                out[a:b] = Zr[a:b]
+            _row_blocks(Zr, one)
+            return out
+        if not self._gpu_logged:
+            self._gpu_logged = True
+            sim.log.note(f"GPU: {gpu.device} via {gpu.name}, {gpu.mem_free() / 1e9:.1f} GB free: complex64 LU there, "
+                         f"Z filled into it in {block}-row blocks (none on the host), refinement matrix-free")
+        with sim.log.timer('fill + LU factor (GPU, streamed)', f"N={N}, {gpu.name}"):
+            try:
+                gpu.factor_rows(N, scaled, block)
+            except Exception as e:                          # driver / memory: the host's paths
+                sim.log.note(f"GPU streamed LU failed ({type(e).__name__}: {e}) - the host's direct solver")
+                gpu.release()
+                self.sim.stream = 'off'
+                return self.solve_direct(f, E, precision='mixed')
+        B = dsc[:, None] * E
+        with sim.log.timer('refinement (GMRES, exact matvec)'):
+            t = time.time()
+            Y, ok, rel = self._refine(lambda V: dsc[:, None] * self.matvec_exact(dsc[:, None] * V, Sx), B,
+                                      gpu.solve, MIXED_MAX_ITER, 1)
+            self._t_iter = (time.time() - t) / max(1, max(self.iters, default=1))
+        sim.log.note(f"streamed mixed precision (GPU): GMRES iterations per port {self.iters}")
+        if ok:
+            if sim.reuse != 'off':
+                self._kept = [(f, _GPUKept(gpu, gpu.vram_needed(N)), dsc, time.time() - t_fresh)]
+            else:
+                gpu.release()
+            return dsc[:, None] * Y
+        gpu.release()
+        sim.log.note(f"WARNING streamed mixed precision did not converge at {f / 1e9:.4g} GHz (residual {rel:.1e}) "
+                     f"- solving in double precision up to {MIXED_RETRY * f / 1e9:.4g} GHz")
+        self._mixed_failed = max(self._mixed_failed, f)
+        return self.solve_direct(f, E, precision='double')
 
     def _solve_tiled(self, f, E, Sx, gpu, block=1024):
         """Mixed precision without a dense Z anywhere: the symmetric part of the equilibrated Z factored as

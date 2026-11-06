@@ -293,3 +293,32 @@ def test_vulkan_backend_matches_cpu(clean, S_cpu):
     S = sim.sparams(4e9)
     assert any(r[0] == 'LU factor (GPU)' for r in sim.log.records), "GPU path not taken"
     assert np.abs(S - S_cpu).max() < 1e-6
+
+
+@vulkan
+def test_vulkan_streamed_fill_matches_cpu(clean, S_cpu):
+    """stream on: Z's rows filled straight into the GPU's factor (no host Z), the refinement matrix-free: the
+    S-parameters of the CPU's dense solve, and the kept factor reused at the next frequency."""
+    sim = make_sim('vulkan')
+    sim.stream = 'on'
+    S = sim.sparams(4e9)
+    assert any(r[0] == 'fill + LU factor (GPU, streamed)' for r in sim.log.records), "streamed path not taken"
+    assert np.abs(S - S_cpu).max() < 1e-6
+    sim.sparams(4.1e9)
+    assert sum(r[0] == 'fill + LU factor (GPU, streamed)' for r in sim.log.records) == 1   # 4.1 GHz: reused
+    assert any('reused LU' in n for n in sim.log.notes)
+
+
+def test_memory_plan_takes_the_backends_own_estimate():
+    """A Vulkan LU factors in place (8 N^2): with gpu_info's 4-tuple the plan puts 40k unknowns on a 16 GB GPU, the
+    host holding no Z where it is short of one (gpu-stream), where the 2-tuple's 16 N^2 assumption sent it to the
+    CPU."""
+    from mom25d.sim import memory_plan
+    n = 40000
+    need = 8.0 * n * n + 0.8e9
+    p = memory_plan(n, has_core=True, avail=8e9, gpu=('vulkan', 15.7e9, need, True), solver='auto')
+    assert p['path'] == 'gpu-stream' and p['solver'] == 'direct' and p['host'] < 6e9
+    p = memory_plan(n, has_core=True, avail=30e9, gpu=('vulkan', 15.7e9, need, True), solver='auto')
+    assert p['path'] == 'gpu-lu'
+    p = memory_plan(n, has_core=True, avail=8e9, gpu=('vulkan', 15.7e9), solver='auto')
+    assert p['solver'] == 'blr'

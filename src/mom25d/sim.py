@@ -64,19 +64,29 @@ MIXED_MIN_N = 3500       # above this, 'auto' precision is mixed whenever the co
 GPU_MIN_N = int(os.environ.get('MOM25D_GPU_MIN_N', 3000))
 
 
+def gpu_info(b, n):
+    """memory_plan's gpu argument for backend b and an n-unknown LU: (name, free bytes, the LU's bytes, fits)."""
+    return (b.name, b.mem_free(), b.vram_needed(n), b.fits(n))
+
+
 def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver='auto', tiled='auto', block=1024,
                 n_lu=None):
     """How the solver of n unknowns runs and the memory it needs: dict(solver, precision, path, host, gpu)
-    (bytes). gpu: None, or (backend name, free bytes). path: 'dense' (NumPy, small n), 'double' (LU on the
-    CPU), 'hybrid' (complex64 LU on the GPU, the double Z on the host for the refinement), 'tiled' (the
+    (bytes). gpu: None, or (backend name, free bytes), or gpu_info's (name, free, the LU's bytes, fits): the
+    backend's own estimate (the Vulkan LU factors in place: 8 N^2, not the 16 N^2 the 2-tuple assumes). path: 'dense' (NumPy, small n), 'double' (LU on the
+    CPU), 'hybrid' (complex64 LU on the GPU, the double Z on the host for the refinement), 'gpu-stream' (the Vulkan
+    GPU's complex64 LU filled by row blocks, no Z on the host, the refinement matrix-free), 'tiled' (the
     symmetric part as L L^T tiles on the GPU, no dense Z: fast.FastOperator._solve_tiled), 'gpu-lu' (complex64
     Z on the host and the GPU), 'cpu-mixed' (complex64 LU on the CPU), 'blr' / 'aca' (compressed, no dense Z).
     tiled: 'auto' (where the hybrid does not fit), 'on' (whenever a CuPy GPU is there) or 'off'. n_lu: the unknowns
     the LU factors (fewer with quads; default n), which the thresholds GPU_MIN_N and MIXED_MIN_N compare."""
     avail = available_memory() if avail is None else avail
-    name, free = gpu if gpu else (None, 0.0)
-    gpu_lu = (1 if name in ('cupy', 'emulate') else 2) * 8.0 * n * n + 0.4e9      # gpu._Backend.vram_needed
-    gpu_fits = name is not None and gpu_lu <= 0.9 * free
+    name, free = gpu[:2] if gpu else (None, 0.0)
+    if gpu and len(gpu) >= 4:                                   # the backend's own: gpu_info(backend, n)
+        gpu_lu, gpu_fits = float(gpu[2]), bool(gpu[3])
+    else:
+        gpu_lu = (1 if name in ('cupy', 'emulate') else 2) * 8.0 * n * n + 0.4e9  # gpu._Backend.vram_needed
+        gpu_fits = name is not None and gpu_lu <= 0.9 * free
     work = 3 * 8.0 * n * block + 0.5e9                                          # fast.FastOperator._tiled_work
     can_tile = tiled != 'off' and has_core and name in ('cupy', 'emulate') and work <= 0.9 * free
     if precision == 'auto':
@@ -98,6 +108,10 @@ def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver
         host = max(0.0, 4.0 * n * n - budget) + 2 * 16.0 * n * block + 1e4 * n + 0.9e9
     elif hybrid:
         path, host, dev = 'hybrid', 24.0 * n * n + 0.9e9, gpu_lu
+    elif gpu_fits and name == 'vulkan' and 10.0 * n * n + 0.9e9 > 0.8 * avail:
+        # fast.FastOperator._solve_streamed: Z's rows filled into the GPU's factor, two blocks on the host and the
+        # sparse exact near field (about blr's)
+        path, host, dev = 'gpu-stream', 2 * 16.0 * n * 2048 + 2e4 * n + 0.9e9, gpu_lu
     elif gpu_fits:
         path, host, dev = 'gpu-lu', 10.0 * n * n + 0.9e9, gpu_lu
     else:
@@ -307,6 +321,8 @@ class Simulation:
         self.hodlr_tol, self.hodlr_leaf, self.hodlr_refine = 1e-6, 256, False   # solver='hodlr'
         self.hodlr_symmetric = False        # Z^T = Z: half the compression (the near correction is not quite)
         self.reuse = 'auto'                 # 'auto' | 'off': the CPU's complex64 LU kept for the next frequencies
+        self.stream = 'auto'                # 'auto' | 'on' | 'off': the Vulkan GPU's LU filled by row blocks, no host Z
+                                            # (auto: where the host cannot hold a complex64 Z)
         self.dmax, self.ncross, self.grade, self.near_fac = dmax, ncross, grade, near_fac
         self.user_ports = list(ports)
         self.ports = [m for p in ports for m in (p.modes() if isinstance(p, DiffPort) else [p])]
@@ -532,7 +548,7 @@ class Simulation:
         n_lu = self.qT.shape[1] if self.qT is not None else n
         want_gpu = has_core and gpu != 'off' and (precision == 'mixed' or (precision == 'auto' and n_lu > GPU_MIN_N))
         b = get_backend(gpu) if want_gpu else None
-        g = (b.name, b.mem_free()) if b is not None else None
+        g = gpu_info(b, n_lu) if b is not None else None
         avail = available_memory()
         plan = memory_plan(n, has_core, avail, g, precision, solver, self.tiled, n_lu=n_lu)
         self.plan, self.precision, precision = plan, plan['precision'], plan['precision']

@@ -37,8 +37,8 @@ class _Backend:
     def vram_needed(self, N):
         return (1 if self.inplace else 2) * 8.0 * N * N + 0.4e9
 
-    def fits(self, N):
-        return self.vram_needed(N) <= 0.9 * self.mem_free()
+    def fits(self, N, extra=0.0):
+        return self.vram_needed(N) <= 0.9 * (self.mem_free() + extra)
 
     def release(self):
         self.lu = self.piv = None

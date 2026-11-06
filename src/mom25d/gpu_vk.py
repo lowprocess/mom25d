@@ -368,8 +368,13 @@ class VulkanBackend:
         """The matrix, the panel staging, the swap and U12 work arrays, the diagonal blocks' inverses."""
         return 8.0 * N * N + 8.0 * N * self.nb * 5 + 0.4e9
 
-    def fits(self, N):
-        return self.vram_needed(N) <= 0.9 * self.mem_free()
+    def fits(self, N, extra=0.0):
+        """Whether an N-unknown LU fits in the free memory (+ extra: what kept factors would give back). vram_needed
+        counts every device buffer factor() makes and 0.4 GB besides, so the margin is that and at least 0.5 GB
+        (3% of the free): 90% of the free turned down antenna_cp_patch's 40.8k unknowns (14.15 GB of 15.7 GB),
+        which factored there in 19 s with 1.95 GB left, against minutes on the CPU."""
+        free = self.mem_free() + extra
+        return self.vram_needed(N) <= free - max(0.5e9, 0.03 * free)
 
     def release(self):
         """Free the factor and the work arrays (the device memory; the mapped host buffers are kept)."""
@@ -487,16 +492,51 @@ class VulkanBackend:
                 perm[k0 + i], perm[k0 + j] = c, a
         return ip, (L11, np.triu(P[:b, :b])), [(r, s) for r, s in perm.items() if r != s]
 
+    def _upload(self, A, Z, chunk=1 << 28, c_start=0):
+        """Z (host complex64, C-ordered: its rows are A's columns) into A: column blocks of 256 MB through two mapped
+        host buffers, the copy kernel reading each across the bus while the host fills the other. 16 GB/s on an
+        RX 7800 XT, where buffer.copy_from_numpy (_Mat.upload_rows_of) ran at 6.5: 0.6 s -> 0.25 s of each LU at
+        22k unknowns."""
+        N, ncols = A.rows, Z.shape[0]                          # Z's rows: A's columns c_start..
+        cols = max(1, min(ncols, chunk // (8 * N)))
+        hs = [self._host(f'up{i}', 8 * N * cols) for i in (0, 1)]
+        subs = [None, None]
+        for j, c0 in enumerate(range(0, ncols, cols)):
+            cc, i = min(cols, ncols - c0), j % 2
+            if subs[i] is not None:
+                self.dev.wait_for_submit(subs[i])                 # that buffer's last copy is done
+            hs[i].view(np.complex64, N * cc).reshape(cc, N)[...] = Z[c0:c0 + cc]
+            self._copy(self._flatdesc(hs[i].address, N), A.desc(0, c_start + c0), N, cc)
+            subs[i] = self._submit()
+        for x in subs:
+            if x is not None:
+                self.dev.wait_for_submit(x)
+
     def factor(self, Z):
         """Z: host complex64, C-contiguous, equilibrated. Factors A = Z^T in place on the GPU (P L U, LAPACK's
         pivots), keeping the diagonal blocks' inverses for solve(). Look-ahead: the next panel's columns are updated
         first and go to the CPU, which factors them while the GPU runs the rest of the trailing update."""
         self.release()
         Z = np.asarray(Z, np.complex64)
-        N, nb = Z.shape[0], self.nb
+        t0 = time.perf_counter()
+        A = _Mat(self, Z.shape[0], Z.shape[0])
+        self._upload(A, Z)
+        self._factor(A, t0)
+
+    def factor_rows(self, N, rows, block=2048):
+        """factor() of the N x N Z whose rows rows(r0, r1) gives (host, complex64-able, C-ordered), block rows at a
+        time: Z is never whole on the host (it goes up as it is filled), so the host needs a block where factor()'s
+        caller needs 8 N^2 bytes (antenna_cp_patch's 40.8k unknowns: 13.3 GB)."""
+        self.release()
         t0 = time.perf_counter()
         A = _Mat(self, N, N)
-        A.upload_rows_of(Z)
+        for r0 in range(0, N, block):
+            self._upload(A, np.asarray(rows(r0, min(N, r0 + block)), np.complex64), c_start=r0)
+        self._factor(A, t0)
+
+    def _factor(self, A, t0):
+        """The blocked LU of the matrix uploaded into A (factor)."""
+        N, nb = A.rows, self.nb
         hdn = self._host('panel', 8 * N * nb)                     # the panel, down to the CPU and back
         hrows = [self._host(f'rows{i}', 4 * 2 * nb) for i in (0, 1)]  # by step parity: S2 may read them while
         hsrc = [self._host(f'src{i}', 4 * 2 * nb) for i in (0, 1)]    # the host writes the next step's
