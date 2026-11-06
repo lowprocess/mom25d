@@ -239,7 +239,7 @@ def figures(res, out):
     ax[1].set_xlabel('Hz'); ax[1].set_ylabel('nH'); ax[1].grid(True, which='both', alpha=0.3)
     ax[1].set_title("hot loop's copper inductance (the cap's own ESL left out)", fontsize=9); ax[1].legend(fontsize=8)
     ax[2].axvspan(0.5e6, 3e6, color='0.9', zorder=0)
-    ax[2].set_xlabel('Hz'); ax[2].set_ylabel('|m| (mA m^2)'); ax[2].grid(True, which='both', alpha=0.3)
+    ax[2].set_xlabel('Hz'); ax[2].set_ylabel('|m| (A mm^2)'); ax[2].grid(True, which='both', alpha=0.3)
     ax[2].set_title('magnetic dipole moment (the field far off ~ |m| / r^3)', fontsize=9); ax[2].legend(fontsize=8)
     fig.tight_layout(); fig.savefig(os.path.join(out, 'nearfield_spectrum.png'), dpi=110); plt.close(fig)
 
@@ -261,12 +261,12 @@ def main(out):
                         for i, fi in enumerate(f)},
             peak_H_10mm={f'{fi / 1e6:g} MHz': round(float(np.linalg.norm(np.abs(r['planes'][10.0][i]), axis=-1).max()), 4)
                          for i, fi in enumerate(f)},
-            moment_mAm2={f'{fi / 1e6:g} MHz': round(float(np.linalg.norm(np.abs(r['mom'][i]))) * 1e6, 4)
+            moment_Amm2={f'{fi / 1e6:g} MHz': round(float(np.linalg.norm(np.abs(r['mom'][i]))) * 1e6, 4)
                          for i, fi in enumerate(f)})
     json.dump(summ, open(os.path.join(out, 'summary.json'), 'w'), indent=1)
     for c, s in summ.items():
         print(c, 'L nH', list(s['L_nH'].values())[:3], 'H 3mm', list(s['peak_H_3mm'].values())[:2], 'H 10mm',
-              list(s['peak_H_10mm'].values())[:2], 'm', list(s['moment_mAm2'].values())[:2], 'solve', s['solve_s'], 's')
+              list(s['peak_H_10mm'].values())[:2], 'm', list(s['moment_Amm2'].values())[:2], 'solve', s['solve_s'], 's')
 
 
 if __name__ == '__main__':
