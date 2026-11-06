@@ -35,12 +35,19 @@ from .mesh import copper_of, mesh_sheet, stiffness, mass, stack_z
 SIGMA_CU = 5.8e7
 
 
-def fill_holes(geom, area):
-    """geom with its holes smaller than `area` (mm2) filled."""
+def fill_holes(geom, area, cover=None):
+    """geom with its holes smaller than `area` (mm2) filled, and those `cover` (shapely: the antipads of the vias
+    through it, a field of them merged into one hole) covers but for 5% of their area."""
     from shapely.geometry import Polygon
     from shapely.ops import unary_union
-    polys = [geom] if geom.geom_type == 'Polygon' else list(geom.geoms)
-    return unary_union([Polygon(p.exterior, [h for h in p.interiors if Polygon(h).area >= area]) for p in polys])
+    polys = [geom] if geom.geom_type == 'Polygon' else [g for g in geom.geoms if g.geom_type == 'Polygon']
+
+    def keep(h):
+        hp = Polygon(h)
+        if hp.area < area:
+            return False
+        return not (cover is not None and hp.difference(cover).area < 0.05 * hp.area)
+    return unary_union([Polygon(p.exterior, [h for h in p.interiors if keep(h)]) for p in polys])
 
 
 def mount_inductance(h, pitch, r):
@@ -88,7 +95,7 @@ class PlanePair:
         self.geom, self.d, self.er, self.tand, self.t, self.sigma = geom, d, er, tand, t, sigma
         self.ports = [dict(p) for p in ports]
         pts = [(p['x'], p['y'], p['r']) for p in self.ports]
-        nodes, tris, rings = mesh_sheet(geom, pts, dmax)
+        nodes, tris, rings, _ = mesh_sheet(geom, pts, dmax)
         missing = [p['name'] for p, r in zip(self.ports, rings) if r is None]
         if missing:
             raise ValueError(f"port(s) {', '.join(missing)} not on the plane pair")

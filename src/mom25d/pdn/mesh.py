@@ -5,8 +5,9 @@ The copper of a net as triangle meshes, one per layer (mom25d's own mesher, geo.
     sheets = net_sheets(board, '+1V0', points=[(x, y, r), ...], dmax=1.0)   # {layer: Sheet}, board.json units (mm)
     K, M = stiffness(sh.nodes, sh.tris), mass(sh.nodes, sh.tris)
 
-A point (a via, a pad) is a vertex of the mesh with an octagon of its radius around it (the via fan of
-mesh_polygons); Sheet.at(i) is the vertex ids of point i on that sheet: its centre and its ring.
+A point (a via) is a vertex of the mesh with an octagon of its radius around it (the via fan of mesh_polygons);
+Sheet.at(i) is the vertex ids of point i on that sheet: its centre and its ring. A region (a pad) has its outline
+made mesh edges; Sheet.region(k) is the vertex ids on and in it.
 """
 from dataclasses import dataclass
 
@@ -31,15 +32,21 @@ class Sheet:
     points: list                # [(x, y, r)] mm: the points asked for that lie on this copper
     rings: list                 # vertex ids of each of them (centre first), [] where it is not on this copper
     key: list                   # the index in the caller's list of each of `points`
+    regions: list = None        # vertex ids of each region asked for on this layer ([]: not on this copper)
 
     def at(self, i):
         """The vertex ids of the caller's point i on this sheet ([]: not on it)."""
         return self.rings[self.key.index(i)] if i in self.key else []
 
+    def region(self, k):
+        return (self.regions or [])[k] if self.regions and k < len(self.regions) else []
+
 
 def copper_of(board, net, layer):
-    """The copper of `net` on `layer` (board.json's dict), one shapely geometry in mm, or None."""
-    gs = [shape(c['polygon']) for c in board['copper'].get(layer, []) if c.get('net') == net]
+    """The copper of `net` (a name, or a set of names: a rail tree's nets) on `layer` (board.json's dict), one
+    shapely geometry in mm, or None."""
+    nets = {net} if isinstance(net, str) else set(net)
+    gs = [shape(c['polygon']) for c in board['copper'].get(layer, []) if c.get('net') in nets]
     g = unary_union(gs).buffer(0) if gs else None
     return None if g is None or g.is_empty else g
 
@@ -49,16 +56,37 @@ def stack_z(board):
     return {c['name']: (c['z'], c['t']) for c in board['stack']['copper']}
 
 
-def mesh_sheet(geom, points=(), dmax=1.0, w_ref=None, coarsen=None):
-    """Mesh one piece of copper (mm): (nodes mm, tris, [vertex ids of each point: centre + ring]) for the points
-    (x, y, r) inside it, None where one is not. coarsen: mesh_polygons' (cells grow away from the features to coarsen x
-    dmax)."""
+def _outline_lines(polys, geom):
+    """The outlines of `polys` (mm) inside `geom` as mesh_polygons' constraint segments (m)."""
+    segs = []
+    for q in polys:
+        q = q.intersection(geom)
+        for part in getattr(q, 'geoms', [q]):
+            if part.geom_type != 'Polygon' or part.is_empty:
+                continue
+            for ring in [part.exterior] + list(part.interiors):
+                c = np.asarray(ring.coords)[:, :2] * 1e-3
+                segs += [(tuple(a), tuple(b)) for a, b in zip(c[:-1], c[1:])]
+    return segs
+
+
+def mesh_sheet(geom, points=(), dmax=1.0, w_ref=None, coarsen=None, regions=(), fine=None, dmax_fine=None):
+    """Mesh one piece of copper (mm): (nodes mm, tris, [vertex ids of each point: centre + ring], [vertex ids of
+    each region]) for the points (x, y, r) inside it (None where one is not) and the regions (shapely polygons, mm:
+    pads), whose outlines are made mesh edges (a region on none of this copper: []). fine (shapely, mm) is meshed at
+    dmax_fine (mm). coarsen: mesh_polygons' (cells grow away from the features to coarsen x dmax)."""
     xy = np.asarray([(x, y) for x, y, _ in points], float).reshape(-1, 2)
     hit = shapely.contains_xy(geom.buffer(1e-6), xy[:, 0], xy[:, 1]) if len(xy) else np.zeros(0, bool)
     inside = list(np.flatnonzero(hit))                     # the copper buffered once: not per point
     vias = [(points[i][0] * 1e-3, points[i][1] * 1e-3, points[i][2] * 1e-3) for i in inside]
     g = scale(geom, 1e-3, 1e-3, origin=(0, 0))
-    nodes, tris, vid = mesh_polygons(g, dmax * 1e-3, (w_ref or dmax) * 1e-3, ncross=1, vias=vias, coarsen=coarsen)
+    live = [k for k, q in enumerate(regions) if q.intersects(geom)]
+    lines = _outline_lines([regions[k] for k in live], geom)
+    kw = {}
+    if fine is not None and dmax_fine:
+        kw = dict(fine=scale(fine, 1e-3, 1e-3, origin=(0, 0)), dmax_fine=dmax_fine * 1e-3)
+    nodes, tris, vid = mesh_polygons(g, dmax * 1e-3, (w_ref or dmax) * 1e-3, ncross=1, vias=vias, coarsen=coarsen,
+                                     lines=lines, **kw)
     nodes = nodes * 1e3
     rings = [None] * len(points)
     for i, v in zip(inside, vid):
@@ -67,22 +95,34 @@ def mesh_sheet(geom, points=(), dmax=1.0, w_ref=None, coarsen=None):
         ids = np.flatnonzero(d <= r * 1.02 + 1e-9)
         c = int(np.argmin(d))
         rings[i] = [c] + [int(k) for k in ids if k != c]
-    return nodes, tris, rings
+    reg = [[] for _ in regions]
+    for k in live:
+        q = regions[k].buffer(1e-4)
+        ids = np.flatnonzero(shapely.contains_xy(q, nodes[:, 0], nodes[:, 1]))
+        if not len(ids):                                    # a pad smaller than a cell: its nearest vertex
+            c = regions[k].centroid
+            ids = [int(np.argmin(np.hypot(nodes[:, 0] - c.x, nodes[:, 1] - c.y)))]
+        reg[k] = [int(i) for i in ids]
+    return nodes, tris, rings, reg
 
 
-def net_sheets(board, net, points=(), dmax=1.0, layers=None, coarsen=None):
-    """{layer: Sheet} of the copper of `net` on each copper layer (or `layers`), every point (x, y, r) of `points`
-    that lies on a layer's copper made a vertex with its ring."""
+def net_sheets(board, net, points=(), dmax=1.0, layers=None, coarsen=None, regions=None, fine=None, dmax_fine=None):
+    """{layer: Sheet} of the copper of `net` (a name or a set: a rail tree) on each copper layer (or `layers`), every
+    point (x, y, r) of `points` that lies on a layer's copper made a vertex with its ring. regions: {layer:
+    [polygon]} (pads) whose outlines become mesh edges; Sheet.region(k) their vertex ids. fine, dmax_fine: a region
+    (shapely, mm) meshed finer."""
     zt = stack_z(board)
     out = {}
     for lay in (layers or zt):
         g = copper_of(board, net, lay)
         if g is None:
             continue
-        nodes, tris, rings = mesh_sheet(g, points, dmax, coarsen=coarsen)
+        rg = (regions or {}).get(lay, [])
+        nodes, tris, rings, reg = mesh_sheet(g, points, dmax, coarsen=coarsen, regions=rg, fine=fine,
+                                             dmax_fine=dmax_fine)
         key = [i for i, r in enumerate(rings) if r is not None]
         out[lay] = Sheet(lay, zt[lay][0], zt[lay][1], g, nodes, tris, [points[i] for i in key],
-                         [rings[i] for i in key], key)
+                         [rings[i] for i in key], key, reg)
     return out
 
 
