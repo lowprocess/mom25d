@@ -322,3 +322,19 @@ def test_memory_plan_takes_the_backends_own_estimate():
     assert p['path'] == 'gpu-lu'
     p = memory_plan(n, has_core=True, avail=8e9, gpu=('vulkan', 15.7e9), solver='auto')
     assert p['solver'] == 'blr'
+
+
+def test_far_field_of_several_excitations_at_once_is_each_ones():
+    """far_field with I (N x k): every excitation's far field from one set of phases, as one column at a time
+    (the vias' included)."""
+    from mom25d.farfield import far_field
+    sim = make_sim('off')
+    f = 4e9
+    I = sim.currents(f, sim.excitation())
+    th, ph = np.arange(0, 91, 15.0), np.arange(0, 361, 30.0)
+    Et, Ep = far_field(sim, I, f, th, ph)
+    assert Et.shape == (I.shape[1], len(ph), len(th))
+    for c in range(I.shape[1]):
+        e1, p1 = far_field(sim, I[:, c], f, th, ph)
+        assert np.allclose(Et[c], e1, rtol=1e-12, atol=1e-14 * np.abs(e1).max())
+        assert np.allclose(Ep[c], p1, rtol=1e-12, atol=1e-14 * np.abs(p1).max())

@@ -660,9 +660,9 @@ class MoM25D(Solver):
             if I is None:
                 I = sim.currents(f, sim.excitation())
             Ys.append(np.array([np.atleast_1d(sim.port_current(I, j)) for j in range(n)]))
-            ee = [far_field(sim, I[:, c], f, th[up], ph) for c in range(n)]
-            Eth.append([e[0] for e in ee])
-            Eph.append([e[1] for e in ee])
+            et, ep = far_field(sim, np.asarray(I)[:, :n], f, th[up], ph)     # every port's at once: (n, nphi, nth)
+            Eth.append(et)
+            Eph.append(ep)
             if i == ip:
                 I_pat = I
         data = dict(theta=th[up], phi=ph, theta_sphere=th, freq=ffr, ports=names, zc=zc, Y=np.array(Ys),

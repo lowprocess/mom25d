@@ -48,29 +48,34 @@ def _via_Eu(st, kr, w, o, layers):
 
 def _tangential(sim, I, w, o, kr, cphi, sphi):
     """E_u, E_v on interface o at the plane-wave directions (kr, cos / sin phi) from all the currents: the surface
-    currents of every layer, and the via chains' (sim.chains, unknowns after the Ne edges, when the sim has them)."""
+    currents of every layer, and the via chains' (sim.chains, unknowns after the Ne edges, when the sim has them).
+    I: one excitation (N) or several (N x k: E_u, E_v (ndir, k)), the phases e^{j k.rho} made once for all."""
     st = sim.st.at(w / (2 * np.pi))
+    one = I is None or np.ndim(I) < 2
     kx, ky = kr * cphi, kr * sphi
-    jx, jy = sim.current_density(I)                                      # per triangle (A/m)
+    jx, jy = sim.current_density(I)                                      # per triangle (A/m), (ntri[, k])
+    jx, jy = np.asarray(jx).reshape(len(sim.rwg.area), -1), np.asarray(jy).reshape(len(sim.rwg.area), -1)
     cen, area = sim.rwg.cent[:, :2], sim.rwg.area
-    Eu, Ev = np.zeros(kr.shape, complex), np.zeros(kr.shape, complex)
+    nk = jx.shape[1]
+    Eu, Ev = np.zeros((len(kr), nk), complex), np.zeros((len(kr), nk), complex)
     for k, idx in sim.tri_idx.items():
         if not len(idx):
             continue
         ph_ = np.exp(1j * (np.outer(kx, cen[idx, 0]) + np.outer(ky, cen[idx, 1])))   # e^{j k.rho}
-        eu, ev = _surface_E_at(st, kr, w, o, k, ph_ @ (jx[idx] * area[idx]), ph_ @ (jy[idx] * area[idx]), cphi, sphi)
+        J = ph_ @ np.concatenate([jx[idx] * area[idx][:, None], jy[idx] * area[idx][:, None]], 1)   # one product
+        eu, ev = _surface_E_at(st, kr[:, None], w, o, k, J[:, :nk], J[:, nk:], cphi[:, None], sphi[:, None])
         Eu, Ev = Eu + eu, Ev + ev
     chains, ne = getattr(sim, 'chains', None) or [], getattr(sim, 'Ne', None)
     if chains and ne is not None:
-        Iv = np.asarray(I)[ne:ne + len(chains)]
+        Iv = np.asarray(I).reshape(np.shape(I)[0], -1)[ne:ne + len(chains)]
         spans = {}
         for c, (v, a, b) in enumerate(chains):                          # one kernel per span, summed over its vias
-            spans.setdefault((a, b), []).append((v.x, v.y, Iv[c]))
+            spans.setdefault((a, b), []).append((v.x, v.y, c))
         for (a, b), vs in spans.items():
-            xy, cur = np.array([(x, y) for x, y, _ in vs]), np.array([i for _, _, i in vs])
-            Eu = Eu + _via_Eu(st, kr, w, o, range(a + 1, b + 1)) * (np.exp(1j * (np.outer(kx, xy[:, 0]) +
-                                                                                    np.outer(ky, xy[:, 1]))) @ cur)
-    return Eu, Ev
+            xy, rows = np.array([(x, y) for x, y, _ in vs]), [c for _, _, c in vs]
+            Eu = Eu + _via_Eu(st, kr, w, o, range(a + 1, b + 1))[:, None] * (
+                np.exp(1j * (np.outer(kx, xy[:, 0]) + np.outer(ky, xy[:, 1]))) @ Iv[rows])
+    return (Eu[:, 0], Ev[:, 0]) if one else (Eu, Ev)
 
 
 def _surface_E_at(st, kr, w, o, k, Jx, Jy, c, s):
@@ -81,14 +86,16 @@ def _surface_E_at(st, kr, w, o, k, Jx, Jy, c, s):
 def far_field(sim, I, f, theta, phi):
     """r E_theta, r E_phi (V, complex, shape (len(phi), len(theta))) of the currents I (one excitation column)
     at f (Hz), the surface currents and the vias'; theta from the board normal (0..180 deg: above the board to 90,
-    below it beyond; zero below the PEC ground), phi from +x (degrees)."""
+    below it beyond; zero below the PEC ground), phi from +x (degrees). I: N x k for k excitations at once:
+    (k, nphi, ntheta) each, the phases shared (an array's ports: one pass, not one each)."""
     st = sim.st.at(f)
+    one = I is None or np.ndim(I) < 2
     th, ph = np.radians(np.asarray(theta, float)), np.radians(np.asarray(phi, float))
     TH, PH = np.meshgrid(th, ph)                                         # (nphi, ntheta)
     if st.top != 'open' and (TH < np.pi / 2).any():
         raise ValueError("a PEC cover on the stack: nothing radiates above it")
     w = 2 * np.pi * f
-    Et, Ep = np.zeros(TH.size, complex), np.zeros(TH.size, complex)
+    Et = Ep = None
     t, cphi, sphi = TH.ravel(), np.cos(PH).ravel(), np.sin(PH).ravel()
     for up, sel in ((True, t <= np.pi / 2), (False, t > np.pi / 2)):
         if not sel.any() or (not up and st.bottom == 'pec'):
@@ -97,9 +104,17 @@ def far_field(sim, I, f, theta, phi):
         k = w / C0 * np.sqrt(complex(er)).real
         kr = k * np.sin(t[sel]) + 1e-9 * k                               # k_rho = 0 at broadside: just off it
         Eu, Ev = _tangential(sim, I, w, st.N if up else 0, kr, cphi[sel], sphi[sel])
+        Eu, Ev = np.reshape(Eu, (len(kr), -1)), np.reshape(Ev, (len(kr), -1))
+        if Et is None:
+            Et, Ep = np.zeros((TH.size, Eu.shape[1]), complex), np.zeros((TH.size, Eu.shape[1]), complex)
         c = (1 if up else -1) * 1j * k / (2 * np.pi)
-        Et[sel], Ep[sel] = c * Eu, c * np.cos(t[sel]) * Ev
-    return Et.reshape(TH.shape), Ep.reshape(TH.shape)
+        Et[sel], Ep[sel] = c * Eu, c * np.cos(t[sel])[:, None] * Ev
+    if Et is None:                                                       # nothing radiates on this grid
+        nk = 1 if one else np.shape(I)[1]
+        Et, Ep = np.zeros((TH.size, nk), complex), np.zeros((TH.size, nk), complex)
+    nk = Et.shape[1]
+    Et, Ep = Et.T.reshape((nk,) + TH.shape), Ep.T.reshape((nk,) + TH.shape)
+    return (Et[0], Ep[0]) if one else (Et, Ep)
 
 
 def radiated(Eth, Eph, theta, phi, eta=ETA0):

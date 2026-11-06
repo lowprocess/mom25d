@@ -894,9 +894,11 @@ class Simulation:
         return out
 
     def current_density(self, I):
+        """(Jx, Jy) per triangle of the currents I (N, or N x k: (ntri, k) each)."""
         r, I = self.rwg, I[:self.Ne]
         a = r.Aal @ I
-        return r.cent[:, 0] * a - r.Bx @ I, r.cent[:, 1] * a - r.By @ I
+        cx, cy = (r.cent[:, 0], r.cent[:, 1]) if a.ndim == 1 else (r.cent[:, :1], r.cent[:, 1:2])
+        return cx * a - r.Bx @ I, cy * a - r.By @ I
 
 
 def _line_fit(sim, IR, IL, step):
