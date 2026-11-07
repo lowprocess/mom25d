@@ -13,7 +13,7 @@ triangle's size and more above the sheet.
 """
 import numpy as np
 
-from .base import _BAR6, _W6
+from .base import _BAR6, _W6, tri_area2
 
 
 def rwg_currents(rwg, I):
@@ -77,7 +77,7 @@ def h_sheets(sheets, pts, near=1.5, levels=2):
     H = None
     for nodes, tris, a, b, z in sheets:
         V = nodes[tris]
-        size = np.sqrt(np.abs(np.cross(V[:, 1] - V[:, 0], V[:, 2] - V[:, 0])) / 2)
+        size = np.sqrt(np.abs(tri_area2(V)) / 2)
         cen = V.mean(1)
         # the triangles near any point: refined
         from scipy.spatial import cKDTree

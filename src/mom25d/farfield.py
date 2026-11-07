@@ -222,7 +222,7 @@ def current_deposit(sim, I, x, y, k, per_cell=2.0):
     current and its centre are kept on any grid; sampling the current at the grid points instead was fragile (it
     crowds at a trace's edges: a row of points on one edge and none on the other put rf_gcpw's 1 mm near field
     0.15 mm off the trace's centre, and at another step halved it). Returns Jx, Jy ((nx, ny) complex, A/m)."""
-    from .base import _BAR6, _W6
+    from .base import _BAR6, _W6, tri_area2
     from .biot import rwg_currents, _split4
     r = sim.rwg
     a, b = rwg_currents(r, np.asarray(I)[:r.Ne])
@@ -230,14 +230,14 @@ def current_deposit(sim, I, x, y, k, per_cell=2.0):
     V, aa, bb = r.nodes[r.tris[idx]][:, :, :2], a[idx], b[idx]
     dx, dy = x[1] - x[0], y[1] - y[0]
     for _ in range(6):
-        size = np.sqrt(np.abs(np.cross(V[:, 1] - V[:, 0], V[:, 2] - V[:, 0])) / 2)
+        size = np.sqrt(np.abs(tri_area2(V)) / 2)
         big = size > per_cell * min(dx, dy)
         if not big.any():
             break
         V = np.concatenate([V[~big], _split4(V[big])])
         aa = np.concatenate([aa[~big], np.tile(aa[big], 4)])
         bb = np.concatenate([bb[~big], np.tile(bb[big], (4, 1))])
-    area = 0.5 * np.abs(np.cross(V[:, 1] - V[:, 0], V[:, 2] - V[:, 0]))
+    area = 0.5 * np.abs(tri_area2(V))
     Q = np.einsum('qk,tkc->tqc', _BAR6, V)                              # (M, 6, 2)
     mom = (aa[:, None, None] * Q + bb[:, None, :]) * (area[:, None] * _W6[None])[..., None]   # A m per point
     fx, fy = (Q[..., 0].ravel() - x[0]) / dx, (Q[..., 1].ravel() - y[0]) / dy

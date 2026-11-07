@@ -47,6 +47,13 @@ class RWG:
         self.D = sp(2 * alpha)               # divergence: +l/A on T+, -l/A on T-
 
 
+def tri_area2(V):
+    """Twice the signed area of planar triangles V (..., 3, 2+): the z of (V1-V0) x (V2-V0). np.cross no
+    longer takes 2-vectors (NumPy 2.5), so it is written out."""
+    e1, e2 = V[..., 1, :] - V[..., 0, :], V[..., 2, :] - V[..., 0, :]
+    return e1[..., 0] * e2[..., 1] - e1[..., 1] * e2[..., 0]
+
+
 def qform(S1, M, S2):
     """S1^T M S2 for sparse S1,S2 (Nt x Ne) and dense M (Nt x Nt)."""
     return (S2.T @ (S1.T @ M).T).T
