@@ -77,26 +77,26 @@ def run_case(case, out):
     mom = np.array([q.moment(r, i) for i in range(len(f))])          # A m^2 per amp of the source
     # H on planes over the board, at each harmonic, for its current
     gx, gy = np.arange(0, W + 1e-9, 0.5), np.arange(0, H + 1e-9, 0.5)
-    X, Y = np.meshgrid(gx, gy, indexing='ij')
     amps = harmonic_amps(HARM)
     planes = {}
     t = time.time()
-    for hgt in (1.0, 3.0, 10.0):
-        pts = np.c_[X.ravel(), Y.ravel(), np.full(X.size, Z_TOP + hgt)] * 1e-3
-        Hk = q.h_field(r, list(range(len(f))), pts)                 # (n, 3, nf): every harmonic in one pass
-        planes[hgt] = np.stack([Hk[:, :, i].reshape(X.shape + (3,)) * amps[i] for i in range(len(f))])
+    scan_heights = np.array([1.0, 3.0, 10.0])
+    Hk, plane_info = q.h_grid(r, list(range(len(f))), gx * 1e-3, gy * 1e-3,
+                              (Z_TOP + scan_heights) * 1e-3, rtol=.02, return_info=True)
+    for k, hgt in enumerate(scan_heights):
+        planes[hgt] = np.moveaxis(Hk[:, :, k] * amps, -1, 0)
     # a volume: 0.5 to 6 mm above, 12 planes, 1 mm in x, y, at the first 6 harmonics
     vx, vy, vz = np.arange(0, W + 1e-9, 1.0), np.arange(0, H + 1e-9, 1.0), np.linspace(0.5, 6.0, 12)
-    VX, VY, VZ = np.meshgrid(vx, vy, vz, indexing='ij')
-    vpts = np.c_[VX.ravel(), VY.ravel(), Z_TOP + VZ.ravel()] * 1e-3
-    Hv = q.h_field(r, list(range(6)), vpts)
-    vol = np.stack([Hv[:, :, i].reshape(VX.shape + (3,)) * amps[i] for i in range(6)])
+    Hv, volume_info = q.h_grid(r, list(range(6)), vx * 1e-3, vy * 1e-3,
+                               (Z_TOP + vz) * 1e-3, rtol=.02, return_info=True)
+    vol = np.moveaxis(Hv * amps[:6], -1, 0)
     t_field = time.time() - t
     write_dumps(os.path.join(out, case), b, f, gx, gy, planes, vx, vy, vz, vol)
     J = q.current_density(r, 0)
     return dict(case=case, q=q, r=r, Z=Z, mom=mom * harmonic_amps(HARM)[:, None], f=f, planes=planes, gx=gx, gy=gy, J=J,
                 t_solve=t_solve, t_field=t_field,
-                tris=len(q.tris), loops=q._mats['C'].shape[1])
+                tris=len(q.tris), loops=q._mats['C'].shape[1],
+                field_convergence=dict(planes=plane_info, volume=volume_info))
 
 
 def write_dumps(d, b, f, gx, gy, planes, vx, vy, vz, vol):
@@ -252,6 +252,7 @@ def main(out):
     for r in res:
         f = r['f']
         summ[r['case']] = dict(
+            field_convergence=r['field_convergence'],
             triangles=r['tris'], loops=r['loops'], solve_s=round(r['t_solve'], 1), field_s=round(r['t_field'], 1),
             L_nH={f'{fi / 1e6:g} MHz': round(z.imag / (2 * np.pi * fi) * 1e9, 3) for fi, z in zip(f, r['Z'])},
             R_mOhm={f'{fi / 1e6:g} MHz': round(z.real * 1e3, 2) for fi, z in zip(f, r['Z'])},

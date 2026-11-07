@@ -748,7 +748,9 @@ class MoM25D(Solver):
             return
         from kicad2ems.api.solver import DumpSource, save_fd_outputs
         tag = self.name
-        for port, d in current_dumps(run, held, [f * 1e9 for f in run.s.mom_dump], run.s.dump_port, run.s.mom_near,
+        # dump_port may be supplied by the optional FDTD plugin. MoM alone
+        # still supports its default (first-port) current/near-field dumps.
+        for port, d in current_dumps(run, held, [f * 1e9 for f in run.s.mom_dump], getattr(run.s, 'dump_port', None), run.s.mom_near,
                                      tag=tag, volume=getattr(run.s, 'mom_near_volume', None), **kw):
             for name in d['names']:
                 src = DumpSource(d['dir'], name, 'FD')

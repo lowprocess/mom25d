@@ -86,6 +86,25 @@ def test_via_partial_inductance_is_rosas():
     assert filament_mutual(0, h, 0, h, 1e-3) < L
 
 
+def test_open_boundary_fft_grid_matches_biot_savart(solved):
+    q, r = solved
+    # Observation window covers only a small part of the copper: deposition
+    # must still retain the rest of the trace and its return plane.
+    x, y = np.linspace(.012, .018, 25), np.linspace(.007, .013, 25)
+    heights = [.0025, -.002]
+    H = q.h_grid(r, [0, 1], x, y, heights)
+    X, Y, Z = np.meshgrid(x[::6], y[::6], heights, indexing='ij')
+    pts = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+    ref = q.h_field(r, [0, 1], pts).reshape(5, 5, 2, 3, 2)
+    assert abs(H[::6, ::6] - ref).max() < .01 * abs(ref).max()
+    assert q.h_grid(r, 1, x, y, heights) == pytest.approx(H[..., 1])
+    refined, info = q.h_grid(r, [0, 1], x, y, heights, rtol=.01, return_info=True)
+    assert info['converged'] and info['refine'] >= 2
+    assert abs(refined[::6, ::6]-ref).max() < abs(H[::6, ::6]-ref).max()
+    with pytest.raises(RuntimeError, match='did not converge'):
+        q.h_grid(r, 1, x, y, heights, rtol=.01, max_refine=1)
+
+
 def test_spectral_near_field_h_is_biot_savart():
     """mom25d.farfield.near_fields' H (magnetostatic, with the ground's image) against mom25d.biot on the same
     currents: a strip's RWG currents, random."""

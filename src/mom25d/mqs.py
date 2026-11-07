@@ -20,16 +20,20 @@ no node potentials), so a sweep is one small solve per frequency:
     partial inductances (parallel filaments), and the parts' series R, L, C.
 Horizontal and vertical currents do not couple (orthogonal); the parts' own fields count, their mutual inductance to
 the copper does not (a part's body: a short filament well above it).
+
+With capacitance=True, a homogeneous-dielectric surface-charge PEEC model
+replaces the closed-loop constraint by charge continuity (mom25d.peec).
+It also provides Maxwell capacitance and Coulomb E; see docs/quasistatic.md.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, diags, block_diag, csr_matrix
 from shapely.geometry import Point, box, shape
 from shapely.ops import unary_union
 
-from .base import MU0, RWG, combine, _BAR3, _W3, quad_pts
-from .sing import offplane_pairs
+from .base import MU0, RWG, combine, qform, _BAR3, _W3, quad_pts
+from .static import static_moments
 from .biot import rwg_currents, h_sheets, h_segments
 from .pdn.mesh import copper_of, mesh_sheet, stack_z
 
@@ -51,11 +55,47 @@ class Result:
     z: dict                         # {source: Z (nf,) complex}: the loop each source drives, its parts included
     names: list
     zc: dict = None                 # {source: Z (nf,)}: the copper of that loop alone (the parts' own Z left out)
+    charge: np.ndarray = None      # PEEC only: (nf, n_nodes), C
+    potential: np.ndarray = None   # PEEC only: (nf, n_nodes), V relative to infinity
 
 
 class MQS:
     def __init__(self, board, nets, terminals=None, region=None, dmax=0.5, sigma=SIGMA_CU, plating=0.025, log=print,
-                 fine=None, dmax_fine=None):
+                 fine=None, dmax_fine=None, near=3.0, outer_levels=1, capacitance=False, er=1.0,
+                 factor_cache_bytes=64 * 1024**2, conductor_loss='dc', conductor_faces=2,
+                 dielectric='homogeneous', dielectric_tol=1e-8, fill_backend='auto', fill_workers=None,
+                 fill_chunk=16384, fill_device=None):
+        """Mesh the selected copper. `near` controls analytic 1/R integration
+        (infinity: all pairs); `outer_levels` refines its close-pair quadrature.
+        `capacitance=True` enables surface-charge PEEC: homogeneous `er`, or
+        `dielectric='stack'` for the board's planar slabs and dielectric loss.
+        `conductor_loss='slab'` adds finite-thickness sheet impedance with
+        `conductor_faces` one or two; barrels retain their DC resistance.
+        PEEC's reusable frequency factors have a `factor_cache_bytes` budget.
+        `fill_backend` chooses auto/openmp/threaded/numpy/cupy; `fill_workers`
+        caps CPU parallelism and `fill_chunk` bounds pairs per tile. Device
+        backends use `fill_device`; `fill_info` records actual execution.
+        """
+        if not np.isfinite(er) or er <= 0:
+            raise ValueError('er must be finite and positive')
+        self.near, self.outer_levels, self.capacitance, self.er = near, outer_levels, capacitance, er
+        self._fill_options = dict(backend=fill_backend, workers=fill_workers, chunk=fill_chunk, device=fill_device)
+        self.fill_info = {}
+        if factor_cache_bytes < 0:
+            raise ValueError('factor_cache_bytes must be nonnegative')
+        self.factor_cache_bytes = factor_cache_bytes
+        if conductor_loss not in ('dc', 'slab') or conductor_faces not in (1, 2):
+            raise ValueError('conductor_loss must be dc or slab; conductor_faces must be 1 or 2')
+        self.conductor_loss, self.conductor_faces = conductor_loss, conductor_faces
+        if dielectric not in ('homogeneous', 'stack'):
+            raise ValueError('dielectric must be homogeneous or stack')
+        if dielectric == 'stack' and er != 1:
+            raise ValueError('er applies to homogeneous dielectric; stack uses board permittivities')
+        self.dielectric = dielectric
+        self._dielectric_stack = None
+        if dielectric == 'stack':
+            from .electrostatic import DielectricStack
+            self._dielectric_stack = DielectricStack.from_board(board, dielectric_tol)
         self.board, self.sigma, self.log = board, sigma, log
         self.nets = {nets} if isinstance(nets, str) else set(nets)
         zt = stack_z(board)
@@ -140,6 +180,9 @@ class MQS:
         self.parts = []                                       # dict(name, a, b, kind, R, L, C, part_h)
         self.plating = plating * 1e-3
         self._mats = None
+        self._copper = None
+        self._potential = None
+        self._peec = None
         log(f"mqs: {Nt:,} triangles on {len(self.layer_tris)} layer(s), {self.ne:,} edges, {self.nv} via segments, "
             f"{len(self.terms)} terminals")
 
@@ -148,39 +191,79 @@ class MQS:
         """A 1 A current source (scaled by solve's amps) through a part from terminal a to terminal b."""
         self.parts.append(dict(name=name, a=a, b=b, kind='I', part_h=part_h))
         self._mats = None
+        self._peec = None
 
     def element(self, name, a, b, R=0.0, L=0.0, C=None, ESR=None, ESL=None, part_h=0.5):
         """A series R, L (and C) through a part between terminals a and b."""
         self.parts.append(dict(name=name, a=a, b=b, kind='Z', R=ESR if ESR is not None else R,
                                L=ESL if ESL is not None else L, C=C, part_h=part_h))
         self._mats = None
+        self._peec = None
 
     # ---- the matrices ----
     def _edge_matrices(self):
-        r = self.rwg
-        Nt = len(self.tris)
-        M0 = np.zeros((Nt, Nt)); Mrx = np.zeros((Nt, Nt)); Mry = np.zeros((Nt, Nt)); Mrr = np.zeros((Nt, Nt))
-        layers = list(self.layer_tris)
-        for la in layers:
-            for lb in layers:
-                pa, pb = self.layer_tris[la], self.layer_tris[lb]
-                d = float(self.z_of[pa[0]] - self.z_of[pb[0]])
-                P, Q = np.meshgrid(pa, pb, indexing='ij')
-                m0, mro, mrs, mrr = offplane_pairs(self.nodes, self.tris, P.ravel(), Q.ravel(), d, chunk=200_000)
-                M0[np.ix_(pa, pb)] = m0.reshape(P.shape)
-                Mrx[np.ix_(pa, pb)] = mro[:, 0].reshape(P.shape)
-                Mry[np.ix_(pa, pb)] = mro[:, 1].reshape(P.shape)
-                Mrr[np.ix_(pa, pb)] = mrr.reshape(P.shape)
+        moments, info = static_moments(self.nodes, self.tris, self.z_of, self.near, self.outer_levels,
+                                       **self._fill_options, return_info=True)
+        nodes, M0, Mrx, Mry, Mrr = moments
+        self.fill_info['magnetic'] = info
+        self.log(f'mqs: {info["backend"]} matrix fill, {info["workers"]} worker(s), {info["seconds"]:.2f} s')
+        r = RWG(nodes, self.tris)
         L = MU0 / (4 * np.pi) * combine(r, Mrr, Mrx, Mry, M0)
         L = 0.5 * (L + L.T)
+        if self.capacitance and self._potential is None:
+            if self.dielectric == 'homogeneous':
+                self._set_potential(M0)
+                self.fill_info['capacitance'] = dict(info, reused_magnetic_moments=True)
+            else:
+                self._ensure_potential()
         # R: the Gram matrix of the RWG functions, each triangle at its sheet resistance
         Ar, Pq = r.area, quad_pts(r, _BAR3)
         rs = 1.0 / (self.sigma * self.t_of)
-        m = lambda v: np.diag(Ar * rs * (_W3[None, :] * v).sum(1))
-        R = combine(r, m((Pq ** 2).sum(-1)), m(Pq[..., 0]), m(Pq[..., 1]), np.diag(Ar * rs))
+        def gram(weights):
+            m = lambda v: diags(Ar * weights * (_W3[None, :] * v).sum(1))
+            return combine(r, m((Pq ** 2).sum(-1)), m(Pq[..., 0]), m(Pq[..., 1]), diags(Ar * weights)).tocsr()
+        R = gram(rs)
         # in total currents across each edge (i = l I): Z / (l_m l_n)
         s = 1.0 / r.l
-        return R * np.outer(s, s), L * np.outer(s, s)
+        scale = diags(s)
+        self._sheet_terms = []
+        if self.conductor_loss == 'slab':
+            for idx in self.layer_tris.values():
+                weights = np.zeros(len(self.tris)); weights[idx] = rs[idx]
+                self._sheet_terms.append((self.t_of[idx[0]], (scale @ gram(weights) @ scale).tocsr()))
+        return (scale @ R @ scale).tocsr(), L * np.outer(s, s)
+
+    def _resistance_delta(self, f):
+        from .conductor import surface_impedance
+        nb = len(self.br) + len(self.parts)
+        if self.conductor_loss == 'dc':
+            return csr_matrix((nb, nb), dtype=complex)
+        delta = csr_matrix((self.ne, self.ne), dtype=complex)
+        for t, R in self._sheet_terms:
+            ratio = surface_impedance(f, t, self.sigma, self.conductor_faces) * self.sigma * t
+            delta = delta + (ratio - 1) * R
+        return block_diag((delta, csr_matrix((nb-self.ne, nb-self.ne))), format='csr')
+
+    def _set_potential(self, M0, er=None):
+        from .base import EPS0
+        area = np.bincount(self.node_of, weights=self.rwg.area, minlength=self.n_nodes)
+        W = coo_matrix((1 / area[self.node_of], (np.arange(len(self.tris)), self.node_of)),
+                       shape=(len(self.tris), self.n_nodes)).tocsr()
+        self._potential = qform(W, M0, W) / (4 * np.pi * EPS0 * (self.er if er is None else er))
+
+    def _ensure_potential(self):
+        if self._potential is None:
+            if self.dielectric == 'stack':
+                from .electrostatic import potential_moments
+                self._set_potential(potential_moments(self), er=1.)
+            else:
+                moments, info = static_moments(self.nodes, self.tris, self.z_of, self.near,
+                                               self.outer_levels, scalar_only=True,
+                                               **self._fill_options, return_info=True)
+                _, M0 = moments
+                self.fill_info['capacitance'] = info
+                self._set_potential(M0)
+        return self._potential
 
     def _via_matrices(self):
         n = self.nv
@@ -191,9 +274,9 @@ class MQS:
             for j, (x2, y2, r2, z02, z12) in enumerate(self.vseg):
                 s = np.hypot(x - x2, y - y2) if i != j else rr
                 L[i, j] = filament_mutual(z0, z1, z02, z12, max(s, rr if i == j else 1e-7))
-        return np.diag(R), L
+        return diags(R).tocsr(), L
 
-    def _loops(self):
+    def _loops(self, allow_open=False, return_tree=False):
         """The loop basis: C (nbranch x nloop), the source loops' columns separate (sources' branches in no tree)."""
         nb = len(self.br) + len(self.parts)
         ends = list(self.br) + [(self.term_node[p['a']], self.term_node[p['b']]) for p in self.parts]
@@ -259,35 +342,55 @@ class MQS:
             col += 1
         C = coo_matrix((vals, (rows, cols)), shape=(nb, col)).tocsc()
         bad = [k for k in dead if is_src[k]]
-        if bad:
+        if bad and not allow_open:
             names = [self.parts[k - len(self.br)]['name'] for k in bad]
             raise ValueError(f"source(s) {', '.join(names)}: their terminals are on copper joined only through them "
                              f"(an island: a pad with no via or path to the rest): no loop to drive")
-        return C, src_cols, is_src
+        return (C, src_cols, is_src, tree) if return_tree else (C, src_cols, is_src)
 
     def _assemble(self):
         if self._mats is not None:
             return self._mats
         import time
         t = time.time()
-        Re, Le = self._edge_matrices()
-        Rv, Lv = self._via_matrices()
+        if self._copper is None:
+            Re, Le = self._edge_matrices()
+            Rv, Lv = self._via_matrices()
+            self._copper = Re, Le, Rv, Lv
+        Re, Le, Rv, Lv = self._copper
         ne, nv, npart = self.ne, self.nv, len(self.parts)
         nb = ne + nv + npart
-        R = np.zeros((nb, nb)); L = np.zeros((nb, nb))
-        R[:ne, :ne], L[:ne, :ne] = Re, Le
-        R[ne:ne + nv, ne:ne + nv], L[ne:ne + nv, ne:ne + nv] = Rv, Lv
-        C, src_cols, is_src = self._loops()
-        Cd = C.toarray()
-        Rl, Ll = Cd.T @ R @ Cd, Cd.T @ L @ Cd
-        self._mats = dict(R=R, L=L, C=Cd, Rl=Rl, Ll=Ll, src=src_cols, is_src=is_src, nb=nb)
-        self.log(f"mqs: {Cd.shape[1]:,} loops; matrices in {time.time() - t:.1f} s")
+        R = block_diag((Re, Rv, csr_matrix((npart, npart))), format='csr')
+        # The magnetic coupling has support only on copper branches. Parts
+        # carry their explicit RLC impedance separately, without padding L.
+        L = (Le, Lv)
+        C, src_cols, is_src, tree = self._loops(allow_open=self.capacitance, return_tree=True)
+        Rl, Ll = (None, None) if self.capacitance else (
+            (C.T @ R @ C).toarray(), self._project_inductance(C, Le, Lv))
+        self._mats = dict(R=R, L=L, C=C, Rl=Rl, Ll=Ll, src=src_cols, is_src=is_src, nb=nb, tree=tree)
+        self.log(f"mqs: {C.shape[1]:,} loops; matrices in {time.time() - t:.1f} s")
         return self._mats
+
+    def _project_inductance(self, basis, Le, Lv):
+        return qform(basis[:self.ne], Le, basis[:self.ne]) + qform(
+            basis[self.ne:self.ne + self.nv], Lv, basis[self.ne:self.ne + self.nv])
+
+    def _inductive_voltage(self, currents):
+        Le, Lv = self._mats['L']
+        out = np.zeros_like(currents, dtype=complex)
+        out[:self.ne] = Le @ currents[:self.ne]
+        out[self.ne:self.ne + self.nv] = Lv @ currents[self.ne:self.ne + self.nv]
+        return out
 
     def solve(self, freqs, amps=None):
         """The currents at each frequency (Hz) for the sources' currents (amps: {source: A}, default 1 A each)."""
-        m = self._assemble()
+        if self.capacitance:
+            from .peec import solve
+            return solve(self, freqs, amps)
         f = np.atleast_1d(np.asarray(freqs, float))
+        if f.ndim != 1 or not np.isfinite(f).all() or (f <= 0).any():
+            raise ValueError('frequencies must be finite and positive')
+        m = self._assemble()
         nb, ne, nv = m['nb'], self.ne, self.nv
         Cd = m['C']
         src = {self.parts[k - ne - nv]['name']: c for k, c in m['src'].items()}
@@ -302,7 +405,10 @@ class MQS:
             for k, p in enumerate(self.parts):
                 if p['kind'] == 'Z':
                     zp[ne + nv + k] = p['R'] + 1j * w * p['L'] + (1 / (1j * w * p['C']) if p.get('C') else 0)
-            Zl = m['Rl'] + 1j * w * m['Ll'] + (Cd.T * zp) @ Cd
+            Zl = m['Rl'] + 1j * w * m['Ll'] + (Cd.T @ diags(zp) @ Cd).toarray()
+            dR = self._resistance_delta(fi)
+            if dR.nnz:
+                Zl += (Cd.T @ dR @ Cd).toarray()
             x = np.zeros(Cd.shape[1], complex)
             for n, c in src.items():
                 x[c] = (amps or {}).get(n, 1.0)
@@ -310,12 +416,13 @@ class MQS:
             rhs = -Zl[np.ix_(free, sc)] @ x[sc]
             x[free] = np.linalg.solve(Zl[np.ix_(free, free)], rhs)
             I[i] = Cd @ x
-            v = (m['R'] + 1j * w * m['L']) @ I[i] + zp * I[i]      # branch voltages
+            v = (m['R'] + dR) @ I[i] + 1j * w * self._inductive_voltage(I[i]) + zp * I[i]
             for n, c in src.items():
                 k = next(kk for kk, cc in m['src'].items() if cc == c)
                 # Kirchhoff's voltage law round its loop: the drops in the rest of it are the copper loop's Z x I
-                Z[n][i] = (Cd[:, c] @ v - Cd[k, c] * v[k]) / x[c]
-                Zc[n][i] = (Cd[:, c] * cu) @ v / x[c]
+                column = Cd[:, c].toarray().ravel()
+                Z[n][i] = (column @ v - Cd[k, c] * v[k]) / x[c] if x[c] else np.nan
+                Zc[n][i] = (column * cu) @ v / x[c] if x[c] else np.nan
         return Result(f, I, Z, [p['name'] for p in self.parts], Zc)
 
     def moment(self, res, fi):
@@ -349,6 +456,55 @@ class MQS:
         return m
 
     # ---- the field ----
+    def capacitance_matrix(self):
+        """Maxwell capacitance (F), node conductor labels, terminal labels.
+        Requires capacitance=True; see mom25d.peec.capacitance_matrix.
+        """
+        if not self.capacitance:
+            raise ValueError('capacitance_matrix requires capacitance=True')
+        from .peec import capacitance_matrix
+        return capacitance_matrix(self)
+
+    def e_field(self, res, fi, pts):
+        """Electrostatic E (V/m) of PEEC's surface charges at points (m).
+        fi may be an index or a list, like h_field. Excludes inductive -jw A.
+        """
+        from .peec import electric_field
+        return electric_field(self, res, fi, pts)
+
+    def h_grid(self, res, fi, x, y, heights, refine=1, rtol=None, max_refine=8, return_info=False):
+        """Fast open-boundary FFT H on uniform x/y grids and absolute z heights
+        (all m). Shape (nx, ny, nh, 3), or (nx, ny, nh, 3, nf) for a list of fi.
+        `refine` increases internal resolution without changing output points.
+        `rtol` checks successive grids at each height/frequency, raising if
+        max_refine is reached without agreement. return_info adds metadata.
+        This is a grid check, not a mesh/model error bound. Use h_field for
+        individual points.
+        """
+        from .biot import h_grid
+        if rtol is not None and (not np.isfinite(rtol) or rtol <= 0):
+            raise ValueError('rtol must be finite and positive')
+        if not isinstance(max_refine, (int, np.integer)) or max_refine < refine:
+            raise ValueError('max_refine must be an integer at least refine')
+        H = h_grid(self, res, fi, x, y, heights, refine)
+        info = dict(refine=refine, converged=None, relative_change=None)
+        if rtol is not None:
+            while refine < max_refine:
+                refine = min(2 * refine, max_refine)
+                finer = h_grid(self, res, fi, x, y, heights, refine)
+                axes = (0, 1, 3)
+                scale = np.maximum(np.max(np.abs(finer), axis=axes), np.finfo(float).tiny)
+                error = np.max(np.abs(finer - H), axis=axes) / scale
+                H = finer
+                info = dict(refine=refine, converged=bool(np.all(error <= rtol)),
+                            relative_change=np.asarray(error).tolist())
+                if info['converged']:
+                    break
+            if not info['converged']:
+                raise RuntimeError(f'FFT field did not converge to {rtol:g} at refinement {refine}; '
+                                   f'relative change {info["relative_change"]}')
+        return (H, info) if return_info else H
+
     def h_field(self, res, fi, pts):
         """H (n, 3) complex, A/m, at points (n, 3), m, at frequency index fi (or a list of them: H (n, 3, k), the
         geometry made once for all): the sheets' currents (Biot-Savart), the vias' and the parts' filaments."""

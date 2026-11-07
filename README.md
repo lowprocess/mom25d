@@ -59,6 +59,16 @@ res = solve_board('coupler_board.json', np.linspace(1e9, 6e9, 101), dmax=0.3e-3)
 res.f, res.S, res.names, res.zref                  # Hz, (nf, n, n), port names, reference impedances
 ```
 
+For low-frequency copper currents and loop impedance, use `mom25d.mqs.MQS`.
+It includes a hybrid analytic/quadrature fill, FFT magnetic field maps, and
+optional distributed capacitance (`capacitance=True, er=...` or
+`dielectric='stack'`), dielectric loss, surface charges, Maxwell capacitance
+extraction, electrostatic E fields and finite-thickness slab conductor loss. See the
+[quasi-static guide](docs/quasistatic.md) for examples, validation and limits.
+Matrix filling uses the OpenMP core when built and a threaded NumPy fallback.
+Select `fill_backend` and `fill_workers` explicitly, or use the optional CuPy
+fill backend; [backend controls and extension protocol](docs/static-backends.md).
+
 `solve_board` builds the model, meshes it and runs an adaptive frequency sweep; its docstring lists the options
 (cell size, port kind, mixed-mode pairs, conductor loss, the GPU's tiled solver, the compiled core). The steps it
 wraps are public too:
@@ -90,6 +100,10 @@ f, S, info = solve_band(sim, 1e9, 6e9, points=101, zref=m.port_z0)
 | `blr.py`, `hodlr.py` | the compressed solvers: block low-rank, hierarchical |
 | `afs.py`, `run.py` | the adaptive frequency sweep |
 | `farfield.py` | far and near fields from the currents |
+| `mqs.py`, `static.py`, `biot.py` | quasi-static copper currents, hybrid 1/R integration, direct and FFT H |
+| `peec.py`, `electrostatic.py` | surface charge, layered dielectric capacitance/loss and Coulomb E |
+| `conductor.py` | optional finite-thickness slab surface impedance |
+| `pdn/` | DC voltage drop and plane-pair power integrity |
 | `core/` | the compiled C++ kernels |
 | `kicad2ems/` | kicad2ems's solver plugins, `mom25d` and `mixed` (the `kicad2ems.solvers` entry points; only kicad2ems imports them) |
 

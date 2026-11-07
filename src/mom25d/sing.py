@@ -11,48 +11,71 @@ import numpy as np
 from .base import _BAR6, _W6, edge_frames
 
 
-def offplane_pairs(nodes, tris, p_idx, q_idx, d, chunk=4000):
+def offplane_pairs(nodes, tris, p_idx, q_idx, d, chunk=4000, outer_levels=0, _geometry=None, scalar_only=False):
     """
     For pairs (p, q) of triangles (observation p, source q) at vertical offset d:
       m0  = int_p int_q 1/R
       mro = int_p r int_q 1/R          (observation-weighted, 2-vector)
       mrs = int_p int_q r'/R           (source-weighted, 2-vector)
       mrr = int_p int_q r.r'/R
+    d may be a scalar or one offset per pair. outer_levels subdivides the observation
+    triangle into four per level, improving self and near-singular terms.
+    With scalar_only=True, returns just m0 without computing current moments.
     """
     p_idx, q_idx = np.asarray(p_idx), np.asarray(q_idx)
     n = len(p_idx)
-    m0 = np.zeros(n); mro = np.zeros((n, 2)); mrs = np.zeros((n, 2)); mrr = np.zeros(n)
-    V = nodes[tris]
-    e, L, tau, un = edge_frames(V)
-    Ar = 0.5 * np.abs(e[:, 0, 0] * (-e[:, 2, 1]) - e[:, 0, 1] * (-e[:, 2, 0]))
-    P = np.einsum('qk,tkc->tqc', _BAR6, V)
-    ad = abs(d)
+    m0 = np.zeros(n)
+    if not scalar_only:
+        mro = np.zeros((n, 2)); mrs = np.zeros((n, 2)); mrr = np.zeros(n)
+    V, L, tau, un, Ar, P, weights = (_offplane_geometry(nodes, tris, outer_levels)
+                                     if _geometry is None else _geometry)
+    offsets = np.broadcast_to(np.asarray(d, float), (n,))
     for c0 in range(0, n, chunk):
         sl = slice(c0, min(n, c0 + chunk))
         pp, qq = p_idx[sl], q_idx[sl]
+        dz = offsets[sl, None, None]
+        ad = np.abs(dz)
         r = P[pp]                                          # (m,6,2)
         Vq, tq, uq, Lq = V[qq], tau[qq], un[qq], L[qq]     # (m,3,2)...
         dv = Vq[:, None, :, :] - r[:, :, None, :]          # (m,6,3,2)
         sm = (dv * tq[:, None]).sum(-1)
         sp = sm + Lq[:, None, :]
         t0 = (dv * uq[:, None]).sum(-1)
-        R02 = t0 ** 2 + d * d
+        R02 = t0 ** 2 + dz * dz
         R0 = np.sqrt(R02)
         Rm, Rp = np.sqrt(R02 + sm ** 2), np.sqrt(R02 + sp ** 2)
         ok = R0 > 1e-14 * Lq[:, None, :]
         R0s = np.where(ok, R0, 1.0)
         lg = np.where(ok, np.arcsinh(sp / R0s) - np.arcsinh(sm / R0s), 0.0)
         beta = np.arctan2(t0 * sp, R02 + ad * Rp) - np.arctan2(t0 * sm, R02 + ad * Rm)
-        I1 = (t0 * lg - ad * beta).sum(-1)                                   # (m,6)
+        I1 = (t0 * lg - ad * beta).sum(-1)
+        wq = (weights[None, :] * Ar[pp][:, None])
+        m0[sl] = (wq * I1).sum(1)
+        if scalar_only:
+            continue
         eR = 0.5 * (R02 * lg + sp * Rp - sm * Rm)
         IR = (eR[..., None] * uq[:, None]).sum(-2)                           # (m,6,2)
         W = IR + r * I1[..., None]                                           # int r'/R
-        wq = (_W6[None, :] * Ar[pp][:, None])                                # (m,6)
-        m0[sl] = (wq * I1).sum(1)
         mro[sl] = (wq[..., None] * r * I1[..., None]).sum(1)
         mrs[sl] = (wq[..., None] * W).sum(1)
         mrr[sl] = (wq * (r * W).sum(-1)).sum(1)
-    return m0, mro, mrs, mrr
+    return m0 if scalar_only else (m0, mro, mrs, mrr)
+
+
+def _offplane_geometry(nodes, tris, outer_levels=0):
+    V = nodes[tris]
+    e, L, tau, un = edge_frames(V)
+    Ar = 0.5 * np.abs(e[:, 0, 0] * (-e[:, 2, 1]) - e[:, 0, 1] * (-e[:, 2, 0]))
+    bar, weights = _BAR6, _W6
+    if outer_levels:
+        from .biot import _split4
+        ref = np.eye(3)[None]
+        for _ in range(outer_levels):
+            ref = _split4(ref)
+        bar = np.einsum('qk,tkc->tqc', _BAR6, ref).reshape(-1, 3)
+        weights = np.tile(_W6, len(ref)) / len(ref)
+    P = np.einsum('qk,tkc->tqc', bar, V)
+    return V, L, tau, un, Ar, P, weights
 
 
 def offplane_moments(cA, cq, m):

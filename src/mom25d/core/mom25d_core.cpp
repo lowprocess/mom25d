@@ -726,8 +726,17 @@ py::array_t<C> project_t(py::array_t<C, py::array::c_style> Z, arr<int> keep, ar
     return out;
 }
 
+#include "static_kernels.hpp"
+
 PYBIND11_MODULE(_core, m) {
     m.doc() = "compiled kernels for mom25d";
+    m.def("static_pairs", &static_pairs, "quasi-static pair batches, host float64, explicit OpenMP worker count");
+    m.def("static_thread_count", &static_thread_count);
+#ifdef _OPENMP
+    m.attr("static_openmp") = true;
+#else
+    m.attr("static_openmp") = false;
+#endif
     m.def("fill_far", &fill_far_t<cd>, "far-field entries into a complex128 Z");
     m.def("fill_far_c64", &fill_far_t<cf>, "far-field entries into a complex64 Z");
     m.def("far_block", &far_block);

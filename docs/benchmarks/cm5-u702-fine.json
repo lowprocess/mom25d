@@ -1,0 +1,76 @@
+{
+  "source": "CM5_MINIMA_3_board.json",
+  "sha256": "d10765e70e51b890915360ca716c3592d198d02c05bb9aadc6edaf604f95a27c",
+  "converter": "U702",
+  "capacitors": [
+    "C704",
+    "C705",
+    "C706"
+  ],
+  "region_mm": [
+    122.28,
+    -76.51,
+    131.69,
+    -62.84
+  ],
+  "dmax_mm": 1.5,
+  "fine_mm": 0.6,
+  "layers": [
+    "B.Cu",
+    "In4.Cu",
+    "In3.Cu",
+    "In2.Cu",
+    "In1.Cu",
+    "F.Cu"
+  ],
+  "triangles": 9736,
+  "edges": 11709,
+  "vias": 85,
+  "loops": 2914,
+  "setup_s": 0.653969307999887,
+  "solve_s": 66.81210822799994,
+  "fft_field_s": 0.34891182199999093,
+  "field_convergence": {
+    "refine": 2,
+    "converged": true,
+    "relative_change": [
+      [
+        0.019692126256512118,
+        0.012631794049280146,
+        0.010550792282325703
+      ],
+      [
+        0.007414735334290891,
+        0.002722023716658609,
+        0.0015262573686246317
+      ]
+    ]
+  },
+  "direct_relative_max_error": 0.009165170461675589,
+  "copper_matrix_bytes": 1097485256,
+  "frequencies_hz": [
+    1000.0,
+    1000000.0,
+    10000000.0
+  ],
+  "loop_R_ohm": [
+    0.005598606544590639,
+    0.008377968426006714,
+    0.026800361860043916
+  ],
+  "loop_L_h": [
+    2.229898499216169e-09,
+    1.1929889677024533e-09,
+    1.3729196615270186e-09
+  ],
+  "assumptions": {
+    "capacitor_ESR_ohm": 0.003,
+    "capacitor_ESL_h": 4e-10,
+    "conductor": "DC sheets",
+    "cropped_return": true
+  },
+  "source_url": "https://gitlab.com/kicad/code/kicad/-/raw/master/demos/cm5_minima/CM5_MINIMA_3.kicad_pcb",
+  "source_kicad_sha256": "123e209e6245cbcc344c1c70b425dcb44a12cd0a2d05f00a39d3f2e7ff307ffa",
+  "source_revision": "085c61811bbbbd21cc0801ca416541af8d15986c",
+  "source_pinned_url": "https://gitlab.com/kicad/code/kicad/-/raw/085c61811bbbbd21cc0801ca416541af8d15986c/demos/cm5_minima/CM5_MINIMA_3.kicad_pcb"
+}
