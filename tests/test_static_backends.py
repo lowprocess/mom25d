@@ -181,7 +181,8 @@ def test_portable_gpu_formula_on_host_namespace(mesh, level, scalar_only):
     assert actual == pytest.approx(e.evaluate(p, q, d, kind, scalar_only), rel=1e-12, abs=1e-27)
 
 
-def test_actual_cupy_backend_when_device_available(mesh):
+@pytest.mark.parametrize('level', [0, 1, 2])
+def test_actual_cupy_backend_when_device_available(mesh, level):
     pytest.importorskip('cupy')
     import cupy as cp
     try:
@@ -189,7 +190,10 @@ def test_actual_cupy_backend_when_device_available(mesh):
     except Exception as exc:
         pytest.skip(f'CuPy device unavailable: {exc}')
     for scalar in (False, True):
-        expected = static_moments(*mesh, backend='numpy', scalar_only=scalar)
-        actual = static_moments(*mesh, backend='cupy', device=0, scalar_only=scalar)
+        expected = static_moments(*mesh, backend='numpy', scalar_only=scalar, outer_levels=level)
+        actual = static_moments(*mesh, backend='cupy', device=0, scalar_only=scalar, outer_levels=level)
         for a, b in zip(expected, actual):
             assert b == pytest.approx(a, rel=2e-10, abs=1e-26)
+        again = static_moments(*mesh, backend='cupy', device=0, scalar_only=scalar,
+                               outer_levels=level, chunk=3)
+        assert all(np.array_equal(a, b) for a, b in zip(actual, again))

@@ -82,16 +82,19 @@ q = MQS(board, nets=nets, terminals=terminals,
 ```
 
 The backend uploads geometry once and evaluates both near analytic integrals
-and far product quadrature on the selected device. Only bounded pair inputs
+and far product quadrature on the selected device. A fused CUDA/HIP kernel
+assigns one thread per pair, keeping observation reductions local and avoiding
+intermediate quadrature arrays and chains of small CuPy operations. Only bounded pair inputs
 and float64 results cross the device boundary; there is no dense GPU matrix.
 Each batch synchronizes before host assembly. CPU worker counts do not create
 multiple GPU submitters. Initialization, allocation and kernel errors propagate.
 
 This is an **experimental optional backend**: its formulas are independently
 checked on a host array namespace, and hardware tests run when CuPy and a
-working device are present. This development environment has neither a CuPy
-runtime nor GPU validation results. GPU performance, driver compatibility
-and consumer-device FP64 throughput must be measured on target hardware.
+working device are present. Local validation on an RX 7800 XT with CuPy 14.2.0/ROCm now covers the
+real device path, all close-quadrature levels, magnetic/scalar fills and MQS,
+PEEC and electrostatic solver tests. Other device/driver combinations and
+consumer-device FP64 throughput still need target-hardware measurements.
 Selecting a GPU fill does not move RWG projection or the linear solve to GPU.
 
 ## Add a backend

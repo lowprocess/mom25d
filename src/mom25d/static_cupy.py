@@ -5,9 +5,6 @@ results cross the device boundary; dense matrices remain on the host.
 """
 import numpy as np
 
-from .static_backends import _far
-
-
 def _analytic(xp, geometry, p, q, dz, scalar_only):
     V, length, tau, un, area, points, weights = geometry
     r = points[p]
@@ -55,19 +52,23 @@ class CupyBackend:
                 self.points, self.area = cp.asarray(geometry.points), cp.asarray(geometry.area)
         except Exception as exc:
             raise RuntimeError(f'CuPy fill could not initialize device {device}: {exc}') from exc
+        from .static_cupy_kernels import SOURCE
+        self.kernel = cp.RawKernel(SOURCE, 'static_pairs')
         self.cp, self.chunk = cp, chunk
 
     def evaluate(self, p, q, d, kind, scalar_only):
         cp = self.cp
         with self.device:
             out = cp.empty((len(p), 1 if scalar_only else 6), dtype=cp.float64)
-            for level in np.unique(kind):
-                indices = np.flatnonzero(kind == level)
-                step = min(self.chunk, 4096 if level < 0 else max(1, 4096//4**int(level)))
-                for start in range(0, len(indices), step):
-                    ids = indices[start:start+step]
-                    pp, qq, dz = cp.asarray(p[ids]), cp.asarray(q[ids]), cp.asarray(d[ids])
-                    result = (_far(cp, self.points, self.area, pp, qq, dz, scalar_only) if level < 0 else
-                              _analytic(cp, self.levels[int(level)], pp, qq, dz, scalar_only))
-                    out[cp.asarray(ids)] = result
+            if len(p):
+                # Upload one bounded pair tile, launch one fused integration kernel,
+                # then download once. No per-level Python scheduling or ufunc chains.
+                levels = [self.levels.get(k, self.levels[0]) for k in range(3)]
+                V, length, tau, un, area, _, _ = self.levels[0]
+                quadrature = tuple(a for level in levels for a in (level[5], level[6], np.int32(len(level[6]))))
+                inputs = (cp.asarray(p, dtype=cp.int32), cp.asarray(q, dtype=cp.int32),
+                          cp.asarray(d, dtype=cp.float64), cp.asarray(kind, dtype=cp.int32))
+                self.kernel(((len(p)+127)//128,), (128,),
+                            (V, length, tau, un, area, self.points, *quadrature,
+                             *inputs, np.int32(len(p)), np.int32(scalar_only), out))
             return cp.asnumpy(out)

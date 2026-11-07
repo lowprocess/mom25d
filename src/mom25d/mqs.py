@@ -544,3 +544,8 @@ class MQS:
 def _inside(poly, pts):
     import shapely
     return shapely.contains_xy(poly.buffer(1e-6), pts[:, 0], pts[:, 1])
+
+
+if __name__ == '__main__':
+    from mom25d.mqs_cli import main
+    raise SystemExit(main())

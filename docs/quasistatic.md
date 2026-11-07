@@ -213,3 +213,47 @@ All three synthetic converter layouts also complete with converged FFT dumps:
 the good/far/slot cases took approximately 1.3/4.7/3.4 s for planes and volume,
 with 4,140/5,326/5,588 triangles respectively. These runs use the demo's
 unchanged meshes, RLC assumptions and source waveform.
+
+## Converter command and GUI
+
+```sh
+python -m mom25d.mqs --describe --json
+python -m mom25d.mqs board.kicad_pcb --list-converters
+python -m mom25d.mqs board.kicad_pcb --converter U702 --vin +5V \
+  --capacitors C704,C705,C706 --fsw 500000 --current 3 --duty .33 \
+  --heights 1,3,10 --fill-backend openmp --fill-workers 8 --out nearfield_U702
+```
+
+The command reads KiCad through kicad2ems, or a previously exported board JSON.
+It identifies candidate regulators from power-inductor/IC switch-net connectivity
+and input-to-ground capacitors. A unique candidate and supply can be selected
+automatically; ambiguous candidates require `--converter` and/or `--vin`.
+`--inductor`, `--ground`, `--capacitors` and `--cap-radius` refine selection.
+Only populated parts with usable copper pads participate. Discovery is a buck
+input-loop heuristic, not recognition of arbitrary converter topologies.
+
+The selected regulator's input and ground pads define the source. Input
+capacitors close the loop through their copper. Their values come from the
+board; `--esr`, `--esl` and `--part-height` are explicit modeling assumptions.
+The copper and scan region are the selected pad extent plus `--margin`.
+`--dmax` and `--fine` control coarse and local mesh spacing. This model uses
+DC sheet loss, explicit return copper and the magnetic MQS solve.
+
+`--current` is the assumed input-pulse amplitude (approximately buck load
+current), `--duty` its duty fraction, and `--edge-time` its smoothing time.
+Alternatively `--vin-volts` and `--vout` set ideal buck duty Vout/Vin.
+Harmonic amplitudes are peak A: `2 I D |sinc(n D) sinc(n fsw tr)|`.
+The model omits switch-node E and output-inductor core/winding leakage.
+
+Outputs are `mqs.json` (selection, settings, copper R/L, complex dipole moment,
+peak H per harmonic/height, fill metadata, FFT convergence and assumptions),
+`mesh.npz`, H-map figures, `spectrum.png`, and standard frequency-domain H dumps
+under `mqs/exc_converter`. Multiple heights also produce a rectilinear volume
+through those heights. Dump coordinates are mm and fields are complex A/m;
+summary dipole moments are A m². The GUI's **Near field** page obtains its
+settings from `--describe --json`, runs the command in a separate process and
+opens its field results in the Viewer, including Cut and 3D views.
+
+Use successive mesh and crop refinements to check physical convergence;
+`--field-tol` only controls FFT deposition-grid convergence. Whole-board dense
+storage, crop/hardware validation and resolved package models remain open.
