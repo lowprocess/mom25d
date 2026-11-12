@@ -344,6 +344,7 @@ class MoM25D(Solver):
     api = (2, 3)                    # kicad2ems.api (2.3: the roughness row)
     name, aliases, label = 'mom25d', ('mom',), 'mom25d (MoM)'
     consumes, previewed, rank, order = 'board', False, 1, 20     # order: after openEMS in kicad2ems's lists
+    basic = ('mom_dmax',)           # what a run is set up with, of its options (kicad2ems 2.9: Solver.basic)
     capabilities = dict(ports='yes: lumped, or de-embedded wave ports on a long enough feed', gap_ports='no',
                         diff_pairs='yes', parts='yes: one series element across the gap',
                         vias='yes: over the layers with metal at the via',
