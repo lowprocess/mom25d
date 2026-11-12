@@ -147,7 +147,7 @@ def test_a_hole_s_potential_and_admittance():
     C = fk.Y((fr, 0), (fr, 0)).imag / (2 * np.pi * 1e8)
     C1 = FrillKernels(1e9, st, [fr], [2, 3], 10e-3).Y((fr, 0), (fr, 0)).imag / (2 * np.pi * 1e9)
     assert 40e-15 < C < 120e-15 and C1 == pytest.approx(C, rel=0.01)
-    assert fk.Y((fr, 0), (fr, 1)) == fk.Y((fr, 1), (fr, 0))
+    assert fk.Y((fr, 0), (fr, 1)) == pytest.approx(fk.Y((fr, 1), (fr, 0)), rel=1e-12)       # (symmetric to rounding)
     Cm = fk.Y((fr, 0), (fr2, 0)).imag / (2 * np.pi * 1e8)
     assert -0.01 * C < Cm < 0 and fk.Y((fr, 0), (Frill(NS(x=0.0, y=0.0, a=a), 2, b), 0)) == 0.0     # another plane
     # the first shape: 1 V across the hole (its transform's integral: int e dkr = int g drho); the coaxial field's
