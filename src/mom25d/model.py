@@ -112,8 +112,16 @@ class PlanarModel:
                 if kp != kn or not np.allclose(dp_, dn, atol=1e-6):
                     raise ValueError(f"{name}: + and - legs must be on the same layer with the same direction")
                 win, need = self._wave_window(max(wp, wn), min(Lp, Ln), step)
+                low = ''
+                if win is not None and sp['legs']['+'].get('kind', 'auto') == 'auto' and fmin:
+                    # as a single port's below: the cuts have to span KNOWN_SPAN at the lowest frequency, or the
+                    # two waves cannot be told apart (a 10 mm feed at 50 MHz: every term wrong, |Sdd21| -48 dB)
+                    beta = 2 * np.pi * fmin * np.sqrt(0.5 * (self.stack.layers[kp - 1].er + 1)) / C0
+                    if (win[2] - win[1]) * beta < KNOWN_SPAN:
+                        need = max(need, min(Lp, Ln) - (win[2] - win[1]) + KNOWN_SPAN / beta)
+                        win, low = None, f" down to {fmin / 1e9:g} GHz"
                 if win is None:
-                    raise ValueError(f"{name}: straight coupled feed too short for a differential wave port "
+                    raise ValueError(f"{name}: straight coupled feed too short for a differential wave port{low} "
                                      f"({min(Lp, Ln) * 1e3:.2f} mm, need {need * 1e3:.2f} mm)")
                 out.append(DiffPort(wave(kp, cp, dp_, wp, win), wave(kp, cn, dp_, wn, win), 100.0, 25.0, name=name))
                 continue

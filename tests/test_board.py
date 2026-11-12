@@ -45,8 +45,16 @@ def test_ground_found_and_differential_ports():
     assert [type(p) for p in ps] == [DiffPort, DiffPort] and [p.name for p in ps] == ['P1', 'P2']
     assert ps[0].pos.w == pytest.approx(0.25e-3, rel=1e-6)
     assert abs((ps[0].pos.c - ps[0].neg.c) @ ps[0].pos.t) == pytest.approx(0.45e-3, rel=1e-3)
+    # a pair's wave port needs its cuts to span enough of a wavelength at the lowest frequency, as a single port's
+    # does: with port auto it is refused below that (kicad2ems then solves the legs as lumped ports), with wave not
+    assert len(m.ports(dmax=0.3e-3, fmin=1e9)) == 2
+    with pytest.raises(ValueError, match=r'P1: straight coupled feed too short for a differential wave port down to '
+                                         r'0\.05 GHz \(\d+\.\d+ mm, need \d+\.\d+ mm\)'):
+        m.ports(dmax=0.3e-3, fmin=5e7)
+    assert len(BoardModel(data, pairs=True, port='wave', log=quiet).ports(dmax=0.3e-3, fmin=5e7)) == 2
     single = BoardModel(data, log=quiet)
     assert [sp['name'] for sp in single.port_specs] == ['P1+', 'P1-', 'P2+', 'P2-']
+    assert [type(p).__name__ for p in single.ports(dmax=0.3e-3, fmin=5e7)] == ['ViaPort'] * 4     # lumped legs
     data['ground'] = None
     assert BoardModel(data, log=quiet).ground == 'B.Cu'                    # the solid plane --ground made
 
