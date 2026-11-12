@@ -95,12 +95,17 @@ class LayerStack:
     top='pec' : PEC cover on interface N (metal allowed on 1..N-1)  -> stripline-type stacks
     bottom='pec' : a PEC ground at z = 0 (interface 0 is the ground; the default)
     bottom='open': a half-space of permittivity bottom_er below layer 1, metal allowed on interface 0 too
+    pec          : interfaces (1..N-1) that are PEC planes inside the stack: no metal on them, and what is above
+                   one is decoupled from what is below it (two stacks in one: each sees the plane as its ground
+                   or its cover). A via through such a plane couples them (frill.py).
     """
-    def __init__(self, layers, top='open', top_er=1.0, bottom='pec', bottom_er=1.0):
+    def __init__(self, layers, top='open', top_er=1.0, bottom='pec', bottom_er=1.0, pec=()):
         assert top in ('open', 'pec') and bottom in ('open', 'pec')
         self.layers, self.top, self.top_er = list(layers), top, top_er
         self.bottom, self.bottom_er = bottom, bottom_er
         self.N = len(self.layers)
+        self.pec = tuple(sorted({int(k) for k in pec}))
+        assert all(0 < k < self.N for k in self.pec), "an internal PEC plane is on an interface between two layers"
         self.z = np.concatenate([[0.0], np.cumsum([l.h for l in self.layers])])
         for i, l in enumerate(self.layers):
             if l.name is None:
@@ -128,11 +133,22 @@ class LayerStack:
 
     @property
     def metal_interfaces(self):
-        return list(range(0 if self.bottom == 'open' else 1, self.N + 1 if self.top == 'open' else self.N))
+        return [k for k in range(0 if self.bottom == 'open' else 1, self.N + 1 if self.top == 'open' else self.N)
+                if k not in self.pec]
 
     def is_pec(self, k):
-        """Interface k is a PEC plane of the stack itself (the ground, a cover), not meshed metal."""
-        return (k == 0 and self.bottom == 'pec') or (k == self.N and self.top == 'pec')
+        """Interface k is a PEC plane of the stack itself (the ground, a cover, a plane inside it), not meshed
+        metal."""
+        return (k == 0 and self.bottom == 'pec') or (k == self.N and self.top == 'pec') or k in self.pec
+
+    def side(self, k):
+        """Which part of the stack interface k is in: the number of internal PEC planes below it. Interfaces of
+        different parts do not see each other."""
+        return sum(p < k for p in self.pec)
+
+    def apart(self, a, b):
+        """A PEC plane of the stack lies between interfaces a and b (or one of them is one)."""
+        return self.is_pec(a) or self.is_pec(b) or self.side(a) != self.side(b)
 
     @property
     def hmin(self):
@@ -151,9 +167,9 @@ class LayerStack:
     def nearest_discontinuity(self, k):
         """Distance from interface k to the closest interface with a permittivity step, or a ground."""
         down = next((self.z[k] - self.z[j] for j in range(k - 1, -1, -1)
-                     if (j == 0 and self.bottom == 'pec') or self.eps(j) != self.eps(j + 1)), np.inf)
+                     if self.is_pec(j) or self.eps(j) != self.eps(j + 1)), np.inf)
         up = next((self.z[j] - self.z[k] for j in range(k + 1, self.N + 1)
-                   if (self.top == 'pec' and j == self.N) or self.eps(j) != self.eps(j + 1)), np.inf)
+                   if self.is_pec(j) or self.eps(j) != self.eps(j + 1)), np.inf)
         return min(down, up)
 
     def max_er(self):
@@ -177,21 +193,44 @@ class LayerStack:
             Yd[1], kfirst = -1j * Y0[1] / tn[1], 2  # shorted by the ground plane
         else:
             Yd[0], kfirst = y0(complex(self.bottom_er))[0], 1     # the half-space below
-        for k in range(kfirst, N + 1):
-            Yd[k] = Y0[k] * (Yd[k - 1] + 1j * Y0[k] * tn[k]) / (Y0[k] + 1j * Yd[k - 1] * tn[k])
+        for k in range(kfirst, N + 1):              # (Yd of a plane inside the stack: into what is below it)
+            Yd[k] = -1j * Y0[k] / tn[k] if k - 1 in self.pec else \
+                Y0[k] * (Yd[k - 1] + 1j * Y0[k] * tn[k]) / (Y0[k] + 1j * Yd[k - 1] * tn[k])
         Yu = [None] * (N + 1)                       # looking up from interface k
         if self.top == 'open':
             Yu[N], kstart = y0(complex(self.top_er))[0], N
         else:
             Yu[N - 1], kstart = -1j * Y0[N] / tn[N], N - 1      # shorted by the top cover
-        for k in range(kstart, 0 if self.bottom == 'open' else 1, -1):
-            Yu[k - 1] = Y0[k] * (Yu[k] + 1j * Y0[k] * tn[k]) / (Y0[k] + 1j * Yu[k] * tn[k])
+        for k in range(kstart, 0 if self.bottom == 'open' else 1, -1):      # (Yu of such a plane: into what is above)
+            Yu[k - 1] = -1j * Y0[k] / tn[k] if k in self.pec else \
+                Y0[k] * (Yu[k] + 1j * Y0[k] * tn[k]) / (Y0[k] + 1j * Yu[k] * tn[k])
         return Y0, tn, sc, Yd, Yu
+
+    def reaches(self, p, k):
+        """The field of a hole in the PEC plane p reaches interface k: k is no PEC plane, and none lies between."""
+        return not self.is_pec(k) and not any(min(p, k) < q < max(p, k) for q in self.pec)
+
+    def transfer(self, kr, w, p, k, mode='e'):
+        """The voltage at interface k of the network driven by a unit voltage at the PEC plane p in place of its
+        short (an aperture in the plane: frill.py), k on either side of it; 1 at p itself, 0 at another PEC
+        plane or beyond one."""
+        one = np.ones_like(np.asarray(kr, complex))
+        if k == p:
+            return one
+        if not self.reaches(p, k):
+            return 0 * one
+        Y0, tn, sc, Yd, Yu = self._network(kr, w, mode)
+        v = one
+        for j in range(p + 1, k + 1):               # up through layer j, load Yu[j]
+            v = v * sc[j] / (1 + 1j * (Yu[j] / Y0[j]) * tn[j])
+        for j in range(p, k, -1):                   # down through layer j, load Yd[j - 1]
+            v = v * sc[j] / (1 + 1j * (Yd[j - 1] / Y0[j]) * tn[j])
+        return v
 
     def voltage(self, kr, w, o, s, mode):
         """Voltage at interface o for a unit shunt current source at interface s, in the TM ('e') or TE ('h')
-        transmission-line network of the stack. Zero at a PEC interface (either end)."""
-        if self.is_pec(o) or self.is_pec(s):
+        transmission-line network of the stack. Zero at a PEC interface (either end), and across one."""
+        if self.apart(o, s):
             return np.zeros_like(np.asarray(kr, complex))
         Y0, tn, sc, Yd, Yu = self._network(kr, w, mode)
         v = 1.0 / (Yu[s] + Yd[s])

@@ -317,7 +317,9 @@ class Simulation:
                  solver='dense', aca_tol=1e-4, refine=1.0e-3, precision='auto', gpu='auto', verbose=True, title='',
                  mesh_only=False, tiled='auto', core='auto', quads=False, quad_tol=35.0, zone=None, dmax_out=None,
                  signal_vias='round', stitching_vias='auto', signal=None, via_barrel=True, line_basis=None,
-                 line_w_max=2.0e-3, line_step=2.0, coarsen=None, grow=0.5, structured='auto', gap_rings=(1/4, 1/8, 1/16)):
+                 line_w_max=2.0e-3, line_step=2.0, coarsen=None, grow=0.5, structured='auto', gap_rings=(1/4, 1/8, 1/16),
+                 frills=()):
+        # frills (frill.Frill): the holes of the stack's internal PEC planes (stack.pec) that a via runs through
         # mesh_only: stop once the mesh and the unknowns (Ne, Nv) are known (a cost estimate; nothing to solve with)
         # coarsen (experimental): cells grow from dmax at the features (corners, vias, ports) to coarsen x dmax away
         # from them, by grow x the distance (geo.mesh_polygons): straight runs and plane interiors in larger cells.
@@ -338,6 +340,10 @@ class Simulation:
         self.ports = [m for p in ports for m in (p.modes() if isinstance(p, DiffPort) else [p])]
         self.vias, self.lumped = list(vias), list(lumped)
         self.vias += [p.via for p in self.ports if isinstance(p, ViaPort) and p.via not in self.vias]
+        self.frills = list(frills)
+        for fr in self.frills:
+            assert fr.k in stack.pec and fr.via in self.vias and fr.via.k_bot < fr.k < fr.via.k_top, \
+                f"a hole is in a PEC plane inside the stack, around a via through it (M{fr.k}, {fr.via.name})"
         self.layers = sorted(shapes)
         for k in self.layers:
             assert k in stack.metal_interfaces, f"interface {k} cannot carry metal in this stack"
@@ -372,8 +378,11 @@ class Simulation:
         # ---- via chains: split where the via touches metal ------------------------------
         self.chains = []                  # (via, k_bot, k_top)
         self.via_attach = []              # per via: list of metal interfaces it attaches to
+        holes = {(id(fr.via), fr.k) for fr in self.frills}
         for v in self.vias:
-            on = lambda k: k in geoms and geoms[k].buffer(1e-9).contains(shapely.Point(v.x, v.y))
+            # (a PEC plane inside the stack holds every via through it that has no hole there)
+            on = lambda k: (k in geoms and geoms[k].buffer(1e-9).contains(shapely.Point(v.x, v.y))) or \
+                (k in stack.pec and (id(v), k) not in holes)
             for k in (v.k_bot, v.k_top):
                 assert stack.is_pec(k) or on(k), \
                     f"via {v.name} ends on M{k} where there is no metal"
@@ -459,7 +468,8 @@ class Simulation:
             self.rwg, self.tri_layer = RWG(np.vstack(nodes), np.vstack(tris)), np.concatenate(tl)
             self.edge_layer = self.tri_layer[self.rwg.tp]
         r = self.rwg
-        self.Ne, self.Nv = r.Ne, len(self.chains)
+        # Nv: the chains, then the holes' unknowns (their field shapes' amplitudes: frill.py)
+        self.Ne, self.Nv = r.Ne, len(self.chains) + sum(fr.modes for fr in self.frills)
         if mesh_only:
             return
         self.tri_idx = {k: np.nonzero(self.tri_layer == k)[0] for k in self.layers}
@@ -476,7 +486,8 @@ class Simulation:
                 if (i, k) in self.fan:
                     ts = self.fan[(i, k)]
                     self.dF[[fpos[t] for t in ts], n] += div / r.area[ts].sum()
-        self.log.note(f"mesh: {Nt} triangles, {r.Ne} edge + {self.Nv} via unknowns  ("
+        self.log.note(f"mesh: {Nt} triangles, {r.Ne} edge + {len(self.chains)} via unknowns"
+                      + (f" + {len(self.frills)} holes in PEC planes" if self.frills else '') + "  ("
                       + ", ".join(f"M{k}: {len(self.tri_idx[k])} tri ({self.mesher_used[k]})"
                                   for k in self.layers) + ")")
 
@@ -713,9 +724,12 @@ class Simulation:
     VIA_TABLE_PAIRS = 64                 # via pairs of one span pair above which R comes from a table
 
     def _via_blocks(self, f, QF):
-        """Via rows/columns: B (Ne x Nv) strip-via coupling, C (Nv x Nv) via-via (incl. elements in vias)."""
+        """Via rows/columns: B (Ne x Nv) strip-via coupling, C (Nv x Nv) via-via (incl. elements in vias); after the
+        chains, the holes of the PEC planes inside the stack (_frill_blocks)."""
         w, r = 2 * np.pi * f, self.rwg
         B, C = np.zeros((self.Ne, self.Nv), complex), np.zeros((self.Nv, self.Nv), complex)
+        if self.frills:
+            self._frill_blocks(f, B, C)
         vk = ViaKernels(f, self.st, [(kb, kt) for _, kb, kt in self.chains], self.layers, self.rho_max)
         # fan-distributed end charges (G_q between triangles, same machinery as strips)
         if len(self.F):
@@ -750,6 +764,32 @@ class Simulation:
             seen.add(id(v))
             C[n, n] += zs * (self.st.z[kt] - self.st.z[kb]) / (2 * np.pi * v.a)     # wall loss
         return B, C
+
+    def _frill_blocks(self, f, B, C):
+        """The columns and rows of the holes' voltages (frill.py: c and -Y), into B and C after the chains'."""
+        from .frill import FrillKernels
+        r, Nc = self.rwg, len(self.chains)
+        fk = FrillKernels(f, self.st, self.frills, self.layers, self.rho_max)
+        spans = {}
+        for n, (v, kb, kt) in enumerate(self.chains):
+            spans.setdefault((kb, kt), []).append(n)
+        for m, (fr, mode) in enumerate(fk.unknowns):
+            s, col = fk.shape(fr, mode), Nc + m
+            psi = np.zeros(len(r.tris), complex)              # the shape's potential over each triangle
+            for k in self.layers:
+                if (s, k) in fk.psi:
+                    idx = self.tri_idx[k]
+                    dist = np.hypot(self.P6[idx, :, 0] - fr.via.x, self.P6[idx, :, 1] - fr.via.y)
+                    psi[idx] = (fk.psi[(s, k)](dist) * self.W6[idx]).sum(1)
+            B[:, col] = -(r.D.T @ psi)
+            c = -(self.dF[:, :Nc].T @ psi[self.F]) if len(self.F) else np.zeros(Nc, complex)
+            for span, ns in spans.items():                    # the chains' remainder, by span
+                d = np.array([max(np.hypot(self.chains[n][0].x - fr.via.x, self.chains[n][0].y - fr.via.y),
+                                  self.chains[n][0].a) for n in ns])
+                c[ns] += fk.rem(s, span, d)
+            C[:Nc, col] = C[col, :Nc] = c
+            for g, other in enumerate(fk.unknowns[:m + 1]):
+                C[Nc + g, col] = C[col, Nc + g] = -fk.Y(other, (fr, mode))
 
     def _block(self, ia, ib, a, b, gt):
         r, st = self.rwg, self.st

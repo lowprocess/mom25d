@@ -141,6 +141,46 @@ def test_a_pair_s_modes_take_their_gamma_from_the_characterisation():
     assert np.abs(d2 - 1).max() < 0.03 and sim.unbalance == pytest.approx(d2.max() / d2.min() - 1)
 
 
+def test_a_plane_only_vias_run_through_as_a_pec_plane_with_holes():
+    """planes='holes' (experimental): the demo transition's inner plane, whose one hole is the signal via's, is a
+    PEC plane inside the stack, not meshed, and the hole a couple of unknowns (mom25d.frill): 1,500 unknowns for
+    3,900. The model is axisymmetric: the traces over the hole see the plane closed, and S is 0.08 from the
+    meshed plane's at most. A plane with any other hole stays meshed."""
+    import copy
+    from shapely.geometry import shape
+    from mom25d.board import plane_holes
+    from mom25d.api import solve_board
+    data = board('demo')
+    gn, outline = set(data['ground_nets']), shape(data['outline'])
+    geom, holes = plane_holes(data, 'In1.Cu', gn, outline)
+    assert len(holes) == 1 and holes[0][0] == 0 and holes[0][1] == pytest.approx(0.6, abs=0.01) and holes[0][2] is None
+    assert plane_holes(data, 'F.Cu', gn, outline) is None and plane_holes(data, 'B.Cu', gn, outline) == (shape(data['copper']['B.Cu'][0]['polygon']).buffer(0), [])
+    bad = copy.deepcopy(data)                                   # a second via in the hole
+    bad['vias'].append(dict(bad['vias'][0], x=bad['vias'][0]['x'] + 0.3))
+    assert plane_holes(bad, 'In1.Cu', gn, outline) is None
+    bad = copy.deepcopy(data)                                   # a slot, not a via's hole
+    x, y = data['vias'][0]['x'], data['vias'][0]['y']
+    bad['copper']['In1.Cu'][0]['polygon']['coordinates'][1] = [[x - 3, y - 0.3], [x + 3, y - 0.3], [x + 3, y + 0.3], [x - 3, y + 0.3], [x - 3, y - 0.3]]
+    assert plane_holes(bad, 'In1.Cu', gn, outline) is None
+    bad = copy.deepcopy(data)                                   # the via ends on the plane's layer
+    bad['vias'][0]['z0'] = 0.4
+    assert plane_holes(bad, 'In1.Cu', gn, outline) is None
+    assert BoardModel(bad, planes='holes', log=quiet).stack.pec == ()
+
+    m = BoardModel(data, planes='holes', log=quiet)
+    assert m.stack.pec == (2,) and sorted(m.shapes) == [1, 3] and len(m.frills) == 1
+    fr = m.frills[0]
+    assert (fr.k, fr.via.k_bot, fr.via.k_top) == (2, 1, 3) and fr.b == pytest.approx(0.6e-3, abs=1e-5)
+    assert any('In1.Cu: a PEC plane inside the stack' in n for n in m.notes) and 'a PEC plane In1.Cu' in m.describe()
+    assert BoardModel(data, log=quiet).stack.pec == () and not BoardModel(data, log=quiet).frills
+    f = np.array([2e9, 6e9])
+    res = {p: solve_board(data, f, planes=p, port='via', log=quiet, max_solves=4) for p in ('pec', 'holes')}
+    assert res['holes'].unknowns < 0.45 * res['pec'].unknowns
+    S, ref = res['holes'].S, res['pec'].S
+    assert np.abs(S - ref).max() < 0.1 and np.abs(np.abs(S[:, 1, 0]) - np.abs(ref[:, 1, 0])).max() < 0.01
+    assert np.abs(S - S.transpose(0, 2, 1)).max() < 1e-6 and np.linalg.svd(S, compute_uv=False).max() < 1.0
+
+
 def test_wall_points_skip_a_via_already_there():
     """Two walls meeting at a corner give one via there, not two (a duplicated via makes the via block
     singular), and a wall via on top of a board via is left out."""

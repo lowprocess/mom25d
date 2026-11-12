@@ -56,7 +56,8 @@ class PlanarModel:
         for j, l in enumerate(self.stack.layers):
             cu = [n for n, k in self.iface.items() if k == j + 1]
             L.append(f"  D{j + 1} {l.name:<14s} h={l.h * 1e3:.3f} mm er={l.er:.2f} tand={l.tand:.4f}"
-                     + (f"   -> metal {cu[0]} on interface {j + 1}" if cu else ''))
+                     + (f"   -> {'a PEC plane' if j + 1 in self.stack.pec else 'metal'} {cu[0]} on interface {j + 1}"
+                        if cu else ''))
         L.append((f"  ground: {self.ground} (z=0)" if self.ground else "  no ground: the whole stack, air below")
                  + (f", PEC cover: {self.cover}" if self.cover else ''))
         L.append("metal interfaces: " + ", ".join(f"{n}->M{k}" for n, k in self.iface.items() if k in self.shapes))
@@ -259,6 +260,8 @@ class PlanarModel:
         if characterize:
             self.characterize(ports, fmin, fmax, dmax=dmax)        # the cells the feeds get: the same gamma
         kw.setdefault('lumped', list(self.lumped))
+        if getattr(self, 'frills', None):
+            kw.setdefault('frills', list(self.frills))         # the holes of the PEC planes inside the stack
         if getattr(self, 'signal', None) is not None:
             kw.setdefault('signal', self.signal)
         zone = kw.pop('zone', None)

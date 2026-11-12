@@ -81,6 +81,48 @@ def _solid(data, lay, gnets, outline):
     return u.geom_type == 'Polygon' and not u.interiors and u.area >= SOLID * outline.area
 
 
+HOLE_ROUND = 2.6        # plane_holes: a hole's largest extent, in radii of the circle of its area (a circle 2)
+HOLE_CENTRE = 0.35      # and how far from its centre the via may be, in those radii
+
+
+def plane_holes(data, lay, gnets, outline):
+    """planes='holes': copper layer `lay` as a PEC plane inside the stack (mom25d.frill): one piece of ground-net
+    copper over SOLID of the outline, no port or part on it, whose every hole is the hole of one via through it
+    (not a ground via, not one that ends there), round or nearly, the via near its middle. Other nets' copper on
+    the layer must be those vias' own pads inside their holes (left out: the pad's rim is the gap's inner edge).
+    Returns (the plane's polygon with its holes, [(via index, hole radius mm, inner radius mm or None)]), or None."""
+    ps = data.get('copper', {}).get(lay) or []
+    z = next(c['z'] for c in data['stack']['copper'] if c['name'] == lay)
+    if not ps or not gnets or any(p['layer'] == lay for p in data.get('ports', []) + data.get('parts', [])):
+        return None
+    u = unary_union([shape(p['polygon']) for p in ps if p.get('net') in gnets]).buffer(0)
+    if u.geom_type != 'Polygon' or shape({'type': 'Polygon', 'coordinates': [list(u.exterior.coords)]}).area < SOLID * outline.area:
+        return None
+    pads = [shape(p['polygon']) for p in ps if p.get('net') not in gnets]
+    through = [(i, Point(v['x'], v['y'])) for i, v in enumerate(data.get('vias', []))
+               if v['z0'] < z - 1e-9 and v['z1'] > z + 1e-9 and v.get('net') not in gnets]
+    ending = [Point(v['x'], v['y']) for v in data.get('vias', [])
+              if v.get('net') not in gnets and (abs(v['z0'] - z) < 1e-9 or abs(v['z1'] - z) < 1e-9)]
+    holes, used = [], set()
+    for ring in u.interiors:
+        h = shape({'type': 'Polygon', 'coordinates': [list(ring.coords)]})
+        b = float(np.sqrt(h.area / np.pi))
+        inside = [(i, pt) for i, pt in through if h.contains(pt)]
+        x0, y0, x1, y1 = h.bounds
+        if len(inside) != 1 or any(h.contains(pt) for pt in ending) or max(x1 - x0, y1 - y0) > HOLE_ROUND * b \
+                or inside[0][1].distance(h.centroid) > HOLE_CENTRE * b or b <= data['vias'][inside[0][0]]['r']:
+            return None
+        mine = [j for j, g in enumerate(pads) if h.contains(g.representative_point())]
+        used.update(mine)
+        a = max((float(np.sqrt(pads[j].area / np.pi)) for j in mine), default=None)
+        if a is not None and a >= b:
+            return None
+        holes.append((inside[0][0], b, a))
+    if len(used) < len(pads):
+        return None                                 # copper of another net on the plane's layer, outside its holes
+    return u, holes
+
+
 def ground_apertures(data, ground):
     """Where the copper of layer `ground` is missing under the signal copper above it (every net but the ground
     nets): a slot, a defected ground, a patterned or partial ground, which mom25d's infinite ground plane fills in.
@@ -162,7 +204,11 @@ class BoardModel(PlanarModel):
         one mixed-mode port. wall_pitch (m): via spacing along edge walls. planes: 'pec' (default: solid planes
         as the ground and a PEC cover) | 'mesh'. stitching_pads: 'drop' (default: lone pads of ground vias left out)
         | 'keep'. wideband: None (default: each dielectric's er and tand constant over frequency) or a frequency
-        (Hz) at which they hold, the Djordjevic-Sarkar model elsewhere (multilayer.djordjevic_sarkar)."""
+        (Hz) at which they hold, the Djordjevic-Sarkar model elsewhere (multilayer.djordjevic_sarkar). planes
+        'holes' (experimental): as 'pec', and a plane between the copper layers whose only holes are those of
+        vias through it (plane_holes) is a PEC plane inside the stack, not meshed, each hole a few unknowns
+        (mom25d.frill): axisymmetric, so what a trace over a hole adds is left out."""
+        assert planes in ('pec', 'mesh', 'holes'), f"planes: pec, mesh or holes, not {planes!r}"
         from .multilayer import Layer, LayerStack
         if data.get('format') != FORMAT:
             raise ValueError(f"not a {FORMAT} file (format {data.get('format')!r})")
@@ -185,7 +231,7 @@ class BoardModel(PlanarModel):
             self.notes.append(f"ground: {name} (the lowest solid copper layer)")
         if name not in cu_z:
             raise ValueError(f"no copper layer {name!r} (layers: {', '.join(cu_z)})")
-        if planes == 'pec' and not self.whole:
+        if planes in ('pec', 'holes') and not self.whole:
             g, self.cover = pec_planes(data, name)
             if g != name:
                 self.notes.append(f"ground: {g} (a solid plane over {name}: the planes as PEC)")
@@ -228,7 +274,21 @@ class BoardModel(PlanarModel):
             self.notes.append(f"lone stitching-via pads left out (the vias kept): " + ", ".join(
                 f"{len(ix)} on {l}" for l, ix in self.pads_dropped.items()))
         S = lambda g: affinity.scale(g, MM, MM, origin=(0, 0))
-        self.shapes = {k: [S(unary_union(copper[lay])).buffer(0)] for lay, k in self.iface.items() if copper.get(lay)}
+        # planes='holes': the planes between the copper layers that only vias run through, as PEC planes of the stack
+        self._pec_geom, self._holes = {}, []
+        if planes == 'holes' and not self.whole:
+            gn = set(data.get('ground_nets') or [])
+            for lay, k in sorted(self.iface.items(), key=lambda kv: kv[1]):
+                got = plane_holes(data, lay, gn, outline) if 0 < k < self.stack.N else None
+                if got is None:
+                    continue
+                self._pec_geom[k] = S(got[0])
+                self._holes += [(i, k, b * MM, a * MM if a else None) for i, b, a in got[1]]
+                self.notes.append(f"{lay}: a PEC plane inside the stack, not meshed; {len(got[1])} via hole(s) as "
+                                  f"unknowns (planes 'holes': a trace over a hole sees the plane closed)")
+            self.stack.pec = tuple(sorted(self._pec_geom))
+        self.shapes = {k: [S(unary_union(copper[lay])).buffer(0)] for lay, k in self.iface.items()
+                       if copper.get(lay) and k not in self._pec_geom}
         # the signal copper (every net but the ground nets), all layers projected: where the current crowds and
         # the mesh needs its detail (zone=, PlanarModel.simulation); None when the board names no ground net
         gnets = set(data.get('ground_nets') or [])
@@ -247,13 +307,17 @@ class BoardModel(PlanarModel):
         # |dS| 1.98)
         gaps = [box(min(q['s'][0], q['e'][0]), min(q['s'][1], q['e'][1]), max(q['s'][0], q['e'][0]),
                     max(q['s'][1], q['e'][1])) for q in data.get('parts', [])]
-        for v in data.get('vias', []):
-            via = self._via(v['x'], v['y'], v['z0'], v['z1'], v['r'], f"{v.get('net', '')}@({v['x']:.2f},{-v['y']:.2f})")
+        made = {}
+        for i, v in enumerate(data.get('vias', [])):
+            via = made[i] = self._via(v['x'], v['y'], v['z0'], v['z1'], v['r'], f"{v.get('net', '')}@({v['x']:.2f},{-v['y']:.2f})")
             if via:
                 if gnets:                           # Simulation(signal_vias=, stitching_vias=): how each is meshed
                     part = any(g.distance(Point(v['x'], v['y'])) < PART_VIA for g in gaps)
                     via.kind = 'stitching' if v.get('net') in gnets and not part else 'signal'
                 self.vias.append(via)
+        from .frill import Frill
+        self.frills = [Frill(made[i], k, b, a=a) for i, k, b, a in self._holes
+                       if made.get(i) is not None and made[i].k_bot < k < made[i].k_top]
         nvia = len(self.vias)
         walls = [(w['axis'], w['at'], w['t0'], w['t1'], w['z0'], w['z1']) for w in data.get('walls', [])]
         for i, x, y in wall_points(walls, wall_pitch / MM, [(v['x'], v['y']) for v in data.get('vias', [])]):
@@ -324,7 +388,8 @@ class BoardModel(PlanarModel):
         """A via (board mm) over the interfaces between z0 and z1 that have metal at (x, y) (the ground counts)."""
         from .sim import Via
         metal = lambda k: (k == 0 and not self.whole) or (k == self.stack.N and self.cover is not None) or \
-            (bool(g := self.shapes.get(k)) and g[0].buffer(1e-9).contains(Point(x * MM, y * MM)))
+            (bool(g := self.shapes.get(k)) and g[0].buffer(1e-9).contains(Point(x * MM, y * MM))) or \
+            (k in self._pec_geom and self._pec_geom[k].buffer(1e-9).contains(Point(x * MM, y * MM)))
         ks = sorted(k for k in [0, self.stack.N] + list(self.iface.values()) if z0 - 1e-9 <= self._zk[k] <= z1 + 1e-9 and metal(k))
         if len(set(ks)) < 2:
             return None

@@ -105,6 +105,102 @@ def test_balance_takes_the_ports_scales_out():
     assert np.array_equal(np.diag(S), np.diag(weak))                                # reflections are not touched
 
 
+def test_a_pec_plane_inside_the_stack_is_two_stacks():
+    """LayerStack(pec=): the copper above the plane sees it as its ground, the copper below as its cover, and
+    neither sees the other: the kernels of the whole stack are those of the two stacks it is."""
+    L = [Layer(0.2e-3, 4.3, 0.02), Layer(0.15e-3, 3.6, 0.01), Layer(0.25e-3, 4.3, 0.02), Layer(0.1e-3, 3.2, 0.0)]
+    whole, upper, lower = LayerStack(L, pec=(2,)), LayerStack(L[2:]), LayerStack(L[:2], top='pec')
+    assert whole.metal_interfaces == [1, 3, 4] and whole.is_pec(2) and whole.apart(1, 3) and not whole.apart(3, 4)
+    assert whole.nearest_discontinuity(3) == pytest.approx(0.1e-3) and whole.nearest_discontinuity(1) == pytest.approx(0.15e-3)
+    w, kr = 2 * np.pi * 5e9, np.array([10.0, 300.0, 2e3 + 5j, 4e4])
+    for (o, s), (st, oo, ss) in {(3, 3): (upper, 1, 1), (4, 3): (upper, 2, 1), (4, 4): (upper, 2, 2), (1, 1): (lower, 1, 1)}.items():
+        assert np.allclose(whole.spectral(kr, w, o, s), st.spectral(kr, w, oo, ss), rtol=1e-12, atol=0)
+    assert not np.any(whole.spectral(kr, w, 3, 1)) and not np.any(whole.spectral(kr, w, 1, 4))
+    # a hole in the plane drives the network there: 1 at the plane, e^(-kr d) far up the spectrum, 0 at the ground
+    assert np.all(whole.transfer(kr, w, 2, 2) == 1) and not np.any(whole.transfer(kr, w, 2, 0))
+    assert abs(whole.transfer(np.array([2e4 + 0j]), w, 2, 3)[0]) == pytest.approx(np.exp(-2e4 * 0.25e-3), rel=0.25)
+    d = np.array([0.15e-3, 1e-3, 5e-3])
+    vw = ViaKernels(5e9, whole, [(3, 4), (0, 1), (2, 4), (0, 2)], [1, 3, 4], 20e-3)
+    vu, vl = ViaKernels(5e9, upper, [(1, 2), (0, 2)], [1, 2], 20e-3), ViaKernels(5e9, lower, [(0, 1), (0, 2)], [1], 20e-3)
+    close = lambda a, b: np.abs(a - b).max() < 1e-4 * np.abs(b).max()
+    assert close(vw.D[(3, (3, 4))](d), vu.D[(1, (1, 2))](d)) and close(vw.D[(1, (0, 1))](d), vl.D[(1, (0, 1))](d))
+    assert close(vw.R((2, 4), (2, 4), d), vu.R((0, 2), (0, 2), d)) and close(vw.R((0, 2), (0, 2), d), vl.R((0, 2), (0, 2), d))
+    assert not np.any(vw.D[(1, (3, 4))](d)) and not np.any(vw.R((0, 1), (3, 4), d))
+
+
+def test_a_hole_s_potential_and_admittance():
+    """frill.py: the potential a hole in a PEC plane leaves on the interfaces (1 V across it), and its admittance:
+    close over the plane it is the hole's own potential, far away nothing; the admittance is a capacitance into
+    both sides, the same at 0.1 and 1 GHz, and two holes couple weakly, with the other sign."""
+    from types import SimpleNamespace as NS
+    from mom25d.frill import Frill, FrillKernels, profile
+    st = LayerStack([Layer(0.2e-3, 4.3), Layer(0.02e-3, 4.3), Layer(3e-3, 4.3)], top_er=4.3, pec=(1,))
+    a, b = 0.15e-3, 0.35e-3
+    fr, fr2 = Frill(NS(x=0.0, y=0.0, a=a), 1, b, modes=2), Frill(NS(x=2e-3, y=0.0, a=a), 1, b, modes=1)
+    fk = FrillKernels(1e8, st, [fr, fr2], [2, 3], 10e-3)
+    assert [(u[0] is fr, u[1]) for u in fk.unknowns] == [(True, 0), (True, 1), (False, 0)]
+    s0, rho = fk.shape(fr, 0), np.array([0.0, a, 0.25e-3, b, 1e-3, 3e-3])
+    near, far = fk.psi[(s0, 2)](rho).real, fk.psi[(s0, 3)](rho).real
+    assert 0.85 < near[0] < 1 and near[1] > near[2] > near[3] > near[4] and abs(near[5]) < 1e-3     # 0.02 mm over it
+    assert np.abs(far).max() < 5e-3 and np.all(np.diff(far) < 0)                                    # 3 mm over it
+    assert fk.shape(fr, 0) == fk.shape(fr2, 0)                                                      # holes alike: one table
+    C = fk.Y((fr, 0), (fr, 0)).imag / (2 * np.pi * 1e8)
+    C1 = FrillKernels(1e9, st, [fr], [2, 3], 10e-3).Y((fr, 0), (fr, 0)).imag / (2 * np.pi * 1e9)
+    assert 40e-15 < C < 120e-15 and C1 == pytest.approx(C, rel=0.01)
+    assert fk.Y((fr, 0), (fr, 1)) == fk.Y((fr, 1), (fr, 0))
+    Cm = fk.Y((fr, 0), (fr2, 0)).imag / (2 * np.pi * 1e8)
+    assert -0.01 * C < Cm < 0 and fk.Y((fr, 0), (Frill(NS(x=0.0, y=0.0, a=a), 2, b), 0)) == 0.0     # another plane
+    # the first shape: 1 V across the hole (its transform's integral: int e dkr = int g drho); the coaxial field's
+    # transform where the hole is narrow against the wavelength of kr
+    kr = np.linspace(1.0, 4e5, 40001)
+    assert np.trapezoid(profile(kr, a, b), kr) == pytest.approx(1.0, abs=0.02)
+
+
+def test_pads_joined_by_a_via_through_a_plane_s_hole():
+    """Two pads either side of a plane, a via through its hole between them: their capacitance with the plane
+    meshed (the hole in its mesh) and with the plane as PEC and the hole's unknowns (frill.py), within 1.5 %;
+    with the hole closed it is 39 % more. Axisymmetric: what the model has. (A trace over the hole is what it
+    lacks: the transition of tests/boards/demo.json is 0.08 from its meshed plane at 8 GHz.)"""
+    pytest.importorskip('mom25d._core')
+    from shapely.geometry import box, Point
+    from mom25d.frill import Frill
+    mm, f = 1e-3, 1e8
+    layers = [Layer(0.2 * mm, 4.3) for _ in range(3)]
+    pad = lambda: [Point(0, 0).buffer(0.3 * mm, 32)]
+    sig = lambda: Via(0, 0, 1, 3, 0.15 * mm, name='sig')
+    port = lambda: [ViaPort(Via(0.18 * mm, 0, 0, 1, 0.03 * mm), name='P1')]
+    gv = lambda: [Via(x * mm, y * mm, 0, 2, 0.15 * mm) for x, y in ((-2, -2), (0, -2), (2, -2), (-2, 2), (0, 2), (2, 2), (2, 0), (-2, 0))]
+    kw = dict(dmax=0.1 * mm, solver='direct', precision='double', gpu='off', verbose=False)
+    cap = lambda s: ((1 - (S := s.sparams(f)[0, 0])) / (1 + S) / 50).imag / (2 * np.pi * f)
+    b = 0.45 * mm
+    plane = box(-3 * mm, -3 * mm, 3 * mm, 3 * mm).difference(Point(0, 0).buffer(b, 48))
+    meshed = Simulation(LayerStack(layers), {1: pad(), 2: [plane], 3: pad()}, port(), vias=[sig()] + gv(),
+                        dmax_layer={2: 0.3 * mm}, **kw)
+
+    def holes(modes, couple=True):
+        v = sig()
+        s = Simulation(LayerStack(layers, pec=(2,)), {1: pad(), 3: pad()}, port(), vias=[v] + gv(),
+                       frills=[Frill(v, 2, b, modes=modes)], **kw)
+        if not couple:                                          # the hole closed: its unknown on its own
+            blocks = s._frill_blocks
+
+            def alone(f, B, C):
+                blocks(f, B, C)
+                n = len(s.chains)
+                B[:, n:] = 0; C[:n, n:] = 0; C[n:, :n] = 0
+            s._frill_blocks = alone
+        return s
+    one = holes(1)
+    assert one.Nv == len(one.chains) + 1 and holes(3).Nv == len(one.chains) + 3
+    assert len(one.chains) == len(meshed.chains) and one.Ne < 0.5 * meshed.Ne
+    C = cap(meshed)
+    assert 180e-15 < C < 230e-15
+    assert cap(one) == pytest.approx(C, rel=0.015) and cap(holes(2)) == pytest.approx(C, rel=0.01)
+    assert cap(holes(1, couple=False)) > 1.3 * C
+    with pytest.raises(AssertionError, match='a hole is in a PEC plane inside the stack'):
+        Simulation(LayerStack(layers), {1: pad(), 3: pad()}, port(), vias=[sig()], frills=[Frill(sig(), 2, b)], **kw)
+
+
 def test_mesher_t_junction_port_lines():
     """Port cut lines ending on a polygon edge must split the edge exactly (no sliver cascade)."""
     from shapely.geometry import box

@@ -280,7 +280,7 @@ def apertures(m, s):
     g, out = _solid_ground(m), []
     if g is not None:
         data = m.to_dict()
-        if _model_kw(s)['planes'] == 'pec':
+        if _model_kw(s)['planes'] in ('pec', 'holes'):
             g, _ = pec_planes(data, g)
         out = [(poly, a, g) for poly, a in ground_apertures(data, g)]
     _held_apertures[:] = [m, (_model_kw(s)['planes'], out)]
@@ -293,7 +293,7 @@ def ports_below(m, s):
     g = _solid_ground(m)
     if g is None:
         return []
-    if _model_kw(s)['planes'] == 'pec':
+    if _model_kw(s)['planes'] in ('pec', 'holes'):
         from mom25d.board import pec_planes
         g, _ = pec_planes(m.to_dict(), g)
     return [p.name for p in m.ports if m.cu_z.get(p.layer, np.inf) < m.cu_z[g] - 1e-9]
@@ -383,8 +383,12 @@ class MoM25D(Solver):
                name='zone', gui='MoM signal zone (experimental)', group=G),
         Option('mom_planes', 'pec', "pec (default): solid planes (one piece over the board, no holes, ground nets "
                "only) as perfect conductors, not meshed: the highest one under every other copper layer the ground, "
-               "the lowest one over them a PEC cover (rf_stripline 15,563 unknowns to 8,671); or mesh: every plane "
-               "meshed (docs/mom.md#planes)", choices=('pec', 'mesh'), name='planes', gui='MoM solid planes', group=G),
+               "the lowest one over them a PEC cover (rf_stripline 15,563 unknowns to 8,671); mesh: every plane "
+               "meshed; or holes (experimental): as pec, and a plane between the copper layers whose only holes are "
+               "those of vias through it is a perfect conductor too, each hole a few unknowns (demo_transition "
+               "3,910 unknowns to 1,504; a trace over a hole sees the plane closed: S within 0.08 of the meshed "
+               "plane's there) (docs/mom.md#planes)", choices=('pec', 'mesh', 'holes'), name='planes',
+               gui='MoM solid planes', group=G),
         Option('mom_stitching_pads', 'drop', "drop (default): a ground via's pad with nothing else on its layer (a "
                "stitching via through a signal layer; not a part's or a port's pad) left out, the via kept as its "
                "barrel (rf_stripline with the planes PEC: 8,671 unknowns to 1,337); or keep (docs/mom.md#planes)",

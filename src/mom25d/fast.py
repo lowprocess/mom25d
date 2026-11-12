@@ -1210,9 +1210,11 @@ class FastOperator:
         return X
 
     def _points(self):
-        """Every unknown's place: the edges' midpoints, the via chains' axes."""
+        """Every unknown's place: the edges' midpoints, the via chains' axes, the PEC planes' holes'."""
         sim = self.sim
-        return np.vstack([sim.rwg.mid] + ([np.array([[v.x, v.y] for v, _, _ in sim.chains])] if sim.Nv else []))
+        border = [[v.x, v.y] for v, _, _ in sim.chains] + \
+            [list(fr.xy) for fr in getattr(sim, 'frills', ()) for _ in range(fr.modes)]
+        return np.vstack([sim.rwg.mid] + ([np.array(border)] if border else []))
 
     def _raw_entry(self, dZx):
         """entry(rows, cols): the dense block of Z (far field from the core, the sparse near correction and extra
