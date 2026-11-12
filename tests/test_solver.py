@@ -187,6 +187,19 @@ def test_batched_gmres_reaches_its_tolerance_on_a_complex_system():
     B = rng.standard_normal((n, 2)) + 1j * rng.standard_normal((n, 2))
     X, _ = gmres_batched(lambda V: A @ V, B, rtol=1e-10, restart=60, maxiter=5)
     assert np.max(np.linalg.norm(A @ X - B, axis=0) / np.linalg.norm(B, axis=0)) < 1e-9
+    # stall: a preconditioner that is no inverse (a GPU's triangular solves that lost an ill-conditioned factor) is
+    # given up after a few iterations instead of all of them; a good one is not disturbed
+    calls = []
+    good = np.linalg.inv(A + 1e-3 * rng.standard_normal((n, n)))
+    X, it = gmres_batched(lambda V: A @ V, B, M=lambda R: calls.append(1) or good @ R, rtol=1e-8, restart=30, maxiter=1,
+                          stall=(4, 0.1))
+    assert max(it) <= 4 and np.max(np.linalg.norm(A @ X - B, axis=0) / np.linalg.norm(B, axis=0)) < 1e-7
+    del calls[:]
+    bad = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+    X, it = gmres_batched(lambda V: A @ V, B, M=lambda R: calls.append(1) or bad @ R, rtol=1e-8, restart=30, maxiter=3,
+                          stall=(4, 0.1))
+    assert it == [4, 4] and len(calls) == 4 and np.isfinite(X).all()
+    assert gmres_batched(lambda V: A @ V, B, M=lambda R: bad @ R, rtol=1e-8, restart=30, maxiter=1)[1] == [30, 30]
 
 
 def test_afs_does_not_stop_on_a_model_that_ignores_new_samples(monkeypatch):

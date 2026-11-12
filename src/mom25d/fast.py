@@ -260,6 +260,9 @@ HYBRID_RETRY = 1.25      # after the GPU's mixed precision fails at f, double up
 MIXED_RETRY = HYBRID_RETRY   # the same after the complex64 LU (CPU or GPU) fails to precondition
 MIXED_MAX_ITER = 30      # refinement iterations before giving up on the complex64 LU (2 on the demo transition; a stall
                          # ran all 300 of restart 30 x 10: 150 s on 8.4k unknowns against 18 s for a double LU)
+FRESH_STALL = (4, 0.1)   # a fresh complex64 LU on the GPU is given up when the residual is above 0.1 after 4 iterations:
+                         # where ROCm's triangular solves lose an ill-conditioned factor (gpu.py) it stays at 1 for all
+                         # 30 (the via transition with its planes meshed, 13.9k unknowns at 1 GHz: 3.8 s for 0.5 s)
 REUSE_ITER = (8, 60)     # GMRES iterations a reused LU may take (FastOperator._solve_reused): the cap, from the cost of
                          # a fresh solve, is clamped to this range
 REUSE_KEEP = 4           # complex64 LUs the CPU keeps at most, memory allowing (FastOperator._solve_kept)
@@ -633,10 +636,10 @@ class FastOperator:
             self.iters.append(it[0]); infos.append(info)
         return X, infos
 
-    def _refine(self, A, B, M, restart, maxiter):
+    def _refine(self, A, B, M, restart, maxiter, stall=None):
         """Batched GMRES on A Y = B preconditioned with M, to mixed_tol: (Y, converged, largest relative residual).
-        Not converged includes a breakdown (NaN)."""
-        Y, self.iters = gmres_batched(A, B, M=M, rtol=self.mixed_tol, restart=restart, maxiter=maxiter)
+        Not converged includes a breakdown (NaN). stall: gmres_batched's, for a fresh factorisation (FRESH_STALL)."""
+        Y, self.iters = gmres_batched(A, B, M=M, rtol=self.mixed_tol, restart=restart, maxiter=maxiter, stall=stall)
         rel = np.linalg.norm(B - A(Y), axis=0) / np.maximum(np.linalg.norm(B, axis=0), 1e-300)
         return Y, bool((rel <= 100 * self.mixed_tol).all()), rel.max()
 
@@ -801,7 +804,8 @@ class FastOperator:
         with sim.log.timer('refinement (GMRES, exact matvec)'):
             t = time.time()
             Y, ok, rel = self._refine(lambda V: dsc[:, None] * down(self.matvec_exact(up(dsc[:, None] * V), Sx)), B,
-                                      gpu.solve if gpu is not None else (lambda R: _lu_solve(lu, R)), MIXED_MAX_ITER, 1)
+                                      gpu.solve if gpu is not None else (lambda R: _lu_solve(lu, R)), MIXED_MAX_ITER, 1,
+                                      FRESH_STALL if gpu is not None else None)
             self._t_iter = (time.time() - t) / max(1, max(self.iters, default=1))
         sim.log.note(f"mixed precision: GMRES iterations per port {self.iters}")
         if ok and sim.reuse != 'off':
@@ -901,7 +905,8 @@ class FastOperator:
                 lu = _lu(_c64(Z))
         with sim.log.timer('refinement (GMRES, dense double)'):
             t = time.time()
-            Y, ok, rel = self._refine(A, B, held if held is not None else (lambda R: _lu_solve(lu, R)), MIXED_MAX_ITER, 1)
+            Y, ok, rel = self._refine(A, B, held if held is not None else (lambda R: _lu_solve(lu, R)), MIXED_MAX_ITER, 1,
+                                      FRESH_STALL if held is not None else None)
             self._t_iter = (time.time() - t) / max(1, max(self.iters, default=1))
         sim.log.note(f"mixed precision{' (GPU)' if gpu is not None else ''}: GMRES iterations per port {self.iters}")
         if not ok and held is not None:
@@ -915,6 +920,7 @@ class FastOperator:
                           or k[0] > HYBRID_RETRY * self._gpu_solve_bad]
             with sim.log.timer('refinement (GMRES, dense double)'):
                 Y, ok, rel = self._refine(A, B, lambda R: _lu_solve(lu, R), MIXED_MAX_ITER, 1)
+            sim.log.note(f"the factor solved on the CPU: GMRES iterations per port {self.iters}")
         if ok:
             if held is not None or gpu is None:              # (factored on the GPU, solved here: not kept)
                 self._kept.append((f, held if held is not None else _Kept(lu), dsc, time.time() - t0))
@@ -1323,11 +1329,14 @@ class FastOperator:
         return dsc[:, None] * Y
 
 
-def gmres_batched(A, B, M=None, x0=None, rtol=1e-6, restart=30, maxiter=10):
+def gmres_batched(A, B, M=None, x0=None, rtol=1e-6, restart=30, maxiter=10, stall=None):
     """
     Right-preconditioned restarted GMRES for k independent systems A x_j = b_j run in lockstep, so
     every operator / preconditioner call is one batched (N x k_active) product. A, M: callables on
-    (N x k) arrays. Converged columns drop out. Returns (X, iterations per column).
+    (N x k) arrays. Converged columns drop out. Returns (X, iterations per column). stall: (iterations,
+    residual): give up when a column's relative residual is still above that after so many iterations (a
+    preconditioner that is no inverse: a fresh factorisation takes two or three iterations, a broken one all
+    of them).
     """
     B = np.asarray(B, complex)
     N, k = B.shape
@@ -1348,7 +1357,7 @@ def gmres_batched(A, B, M=None, x0=None, rtol=1e-6, restart=30, maxiter=10):
         H, g = np.zeros((restart + 1, restart, ka), complex), np.zeros((restart + 1, ka), complex)
         cs, sn = np.zeros((restart, ka), complex), np.zeros((restart, ka), complex)
         g[0], V[0] = beta, R / beta
-        live, last = np.ones(ka, bool), np.full(ka, restart - 1)
+        live, last, stalled = np.ones(ka, bool), np.full(ka, restart - 1), False
         for j in range(restart):
             Z[j] = M(V[j])
             Wv = A(Z[j])
@@ -1374,8 +1383,13 @@ def gmres_batched(A, B, M=None, x0=None, rtol=1e-6, restart=30, maxiter=10):
             live &= ~conv
             if not live.any():
                 break
+            if stall is not None and j + 1 >= stall[0] and (np.abs(g[j + 1])[live] > stall[1] * bn[act][live]).any():
+                last[live], stalled = j, True
+                break
         for c in range(ka):                                           # update each column
             m = last[c] + 1
             y = np.linalg.solve(np.triu(H[:m, :m, c]), g[:m, c]) if m else np.zeros(0)
             X[:, act[c]] += Z[:m, :, c].T @ y
+        if stalled:
+            break                                                     # no restart either
     return X, iters.tolist()
