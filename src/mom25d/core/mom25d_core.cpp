@@ -302,8 +302,20 @@ py::array_t<cd> matvec_far_multi(arr<cd> x, py::dict geom, py::dict tabs, double
 }
 
 // ---------------------------------------------------------------------------------------------
-// analytic 1/sqrt(rho^2 + d^2) moments: inner integral analytic over q, outer 6-point rule over p
+// analytic 1/sqrt(rho^2 + d^2) moments: one integral analytic over a triangle (V), the other a 6-point rule over
+// the other (P6, W6). The rule runs over the smaller triangle of a pair (rule_over_p, as sing.rule_over): the pair's
+// moments are one value whichever of the two is the observation (Z symmetric), and the accurate ones
 // ---------------------------------------------------------------------------------------------
+static inline bool rule_over_p(double ap, double aq, int p, int q) {
+    const double tie = 1e-9 * std::max(ap, aq);              // sing.RULE_TIE
+    return std::fabs(ap - aq) <= tie ? p <= q : ap < aq;
+}
+
+static inline double tri_area(const double *nd, const int *tr, int t) {
+    const double *a = nd + 2 * tr[3 * t], *b = nd + 2 * tr[3 * t + 1], *c = nd + 2 * tr[3 * t + 2];
+    return 0.5 * std::fabs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]));
+}
+
 static inline void offplane_one(const double *V /*3x2 of q*/, const double *P6, const double *W6, double d,
                                 double &m0, double mro[2], double mrs[2], double &mrr) {
     double ad = std::fabs(d);
@@ -347,12 +359,17 @@ py::tuple offplane_pairs(arr<double> nodes, arr<int> tris, arr<double> P6, arr<d
     double *a = m0.mutable_data(), *b = mro.mutable_data(), *c = mrs.mutable_data(), *e = mrr.mutable_data();
     const double *nd = nodes.data(), *p6 = P6.data(), *w6 = W6.data();
     const int *tr = tris.data(), *pp = P.data(), *qq = Q.data();
-    py::gil_scoped_release nogil;
+    {
+        py::gil_scoped_release nogil;                        // (held again for the tuple: it was not, and the call failed)
 #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; ++i) {
-        double V[6];
-        for (int k = 0; k < 3; ++k) { V[2 * k] = nd[2 * tr[3 * qq[i] + k]]; V[2 * k + 1] = nd[2 * tr[3 * qq[i] + k] + 1]; }
-        offplane_one(V, p6 + 12 * (size_t)pp[i], w6 + 6 * (size_t)pp[i], d, a[i], b + 2 * i, c + 2 * i, e[i]);
+        for (int i = 0; i < n; ++i) {
+            const bool keep = rule_over_p(tri_area(nd, tr, pp[i]), tri_area(nd, tr, qq[i]), pp[i], qq[i]);
+            const int po = keep ? pp[i] : qq[i], qi = keep ? qq[i] : pp[i];  // the rule over po, analytic over qi
+            double V[6];
+            for (int k = 0; k < 3; ++k) { V[2 * k] = nd[2 * tr[3 * qi + k]]; V[2 * k + 1] = nd[2 * tr[3 * qi + k] + 1]; }
+            offplane_one(V, p6 + 12 * (size_t)po, w6 + 6 * (size_t)po, d, a[i], keep ? b + 2 * i : c + 2 * i,
+                         keep ? c + 2 * i : b + 2 * i, e[i]);
+        }
     }
     return py::make_tuple(m0, mro, mrs, mrr);
 }
@@ -414,14 +431,17 @@ void near_core(const Mesh &g, const Tables &tb, const double *nodes, const int *
                 Mrr += ga * (Pa[2 * a] * Pb[2 * b] + Pa[2 * a + 1] * Pb[2 * b + 1]);
                 Mq += gq;
             }
-        // analytic parts
+        // analytic parts: the rule over the smaller triangle of the pair, the analytic integral over the other
+        const bool keep = rule_over_p(g.area[p], g.area[q], p, q);
+        const int po = keep ? p : q, qi = keep ? q : p;
         double V[6];
-        for (int k = 0; k < 3; ++k) { V[2 * k] = nodes[2 * tris[3 * q + k]]; V[2 * k + 1] = nodes[2 * tris[3 * q + k] + 1]; }
+        for (int k = 0; k < 3; ++k) { V[2 * k] = nodes[2 * tris[3 * qi + k]]; V[2 * k + 1] = nodes[2 * tris[3 * qi + k] + 1]; }
         auto add = [&](int k, double dd, cd cA, cd cq) {
             double st[6], *m = o.stat ? o.stat + NEAR_STAT * (size_t)i + 6 * k : st;
             if (!(o.stat && o.stat_ready)) {
                 double mro[2], mrs[2];
-                offplane_one(V, P6 + 12 * (size_t)p, W6 + 6 * (size_t)p, dd, m[0], mro, mrs, m[5]);
+                offplane_one(V, P6 + 12 * (size_t)po, W6 + 6 * (size_t)po, dd, m[0], keep ? mro : mrs,
+                             keep ? mrs : mro, m[5]);
                 m[1] = mro[0]; m[2] = mro[1]; m[3] = mrs[0]; m[4] = mrs[1];
             }
             M0 += cA * m[0]; Mox += cA * m[1]; Moy += cA * m[2]; Msx += cA * m[3]; Msy += cA * m[4];

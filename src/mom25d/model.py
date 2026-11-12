@@ -216,6 +216,11 @@ class PlanarModel:
                                                 length=length_for(a.w + b.w + gap))
                 zd, zcm = 2 * zo.real, ze.real / 2
                 p.zd_fn, p.zc_fn = _smooth(fs, zd), _smooth(fs, zcm)
+                # each mode's gamma too (gamma / f is nearly flat), as a single line's below: fitted from the
+                # feed's own cuts it is unreliable where they span little (rf_diffvia at 1 GHz, 0.25 rad: S moved
+                # by 0.06 with the near field's reach, |Sdd21| 1.21 one way and 0.79 the other, 54 solves)
+                p.gd_fn = (lambda f, gf=_smooth(fs, go / fs): f * gf(f))
+                p.gc_fn = (lambda f, gf=_smooth(fs, ge / fs): f * gf(f))
                 p.zdiff, p.zcomm = float(zd[len(zd) // 2]), float(zcm[len(zcm) // 2])
                 log(f"  {p.name}: coupled pair on M{a.layer}, w={a.w * 1e3:.3f} mm, gap={gap * 1e3:.3f} mm: "
                     f"Zdiff = " + ", ".join(f"{v:.1f}" for v in zd) + ", Zcomm = " + ", ".join(f"{v:.1f}" for v in zcm) + " ohm")

@@ -56,6 +56,55 @@ def test_offplane_reduces_to_inplane_and_converges():
     assert abs(a[0] / (ar[0] * ar[3] / R) - 1) < 0.02
 
 
+def test_a_pair_s_moments_are_one_value_with_the_rule_over_the_smaller_triangle():
+    """The extracted 1/R moments of a pair: the 6-point rule over the smaller triangle, the analytic integral over
+    the larger, whichever is the observation. With the rule over a 0.9 mm plane cell and a 0.3 mm trace cell 0.2 mm
+    under it the moment was 1.3 % off, and Z not symmetric: transmission through a via differed by 0.4 % between
+    its two directions with lumped ports."""
+    from mom25d.sing import rule_over
+    tri = lambda c, size, rot: np.c_[c[0] + size * np.cos(rot + np.array([0, 2.1, 4.2])),
+                                     c[1] + size * np.sin(rot + np.array([0, 2.1, 4.2]))]
+    nodes = np.vstack([tri((0, 0), 0.54, 0.3), tri((0.3, 0.03), 0.18, 1.1), tri((0.5, 0.2), 0.18, 1.1)]) * 1e-3
+    tris = np.arange(9).reshape(3, 3)
+    V = nodes[tris]
+    area = 0.5 * np.abs((V[:, 1, 0] - V[:, 0, 0]) * (V[:, 2, 1] - V[:, 0, 1]) - (V[:, 1, 1] - V[:, 0, 1]) * (V[:, 2, 0] - V[:, 0, 0]))
+    assert rule_over(area, [0, 1, 1, 2, 2], [1, 0, 2, 1, 2]).tolist() == [False, True, True, False, True]
+    d = 0.2e-3
+    m0, mro, mrs, mrr = offplane_pairs(nodes, tris, [0, 1], [1, 2], d)            # large and small; two alike
+    n0, nro, nrs, nrr = offplane_pairs(nodes, tris, [1, 2], [0, 1], d)            # the same pairs the other way
+    assert np.array_equal(m0, n0) and np.array_equal(mrr, nrr)
+    assert np.array_equal(mro, nrs) and np.array_equal(mrs, nro)
+    ref = offplane_pairs(nodes, tris, [0, 1], [1, 2], d, outer_levels=4)
+    for got, want in zip((m0, mro, mrs, mrr), ref):
+        assert np.abs(got - want).max() < 2e-4 * np.abs(want).max()
+    core = pytest.importorskip('mom25d._core')
+    from mom25d.sing import _offplane_geometry
+    P6 = _offplane_geometry(nodes, tris)[5]
+    W6 = np.tile(np.asarray(_offplane_geometry(nodes, tris)[6])[None], (3, 1)) * area[:, None]
+    c0, cro, crs, crr = core.offplane_pairs(nodes, tris.astype(np.int32), np.ascontiguousarray(P6), W6,
+                                            np.array([0, 1, 1, 2], np.int32), np.array([1, 2, 0, 1], np.int32), d)
+    assert np.allclose(c0, np.r_[m0, n0], rtol=1e-12) and np.allclose(crr, np.r_[mrr, nrr], rtol=1e-12)
+    assert np.allclose(cro, np.r_[mro, nro], rtol=1e-12, atol=0) and np.allclose(crs, np.r_[mrs, nrs], rtol=1e-12, atol=0)
+
+
+def test_balance_takes_the_ports_scales_out():
+    """sim.balance: the S of wave ports whose waves are scaled (their characterised impedances a little off) is
+    D S D^-1 of the reciprocal one. The scales come out where ports are coupled; a stop band's noise is averaged."""
+    from mom25d.sim import balance
+    rng = np.random.default_rng(1)
+    S0 = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    S0 = 0.2 * (S0 + S0.T)
+    d = np.array([1.02, 0.97, 1.0, 1.05])
+    S, got = balance(S0 * (d[:, None] / d[None, :]))
+    assert np.abs(S - S0).max() < 1e-4 and np.allclose(got / got[2], d, atol=3e-3)
+    S, got = balance(S0 * (d[:, None] / d[None, :]), np.array([False, False, True, False]))     # a lumped port: exact
+    assert np.abs(S - S0).max() < 1e-4 and np.allclose(got, d, atol=3e-3)
+    weak = np.array([[0.9, 0.012], [0.004, 0.9]], complex)
+    S, got = balance(weak)
+    assert np.allclose(got, 1, atol=5e-3) and S[0, 1] == S[1, 0] == pytest.approx(0.008, abs=1e-4)
+    assert np.array_equal(np.diag(S), np.diag(weak))                                # reflections are not touched
+
+
 def test_mesher_t_junction_port_lines():
     """Port cut lines ending on a polygon edge must split the edge exactly (no sliver cascade)."""
     from shapely.geometry import box
@@ -224,6 +273,7 @@ def test_core_matches_numpy_and_solvers_agree(monkeypatch):
     assert np.abs(Bc - Bp).max() < 1e-12 * np.abs(Bp).max()
     S = {k: mk(*k).sparams(4e9) for k in (('direct', 'double'), ('direct', 'mixed'), ('blr', 'double'))}
     ref = S[('direct', 'double')]
+    assert np.abs(ref - ref.T).max() < 1e-6                     # through a via, cells of two sizes: reciprocal
     for k, v in S.items():
         assert np.abs(v - ref).max() < 1e-6, k
     for tol, refine, err in ((1e-8, False, 1e-5), (1e-4, True, 1e-5)):     # hodlr.py: direct, or GMRES's preconditioner

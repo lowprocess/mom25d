@@ -32,6 +32,7 @@ from .via import ViaKernels
 from .sing import offplane_pairs, offplane_moments
 
 FIT_SPAN = 0.4             # rad: a wave port's cuts must span this much to fit gamma (a port without a characterised one)
+BALANCE_FLOOR = 1e-2       # balance: ports coupled by less than this (|S_ij S_ji|, -20 dB each way) keep their scales
 
 
 # ---- Components -------------------------------------------------------------
@@ -180,7 +181,8 @@ class DiffPort:
     def __init__(self, pos, neg, zdiff=100.0, zcomm=25.0, name='P'):
         assert np.allclose(pos.d, neg.d), "differential lines must run in the same direction"
         self.pos, self.neg, self.zdiff, self.zcomm, self.name = pos, neg, zdiff, zcomm, name
-        self.zd_fn = self.zc_fn = None
+        self.zd_fn = self.zc_fn = None                # the modes' impedances over frequency (model.characterize)
+        self.gd_fn = self.gc_fn = None                # and their propagation constants
 
     def modes(self):
         return [ModePort(self, 'd'), ModePort(self, 'c')]
@@ -196,6 +198,8 @@ class ModePort(LinePort):
         self.sign_n, self.cscale = (-1.0, 1.0) if mode == 'd' else (1.0, 2.0)   # Id = (I+ - I-)/2,  Ic = I+ + I-
         if (fn := parent.zd_fn if mode == 'd' else parent.zc_fn) is not None:
             self.zc_fn = fn
+        if (fn := parent.gd_fn if mode == 'd' else parent.gc_fn) is not None:
+            self.gamma_fn = fn                        # the wave fit's gamma (sparams), not fitted on the feed
 
 
 class SeriesLumped:
@@ -873,12 +877,20 @@ class Simulation:
                 Vp, Ip = np.eye(n)[i], self.port_current(I, i)          # port voltage = applied EMF
                 Ap[i], Bp[i] = (Vp + p.zc * Ip) / (2 * np.sqrt(p.zc)), (Vp - p.zc * Ip) / (2 * np.sqrt(p.zc))
         S = Bp @ np.linalg.inv(Ap)
+        wave = np.array([isinstance(p, LinePort) for p in self.ports])
+        scale = np.ones(n)
+        if wave.any() and n > 1:
+            S, scale = balance(S, ~wave)
+            # the most transmission differed between two directions, over the frequencies solved (run.solve_band
+            # says it)
+            self.unbalance = max(getattr(self, 'unbalance', 0.0), float((scale.max() / scale.min()) ** 2 - 1))
         for i in np.nonzero(resid > 1e-2)[0]:
             self.log.note(f"WARNING {f / 1e9:.2f} GHz port {self.ports[i].name}: wave-fit residual "
                           f"{resid[i]:.1e} - sample cuts too close to a discontinuity (use s1) "
                           f"or too short a feed for this frequency")
-        self.last = dict(f=f, I=I if keep else None, gamma=gam, resid=resid, A=Ap, B=Bp)   # A, B: the waves of each
-        return S                                                                          # excitation column
+        self.last = dict(f=f, I=I if keep else None, gamma=gam, resid=resid, A=Ap, B=Bp,   # A, B: the waves of each
+                         scale=scale)                                                      # excitation column
+        return S
 
     def sweep(self, freqs, zc=None, currents_at=None):
         out = SimpleNamespace(f=np.asarray(freqs), S=[], gamma=[], resid=[], recip=[], passiv=[], I=None, fI=None)
@@ -905,6 +917,28 @@ class Simulation:
         a = r.Aal @ I
         cx, cy = (r.cent[:, 0], r.cent[:, 1]) if a.ndim == 1 else (r.cent[:, :1], r.cent[:, 1:2])
         return cx * a - r.Bx @ I, cy * a - r.By @ I
+
+
+def balance(S, exact=None):
+    """(S made reciprocal, the ports' scales): a wave port's forward and backward waves both carry the error of
+    its characterised impedance (and of whatever else scales its currents), so the S computed is D S D^-1 of the
+    true, symmetric one, D diagonal: transmission differs between directions by d_i^2 / d_j^2 while reflections
+    and the products S_ij S_ji are exact. The d that fit |S_ij / S_ji| best are taken out, each pair weighted by
+    |S_ij S_ji| and every d held towards 1 with the weight BALANCE_FLOOR: ports that reach each other only
+    through weak terms (a filter's stop band, a pair's mode conversion: noise) are left as they are; ports
+    `exact` (lumped ones) are held at 1. What is left of the asymmetry is averaged. rf_diffvia's pair on a
+    microstrip and a stripline: |Sdd21| 0.962 one way and 0.985 the other at every frequency, 0.974 after."""
+    A = np.abs(S)
+    W = A * A.T
+    np.fill_diagonal(W, 0.0)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        R = np.where(W > 0, 0.5 * np.log(A / A.T), 0.0)       # ln d_i - ln d_j for each pair
+    L = np.diag(W.sum(1) + BALANCE_FLOOR) - W                  # the weighted graph's Laplacian, and the hold
+    if exact is not None and np.any(exact):
+        L = L + np.diag(np.where(exact, 1e6, 0.0))
+    d = np.exp(np.linalg.solve(L, (W * R).sum(1)))
+    S = S * (d[None, :] / d[:, None])
+    return 0.5 * (S + S.T), d
 
 
 def _line_fit(sim, IR, IL, step):

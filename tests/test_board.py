@@ -120,6 +120,27 @@ def test_wave_ports_with_the_characterised_gamma():
         assert abs(S[0, 0]) < 0.04 and abs(abs(S[1, 0]) - 1) < 0.01
 
 
+def test_a_pair_s_modes_take_their_gamma_from_the_characterisation():
+    """A pair's differential and common modes are fitted with the gamma of the pair's characterisation, as a single
+    line's wave is: fitted on the feed's own cuts where they span a quarter of a radian it made S wrong at the low
+    end of the band (rf_diffvia at 1 GHz: |Sdd11| 0.19 for 0.01, |Sdd21| 1.21 one way and 0.79 the other, the sweep
+    54 solves long). The ports' scales are then taken out (sim.balance): S is reciprocal."""
+    from mom25d.sim import ModePort
+    m = BoardModel(board('diff'), pairs=True, log=quiet)
+    sim = m.simulation(dmax=0.3e-3, fmin=1e9, fmax=10e9, verbose=False, wave_down_to=1e9)
+    assert [type(p) for p in sim.ports] == [ModePort] * 4 and [p.name for p in sim.ports] == ['P1d', 'P1c', 'P2d', 'P2c']
+    k0 = 2 * np.pi * 1e9 / 299792458.0
+    for p in sim.ports:
+        g = p.gamma_fn(1e9)
+        assert 1.3 * k0 < g.imag < 2.2 * k0 and abs(g.real) < 0.05 * g.imag     # between air and the dielectric
+    S = sim.sparams(1e9)
+    assert all(p.known_gamma for p in sim.ports)
+    assert np.abs(S - S.T).max() < 1e-12 and np.linalg.svd(S, compute_uv=False).max() < 1.0
+    assert abs(S[0, 0]) < 0.03 and 0.98 < abs(S[2, 0]) < 0.997 and 0.98 < abs(S[3, 1]) < 0.997
+    d2 = sim.last['scale'] ** 2
+    assert np.abs(d2 - 1).max() < 0.03 and sim.unbalance == pytest.approx(d2.max() / d2.min() - 1)
+
+
 def test_wall_points_skip_a_via_already_there():
     """Two walls meeting at a corner give one via there, not two (a duplicated via makes the via block
     singular), and a wall via on top of a board via is left out."""

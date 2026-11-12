@@ -70,5 +70,10 @@ def solve_band(sim, fmin, fmax, points=401, zref=50.0, linear=None, afs_tol=2e-3
                                            log=log, on_step=on_step, seed=sorted(keep_at))
     if keep_mid:
         sim.sparams(fs[len(fs) // 2], keep=True)
+    worst = getattr(sim, 'unbalance', 0.0)
+    if worst > 0.02:                                         # (sim.balance took it out)
+        sim.log.note(('WARNING ' if worst > 0.1 else '') + f"wave ports: transmission differed by up to "
+                     f"{100 * worst:.1f} % between its two directions, the ports' characterised impedances being "
+                     f"that consistent; made reciprocal")
     return f, S, dict(solves=len(fs), seconds=time.time() - t0, zref=zr.tolist(), solved=list(map(float, fs)),
                       names=[p.name for p in sim.ports], afs=[] if linear else hist, afs_tol=afs_tol)
