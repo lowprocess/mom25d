@@ -93,6 +93,7 @@ f, S, info = solve_band(sim, 1e9, 6e9, points=101, zref=m.port_z0)
 | `geo.py` | the mesher (Triangle, with offset rings along the copper edges) |
 | `line.py`, `quads.py` | line basis functions on straight runs; quad cells |
 | `fast.py` | the matrix fill and the solvers |
+| `looptree.py` | the loop/tree basis the direct solver takes at low frequency (pcbqs's) |
 | `gpu.py`, `ldlt.py` | the GPU backends and the tiled solver |
 | `gpu_vk.py` | the Vulkan backend: a hybrid LU (panels on the CPU, updates on the GPU) and its GPU solves |
 | `blr.py`, `hodlr.py` | the compressed solvers: block low-rank, hierarchical |

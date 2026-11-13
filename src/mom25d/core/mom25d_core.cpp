@@ -13,6 +13,8 @@
 //                   (n_rho x n_k) Bessel matrix (the Green tables and the via kernels)
 //   scale_c64     : Z <- D Z D (equilibration) and its complex64 copy, one pass (the GPU LU's input)
 //   fan_q         : G_q moments between every triangle and the via fan triangles (centroid rule)
+//   near_q        : the near pairs' G_q moment corrections alone (the loop/tree basis's charge matrix)
+//   tree_cols/rows: X K and K^T X for the loop/tree basis; charge_into: its charge block into Z
 //   project       : T^T Z T for the quad cells / line functions (quads.project), Z's rows reduced in place
 //
 // Everything mirrors the NumPy implementation in mom25d_fast.py (same tables and conventions),
@@ -463,6 +465,7 @@ void near_core(const Mesh &g, const Tables &tb, const double *nodes, const int *
             Mrr -= ga * (cpx * cqx + cpy * cqy); Mq -= gq;
         }
         if (o.qcorr) o.qcorr[i] = Mq;
+        if (o.mode == 3) continue;                  // the charge moments alone (near_q)
         // scatter to the edge pairs (halves on p) x (halves on q)
         for (int s = 0; s < 3; ++s) {
             int em_ = g.te[3 * p + s];
@@ -559,6 +562,126 @@ py::tuple near_coo(py::dict geom, py::dict tabs, py::dict quad, arr<int> P, arr<
                   P.data(), Q.data(), n, w, o);
     }
     return py::make_tuple(ri, ci, vv, qc);
+}
+
+// mode 3: the per-pair Q correction alone, nothing scattered: the loop/tree basis's charge matrix between
+// triangles (looptree.py) has the accurate moments of the near pairs as fan_q's centroid values plus these
+py::array_t<cd> near_q(py::dict geom, py::dict tabs, py::dict quad, arr<int> P, arr<int> Q, double w) {
+    MeshHold mh(geom); TabHold th(tabs);
+    arr<double> nodes(quad["nodes"]), P3(quad["P3"]), W3(quad["W3"]), P6(quad["P6"]), W6(quad["W6"]);
+    arr<int> tris(quad["tris"]);
+    const int n = (int)P.shape(0);
+    py::array_t<cd> qc(n);
+    NearOut o{};
+    o.mode = 3; o.qcorr = qc.mutable_data();
+    near_stat(quad, n, o);
+    {
+        py::gil_scoped_release nogil;
+        near_core(mh.m, th.t, nodes.data(), tris.data(), P3.data(), W3.data(), P6.data(), W6.data(),
+                  P.data(), Q.data(), n, w, o);
+    }
+    return qc;
+}
+
+// ---------------------------------------------------------------------------------------------
+// the loop/tree basis (looptree.py). The tree: its non-root nodes breadth first, each with its parent, the branch up
+// and that branch's sign (P[node] = P[parent] + sign X[branch]: the sum over the node's path to its root); the
+// roots (P = 0). A loop: its branch and that branch's two ends (its row or column plus P[cv] - P[cu]).
+// ---------------------------------------------------------------------------------------------
+struct TreeView {
+    const int *node, *parent, *branch, *roots, *cot, *cu, *cv; const double *sig;
+    int nn, nr, nc, n_nodes;
+};
+static TreeView tree_view(arr<int> &node, arr<int> &parent, arr<int> &branch, arr<double> &sig, arr<int> &roots,
+                          arr<int> &cot, arr<int> &cu, arr<int> &cv, int n_nodes) {
+    return TreeView{node.data(), parent.data(), branch.data(), roots.data(), cot.data(), cu.data(), cv.data(),
+                    sig.data(), (int)node.shape(0), (int)roots.shape(0), (int)cot.shape(0), n_nodes};
+}
+
+// X <- X K in place (X: n x m complex128, C order): a row at a time, its P over the nodes in cache
+void tree_cols(py::array_t<cd> X, arr<int> node, arr<int> parent, arr<int> branch, arr<double> sig, arr<int> roots,
+               arr<int> cot, arr<int> cu, arr<int> cv, int n_nodes) {
+    auto buf = X.request(true);
+    if (buf.ndim != 2) throw std::invalid_argument("tree_cols: X must be 2-D");
+    const i64 n = buf.shape[0], m = buf.shape[1];
+    cd *x0 = static_cast<cd *>(buf.ptr);
+    TreeView t = tree_view(node, parent, branch, sig, roots, cot, cu, cv, n_nodes);
+    py::gil_scoped_release nogil;
+#pragma omp parallel
+    {
+        std::vector<cd> P(t.n_nodes);
+#pragma omp for schedule(static)
+        for (i64 r = 0; r < n; ++r) {
+            cd *x = x0 + r * m;
+            for (int k = 0; k < t.nr; ++k) P[t.roots[k]] = 0;
+            for (int k = 0; k < t.nn; ++k) P[t.node[k]] = P[t.parent[k]] + t.sig[k] * x[t.branch[k]];
+            for (int j = 0; j < t.nc; ++j) x[t.cot[j]] += P[t.cv[j]] - P[t.cu[j]];
+        }
+    }
+}
+
+// X <- K^T X in place: blocks of columns, a block's P (nodes x block) a thread's
+void tree_rows(py::array_t<cd> X, arr<int> node, arr<int> parent, arr<int> branch, arr<double> sig, arr<int> roots,
+               arr<int> cot, arr<int> cu, arr<int> cv, int n_nodes) {
+    auto buf = X.request(true);
+    if (buf.ndim != 2) throw std::invalid_argument("tree_rows: X must be 2-D");
+    const i64 m = buf.shape[1];
+    cd *x0 = static_cast<cd *>(buf.ptr);
+    TreeView t = tree_view(node, parent, branch, sig, roots, cot, cu, cv, n_nodes);
+    const i64 B = 32, nb = (m + B - 1) / B;
+    py::gil_scoped_release nogil;
+#pragma omp parallel
+    {
+        std::vector<cd> P((size_t)t.n_nodes * B);
+#pragma omp for schedule(dynamic, 1)
+        for (i64 b = 0; b < nb; ++b) {
+            const i64 c0 = b * B, w = std::min(B, m - c0);
+            for (int k = 0; k < t.nr; ++k) std::fill_n(&P[(size_t)t.roots[k] * B], w, cd(0));
+            for (int k = 0; k < t.nn; ++k) {
+                cd *p = &P[(size_t)t.node[k] * B];
+                const cd *q = &P[(size_t)t.parent[k] * B], *x = x0 + (i64)t.branch[k] * m + c0;
+                const double s = t.sig[k];
+                for (i64 c = 0; c < w; ++c) p[c] = q[c] + s * x[c];
+            }
+            for (int j = 0; j < t.nc; ++j) {
+                cd *x = x0 + (i64)t.cot[j] * m + c0;
+                const cd *pv = &P[(size_t)t.cv[j] * B], *pu = &P[(size_t)t.cu[j] * B];
+                for (i64 c = 0; c < w; ++c) x[c] += pv[c] - pu[c];
+            }
+        }
+    }
+}
+
+// Z[tree_i, tree_j] += sum over the ends a of branch i, b of branch j of s_a s_b Mq[a, b] / (area_a area_b): the
+// tree's charge block (A_T^T Gc A_T, Gc the potential between unit charges on two triangles) straight into Z. A
+// branch's ends: u (+1) and v (-1), the ground (g) carrying none. Mq: the G_q moments between triangles (Nt x Nt).
+void charge_into(py::array_t<cd> Z, arr<cd> Mq, arr<int> tree, arr<int> u, arr<int> v, arr<double> area, int g) {
+    auto buf = Z.request(true);
+    const i64 ld = buf.shape[1], Nt = Mq.shape(1);
+    cd *z = static_cast<cd *>(buf.ptr);
+    const cd *M = Mq.data();
+    const int nt = (int)tree.shape(0);
+    const int *tr = tree.data(), *pu = u.data(), *pv = v.data();
+    const double *ar = area.data();
+    py::gil_scoped_release nogil;
+#pragma omp parallel for schedule(dynamic, 16)
+    for (int i = 0; i < nt; ++i) {
+        cd *row = z + (i64)tr[i] * ld;
+        const int ends[2] = {pu[i], pv[i]};
+        const double sg[2] = {1.0, -1.0};
+        for (int ea = 0; ea < 2; ++ea) {
+            const int a = ends[ea];
+            if (a == g) continue;
+            const cd *Ma = M + (i64)a * Nt;
+            const double sa = sg[ea] / ar[a];
+            for (int j = 0; j < nt; ++j) {
+                cd acc = 0;
+                if (pu[j] != g) acc += Ma[pu[j]] / ar[pu[j]];
+                if (pv[j] != g) acc -= Ma[pv[j]] / ar[pv[j]];
+                row[tr[j]] += sa * acc;
+            }
+        }
+    }
 }
 
 int num_threads() {
@@ -766,6 +889,10 @@ PYBIND11_MODULE(_core, m) {
     m.def("near_into_dense", &near_into_dense);
     m.def("near_matvec", &near_matvec);
     m.def("near_coo", &near_coo);
+    m.def("near_q", &near_q, "the near pairs' G_q moment corrections alone");
+    m.def("tree_cols", &tree_cols, "X <- X K, the loop/tree basis (looptree.py)");
+    m.def("tree_rows", &tree_rows, "X <- K^T X, the loop/tree basis (looptree.py)");
+    m.def("charge_into", &charge_into, "the loop/tree basis's charge block into Z[tree, tree]");
     m.def("num_threads", &num_threads);
     m.def("near_pairs", &near_pairs, "near triangle pairs (sorted by p, q)");
     m.def("hankel_real", &hankel_real, "sum_k J0(rho kr_k) W[s, k] for real kr");

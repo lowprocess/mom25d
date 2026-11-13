@@ -266,6 +266,12 @@ FRESH_STALL = (4, 0.1)   # a fresh complex64 LU on the GPU is given up when the 
 REUSE_ITER = (8, 60)     # GMRES iterations a reused LU may take (FastOperator._solve_reused): the cap, from the cost of
                          # a fresh solve, is clamped to this range
 REUSE_KEEP = 4           # complex64 LUs the CPU keeps at most, memory allowing (FastOperator._solve_kept)
+LOOP_TREE_BELOW = 1e-5   # sim.loop_tree 'auto': the loop/tree basis where (k h)^2 is below this (k in the densest
+                         # dielectric, h the median edge), about the ratio of a cell's two MPIE parts. The RWG basis's
+                         # complex64 LU stops preconditioning below ~2e-6 (the via transition: ~100 MHz), its double LU
+                         # loses S11's digits below ~1e-13 (~10 kHz: 3 %, 1 kHz: its sign). The via transition from
+                         # 100 kHz to 100 MHz: 37 s in the RWG basis (6 of 7 solves falling back to double), 7 s
+_BASIS_STATE = ('_kept', '_reach', '_t_iter', '_mixed_failed', '_hybrid_failed', '_gpu_solve_bad')
 
 
 
@@ -381,6 +387,7 @@ class FastOperator:
         self.layer_of_tri, self.cent, self.area, self.layers = sim.tri_layer, r.cent, r.area, sim.layers
         self.lidx = {k: i for i, k in enumerate(self.layers)}
         self._static_cache, self.dZ_exact, self.core = {}, None, _core
+        self._lt, self._basis_name, self._basis_saved = None, 'rwg', {}    # the loop/tree basis (_solve_loop_tree)
         self._near_pairs()
         if self.core is not None:                       # the compiled core's geometry
             Ne, H, c = sim.Ne, self.tri_halves, np.ascontiguousarray
@@ -686,6 +693,9 @@ class FastOperator:
             return self._solve_direct_numpy(f, E, block)
         self.setup(f, mode='direct')
         Sx, self.iters = self.extra_blocks(f), []
+        if self._loop_tree_at(f):
+            return self._solve_loop_tree(f, E, Sx, precision)
+        self._basis('rwg')
         T = sim.qT
         quads = T is not None                       # quad cells / line functions: Z projected before the LU
         Nq = T.shape[1] if quads else N
@@ -825,6 +835,127 @@ class FastOperator:
                      f"- solving in double precision up to {MIXED_RETRY * f / 1e9:.4g} GHz")
         self._mixed_failed = max(self._mixed_failed, f)
         return self.solve_direct(f, E, block, precision='double')
+
+    # ---- the loop/tree basis (looptree.py): low frequency ------------------------------------------------
+    def _basis(self, name):
+        """Switch the kept LUs and what was learnt about them (_BASIS_STATE) to basis `name` ('rwg', 'loop/tree'):
+        one basis's LU does not precondition the other's matrix. The other's GPU LUs are dropped (their memory is
+        the next factor's); its CPU ones are kept for when it is back."""
+        if self._basis_name == name:
+            return
+        mine = {k: getattr(self, k) for k in _BASIS_STATE}
+        mine['_kept'] = [k for k in mine['_kept'] if not isinstance(k[1], _GPUKept)]
+        self._basis_saved[self._basis_name] = mine
+        back = self._basis_saved.pop(name, None) or dict(_kept=[], _reach=np.log(2.0), _t_iter=None, _mixed_failed=0.0,
+                                                          _hybrid_failed=0.0, _gpu_solve_bad=0.0)
+        for k, v in back.items():
+            setattr(self, k, v)
+        self._basis_name = name
+
+    def kh2(self, f):
+        """(k h)^2 at f: k in the densest dielectric, h the mesh's median edge - about the ratio of a cell's jw
+        part of the MPIE to its 1/(jw) part."""
+        from .base import C0
+        k = 2 * np.pi * f / C0 * np.sqrt(self.sim.st.max_er())
+        return float((k * np.median(self.sim.rwg.l)) ** 2)
+
+    def _loop_tree_at(self, f):
+        """Whether f is solved in the loop/tree basis (sim.loop_tree: 'auto' below LOOP_TREE_BELOW, 'on', 'off'):
+        the compiled core with near_q, no quad cells or line functions, no holes of PEC planes, and room for the
+        double-precision matrix, the charge matrix and a complex64 copy."""
+        sim, mode = self.sim, getattr(self.sim, 'loop_tree', 'auto')
+        if mode == 'off' or (mode == 'auto' and self.kh2(f) >= LOOP_TREE_BELOW):
+            return False
+        why = ('no compiled core with the loop/tree kernels (python -m mom25d.core.build)' if self.core is None
+               or not hasattr(self.core, 'charge_into') else 'quad cells or line functions' if sim.qT is not None
+               else 'holes of PEC planes (frills)' if sim.frills else None)
+        if why is None:
+            from .sim import available_memory
+            N, Nt = sim.Ne + sim.Nv, len(sim.rwg.tris)
+            need = max(16.0 * (N * N + Nt * Nt), 24.0 * N * N) + 0.9e9     # (Z with the charge matrix, then its copy)
+            if need > 0.8 * available_memory():
+                why = f"its matrices need ~{need / 1e9:.1f} GB"
+        if why is not None:
+            if not getattr(self, '_lt_why', None):
+                self._lt_why = why
+                sim.log.note(f"loop/tree basis not used at {f / 1e9:.4g} GHz ((k h)^2 = {self.kh2(f):.1e}): {why}")
+            return False
+        return True
+
+    def _looptree(self):
+        if self._lt is None:
+            from .looptree import LoopTree
+            with self.sim.log.timer('loop/tree basis'):
+                self._lt = LoopTree(self.sim)
+            lt = self._lt
+            self.sim.log.note(f"loop/tree basis: {len(lt.cot)} loops, {len(lt.tree)} tree branches (depth {lt.depth}, "
+                              f"{len(lt.roots)} root{'s' if len(lt.roots) != 1 else ''})")
+        return self._lt
+
+    def _solve_loop_tree(self, f, E, Sx, precision):
+        """The direct solve in the loop/tree basis (looptree.py): M = K_s^T Z_A K_s + the tree's charge block,
+        Z_A filled with the tables' charge side zeroed, the charge block from the potentials between triangles;
+        then as solve_direct (mixed precision: the complex64 LU, on the GPU when it fits, refined with the dense
+        double M, LUs kept across frequencies). Returns the basis currents."""
+        sim, core, w, lt = self.sim, self.core, self.w, self._looptree()
+        self._basis('loop/tree')
+        Ne, Nv, N, Nt = sim.Ne, sim.Nv, sim.Ne + sim.Nv, len(sim.rwg.tris)
+        tb = self.tb
+        z = np.zeros_like
+        tbA = dict(tb, Q=z(tb['Q']), cq=z(tb['cq']), cqi=z(tb['cqi']))     # the current's part alone
+        with sim.log.timer('direct fill', f"N={N}, complex128, the current's part (loop/tree), "
+                                          f"{core.num_threads()} threads"):
+            Z = np.zeros((N, N), complex)
+            core.fill_far(Z, self.g, tbA, w)
+        with sim.log.timer('near-field correction'):
+            core.near_into_dense(Z, self.g, tbA, self.q, self.nP32, self.nQ32, w)
+            self._near_kept()
+        if Nv:
+            with sim.log.timer('via kernels', f"{Nv} chains, without their end charges"):
+                B, C = sim._via_blocks(f, None, charges=False)
+            Z[:Ne, Ne:], Z[Ne:, :Ne], Z[Ne:, Ne:] = B, B.T, C
+        if Sx.nnz:
+            Sc = Sx.tocoo()
+            np.add.at(Z, (Sc.row, Sc.col), Sc.data)
+        with sim.log.timer('loop/tree transform', f"{len(lt.cot)} loops, depth {lt.depth}"):
+            lt.to_ideal(Z, lambda fn: _row_blocks(Z, fn))
+            lt.cols(Z, core)                                # Z K
+            lt.rows(Z, core)                                # K^T Z K
+            sc = lt.scales(w)
+
+            def scale(a, b):
+                Z[a:b] *= sc[a:b, None]
+                Z[a:b] *= sc[None, :]
+            _row_blocks(Z, scale)
+        with sim.log.timer('charge matrix', f"{Nt} triangles"):
+            Mq = core.fan_q(self.g, tb, np.arange(Nt, dtype=np.int32))
+            Mq[self.nP, self.nQ] += core.near_q(self.g, tb, self.q, self.nP32, self.nQ32, w)    # (a pair once)
+            lt.charge_into(Z, Mq, sim.rwg.area, core)
+            del Mq
+        Es = sc[:, None] * lt.rows(lt.rhs(E), core)
+        dsc = 1.0 / np.sqrt(np.abs(np.diagonal(Z)) + 1e-300)
+        if precision == 'mixed':
+            from .sim import available_memory
+            gpu = self._backend()
+            on_gpu = sum(getattr(k[1], 'device_bytes', 0) for k in self._kept)
+            gpu = gpu if gpu is not None and gpu.fits(N, on_gpu) else None
+            kept = sum(k[1].nbytes for k in self._kept if hasattr(k[1], 'nbytes'))
+            if sim.reuse == 'off':
+                self._keep_max = 0
+            elif gpu is not None:
+                self._keep_max = int(min(REUSE_KEEP, (0.9 * (gpu.mem_free() + on_gpu) - 0.4e9) // (8.0 * N * N)))
+            else:
+                self._keep_max = int(min(REUSE_KEEP, (0.8 * (available_memory() + kept) - 24.0 * N * N - 0.9e9)
+                                         // (8.0 * N * N)))
+            Y = self._solve_kept(f, Z, dsc, Es, gpu)
+        else:
+            _equilibrate(Z, dsc)
+            with sim.log.timer('LU factor', f"N={N} (loop/tree)"):
+                lu = _lu(Z)
+            del Z
+            with sim.log.timer('LU solve'):
+                Y = dsc[:, None] * _lu_solve(lu, dsc[:, None] * Es)
+        return lt.from_ideal(lt.from_tree(sc[:, None] * Y))
 
     def _reusable(self, f):
         """The kept preconditioner (_solve_reused, _solve_kept) to try at f: the one nearest in frequency, if near

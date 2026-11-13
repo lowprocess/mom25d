@@ -333,6 +333,9 @@ class Simulation:
         self.hodlr_tol, self.hodlr_leaf, self.hodlr_refine = 1e-6, 256, False   # solver='hodlr'
         self.hodlr_symmetric = False        # Z^T = Z: half the compression (the near correction is not quite)
         self.reuse = 'auto'                 # 'auto' | 'off': the CPU's complex64 LU kept for the next frequencies
+        self.loop_tree = os.environ.get('MOM25D_LOOP_TREE', 'auto')     # 'auto' | 'on' | 'off': the direct
+                                            # solver in the loop/tree basis (looptree.py) at low frequency (auto: below
+                                            # fast.LOOP_TREE_BELOW of (k h)^2)
         self.stream = 'auto'                # 'auto' | 'on' | 'off': the Vulkan GPU's LU filled by row blocks, no host Z
                                             # (auto: where the host cannot hold a complex64 Z)
         self.dmax, self.ncross, self.grade, self.near_fac = dmax, ncross, grade, near_fac
@@ -723,16 +726,19 @@ class Simulation:
 
     VIA_TABLE_PAIRS = 64                 # via pairs of one span pair above which R comes from a table
 
-    def _via_blocks(self, f, QF):
+    def _via_blocks(self, f, QF, charges=True):
         """Via rows/columns: B (Ne x Nv) strip-via coupling, C (Nv x Nv) via-via (incl. elements in vias); after the
-        chains, the holes of the PEC planes inside the stack (_frill_blocks)."""
+        chains, the holes of the PEC planes inside the stack (_frill_blocks). charges=False: without the chains'
+        fan-distributed end charges, the blocks' only 1/(jw) part (QF not used): what the loop/tree basis
+        (looptree.py) has, the charges being in its charge matrix. The rest (the D and R kernels, the barrel's
+        own term) is the current's: its static part cancels the end charges', so it goes as jw."""
         w, r = 2 * np.pi * f, self.rwg
         B, C = np.zeros((self.Ne, self.Nv), complex), np.zeros((self.Nv, self.Nv), complex)
         if self.frills:
             self._frill_blocks(f, B, C)
         vk = ViaKernels(f, self.st, [(kb, kt) for _, kb, kt in self.chains], self.layers, self.rho_max)
         # fan-distributed end charges (G_q between triangles, same machinery as strips)
-        if len(self.F):
+        if len(self.F) and charges:
             T = QF @ self.dF                                   # (Nt, Nv) potential of fan charges
             B += (r.D.T @ T) / (1j * w)
             C += (self.dF.T @ T[self.F]) / (1j * w)
