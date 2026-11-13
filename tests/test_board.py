@@ -298,3 +298,17 @@ def test_ground_apertures():
     gnd['polygon'] = mapping(shape(gnd['polygon']).difference(box(5.0, -5.8, 5.4, -4.2)))  # a slot across the trace
     (slot, area), = ground_apertures(data, 'B.Cu')
     assert area == pytest.approx(0.4 * 1.6, rel=1e-3) and slot.centroid.x == pytest.approx(5.2)
+
+
+def test_a_feed_with_another_trace_beside_it_takes_a_lumped_port():
+    """port auto: a wave port fits one line's two waves, and what a neighbour couples in along the feed is not
+    one of them (kicad2ems's rf_crosstalk, two lines 3 mm apart on 0.8 mm: NEXT 20 dB low with wave ports). A
+    lone line keeps its wave ports, and port='wave' is the user's word."""
+    m = BoardModel(board('xtalk'), log=quiet)
+    ps = m.ports(dmax=0.3e-3)
+    assert [type(p).__name__ for p in ps] == ['ViaPort'] * 4
+    assert sum('another trace runs beside its feed' in n for n in m.notes) == 4
+    m = BoardModel(board('xtalk'), port='wave', log=quiet)
+    assert [type(p).__name__ for p in m.ports(dmax=0.3e-3)] == ['LinePort'] * 4
+    m = BoardModel(board('thru'), log=quiet)
+    assert [type(p).__name__ for p in m.ports(dmax=0.3e-3)] == ['LinePort'] * 2 and not any('beside' in n for n in m.notes)

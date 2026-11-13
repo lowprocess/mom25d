@@ -24,6 +24,11 @@ MM = 1e-3
 
 
 KNOWN_SPAN = 0.1          # rad: the least span of a wave port's cuts at the lowest frequency, gamma known
+COUPLED_REACH = 8.0       # an 'auto' port is lumped where other signal copper runs beside its feed within this many
+                          # heights of it: a wave port fits one line's two waves to the feed's currents, and what
+                          # the neighbour couples in along the feed is not one of them. rf_crosstalk (two lines
+                          # 3 mm apart on 0.8 mm, wave ports at their ends): NEXT -52 dB at 1 GHz and FEXT -34 dB at
+                          # 6 GHz, against -31.7 and -17.5 dB with lumped ports (Palace: -31.0 and -17.2 dB)
 
 
 def _cross(g, p, d, half):
@@ -87,6 +92,19 @@ class PlanarModel:
                              f"interface M{k}")
         return c, np.asarray(sp['d'], float), k, g
 
+    def _beside(self, k, g, c, d, w, win):
+        """Whether other signal copper runs beside the cuts of a wave port's feed, within COUPLED_REACH heights of
+        its edge (the feed: through c along d on interface k, width w; win: _wave_window's). Ground copper beside
+        it (a coplanar line's) is not a neighbour."""
+        sig = getattr(self, 'signal', None)
+        reach = COUPLED_REACH * self.stack.layers[k - 1].h
+        for s in np.linspace(win[1], win[2], 5):
+            p = c + d * s
+            for q in _cross(g, p, d, w / 2 + reach):
+                if q.distance(Point(*p)) > 1e-9 and (sig is None or sig.buffer(1e-9).intersects(q)):
+                    return True
+        return False
+
     def _wave_window(self, w, L, step):
         """(gap offset, first and last cut, cut spacing) for a straight feed of width w, length L."""
         clear = max(2 * step, 4 * w, 3 * self.stack.z[-1], 1.0e-3)   # stay out of the next discontinuity's near field
@@ -139,13 +157,17 @@ class PlanarModel:
                     if (win[2] - win[1]) * beta < KNOWN_SPAN:
                         need = max(need, L - (win[2] - win[1]) + KNOWN_SPAN / beta)
                         win = None
-                if win is not None:
+                beside = win is not None and kind == 'auto' and self._beside(k, g, c, d, w, win)
+                if win is not None and not beside:
                     out.append(wave(k, c, d, w, win, zc=z0, name=name))
                     continue
                 if kind == 'wave':
                     raise ValueError(f"{name}: straight feed too short for a wave port ({L * 1e3:.2f} mm, need {need * 1e3:.2f} mm)")
-                self.notes.append(f"{name}: no straight feed of {need * 1e3:.1f} mm for a wave port"
-                                  + (f" down to {fmin / 1e9:g} GHz" if fmin else '') + f" (found {L * 1e3:.2f} mm) - lumped port")
+                self.notes.append(
+                    f"{name}: another trace runs beside its feed (within {COUPLED_REACH:g} heights): a wave port would "
+                    f"take their coupling out - lumped port (--mom-port wave keeps the wave port)" if beside else
+                    f"{name}: no straight feed of {need * 1e3:.1f} mm for a wave port"
+                    + (f" down to {fmin / 1e9:g} GHz" if fmin else '') + f" (found {L * 1e3:.2f} mm) - lumped port")
                 kind = 'via'
             if kind == 'via':
                 kr = sp.get('kref', 0)                                     # its reference: below, or above it
