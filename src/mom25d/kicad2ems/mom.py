@@ -390,8 +390,8 @@ class MoM25D(Solver):
                "the lowest one over them a PEC cover (rf_stripline 15,563 unknowns to 8,671); mesh: every plane "
                "meshed; or holes (experimental): as pec, and a plane between the copper layers whose only holes are "
                "those of vias through it is a perfect conductor too, each hole a few unknowns (demo_transition "
-               "3,910 unknowns to 1,504; a trace over a hole sees the plane closed: S within 0.08 of the meshed "
-               "plane's there) (docs/mom.md#planes)", choices=('pec', 'mesh', 'holes'), name='planes',
+               "3,910 unknowns to 1,508, S within 0.02 of the meshed plane's) (docs/mom.md#planes)",
+               choices=('pec', 'mesh', 'holes'), name='planes',
                gui='MoM solid planes', group=G),
         Option('mom_stitching_pads', 'drop', "drop (default): a ground via's pad with nothing else on its layer (a "
                "stitching via through a signal layer; not a part's or a port's pad) left out, the via kept as its "

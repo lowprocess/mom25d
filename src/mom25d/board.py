@@ -207,7 +207,8 @@ class BoardModel(PlanarModel):
         (Hz) at which they hold, the Djordjevic-Sarkar model elsewhere (multilayer.djordjevic_sarkar). planes
         'holes' (experimental): as 'pec', and a plane between the copper layers whose only holes are those of
         vias through it (plane_holes) is a PEC plane inside the stack, not meshed, each hole a few unknowns
-        (mom25d.frill): axisymmetric, so what a trace over a hole adds is left out."""
+        (mom25d.frill): its axisymmetric field and its first azimuthal order, which a trace over the hole
+        drives."""
         assert planes in ('pec', 'mesh', 'holes'), f"planes: pec, mesh or holes, not {planes!r}"
         from .multilayer import Layer, LayerStack
         if data.get('format') != FORMAT:
@@ -285,7 +286,7 @@ class BoardModel(PlanarModel):
                 self._pec_geom[k] = S(got[0])
                 self._holes += [(i, k, b * MM, a * MM if a else None) for i, b, a in got[1]]
                 self.notes.append(f"{lay}: a PEC plane inside the stack, not meshed; {len(got[1])} via hole(s) as "
-                                  f"unknowns (planes 'holes': a trace over a hole sees the plane closed)")
+                                  f"unknowns (planes 'holes')")
             self.stack.pec = tuple(sorted(self._pec_geom))
         self.shapes = {k: [S(unary_union(copper[lay])).buffer(0)] for lay, k in self.iface.items()
                        if copper.get(lay) and k not in self._pec_geom}

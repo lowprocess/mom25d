@@ -136,7 +136,8 @@ def test_a_hole_s_potential_and_admittance():
     from mom25d.frill import Frill, FrillKernels, profile
     st = LayerStack([Layer(0.2e-3, 4.3), Layer(0.02e-3, 4.3), Layer(3e-3, 4.3)], top_er=4.3, pec=(1,))
     a, b = 0.15e-3, 0.35e-3
-    fr, fr2 = Frill(NS(x=0.0, y=0.0, a=a), 1, b, modes=2), Frill(NS(x=2e-3, y=0.0, a=a), 1, b, modes=1)
+    fr, fr2 = Frill(NS(x=0.0, y=0.0, a=a), 1, b, modes=2, dipoles=0), Frill(NS(x=2e-3, y=0.0, a=a), 1, b, modes=1, dipoles=0)
+    assert Frill(NS(x=0.0, y=0.0, a=a), 1, b).count == 6 and fr.count == 2          # (2 axisymmetric, 2 x (cos, sin))
     fk = FrillKernels(1e8, st, [fr, fr2], [2, 3], 10e-3)
     assert [(u[0] is fr, u[1]) for u in fk.unknowns] == [(True, 0), (True, 1), (False, 0)]
     s0, rho = fk.shape(fr, 0), np.array([0.0, a, 0.25e-3, b, 1e-3, 3e-3])
@@ -149,11 +150,106 @@ def test_a_hole_s_potential_and_admittance():
     assert 40e-15 < C < 120e-15 and C1 == pytest.approx(C, rel=0.01)
     assert fk.Y((fr, 0), (fr, 1)) == pytest.approx(fk.Y((fr, 1), (fr, 0)), rel=1e-12)       # (symmetric to rounding)
     Cm = fk.Y((fr, 0), (fr2, 0)).imag / (2 * np.pi * 1e8)
-    assert -0.01 * C < Cm < 0 and fk.Y((fr, 0), (Frill(NS(x=0.0, y=0.0, a=a), 2, b), 0)) == 0.0     # another plane
+    assert -0.01 * C < Cm < 0 and fk.Y((fr, 0), (Frill(NS(x=0.0, y=0.0, a=a), 2, b, dipoles=0), 0)) == 0.0     # another plane
     # the first shape: 1 V across the hole (its transform's integral: int e dkr = int g drho); the coaxial field's
     # transform where the hole is narrow against the wavelength of kr
     kr = np.linspace(1.0, 4e5, 40001)
     assert np.trapezoid(profile(kr, a, b), kr) == pytest.approx(1.0, abs=0.02)
+
+
+def test_a_hole_s_first_order_shapes_are_their_tm_and_te_parts():
+    """frill.dipole_shapes: a shape that goes as cos(phi) about the via is a part along k (TM: a potential,
+    psi cos(phi)) and a part across it (TE: a field, U0 and U2). Put back together at the plane itself (transfer
+    1) they are the shape's own field inside the hole, and nothing on the metal: every sign and factor between
+    e1, h1, the potential and the field (FrillKernels' tables, with the network's transfers in)."""
+    from scipy.special import jv
+    from mom25d.frill import dipole_shapes, DIPOLE_SHAPES
+    a, b = 0.15e-3, 0.45e-3
+    kr = np.linspace(1e-3 / b, 250 / b, 100001)
+    dk = (kr[1] - kr[0]) * np.exp(-0.5 * (kr * 0.01 * b) ** 2)     # (smoothed over b / 100: the integrals converge)
+    for j in (0, 1):
+        e1, h1 = dipole_shapes(kr, a, b, j)
+        R, F = DIPOLE_SHAPES[j]
+        for x in (0.2, 0.5, 0.8, 1.2):
+            rho = x * b
+            z = kr * rho
+            J0, J1, J2 = jv(0, z), jv(1, z), jv(2, z)
+            dpsi, psi_r = -np.sum(e1 * (J0 - J1 / z) * kr * dk), -np.sum(e1 * J1 * dk) / rho
+            U0, U2 = 0.5 * np.sum(h1 * J0 * kr * dk), 0.5 * np.sum(h1 * J2 * kr * dk)
+            Er, Ef = -dpsi + U0 + U2, psi_r - U0 + U2          # E_rho at phi = 0, E_phi at phi = pi / 2
+            inside = a < rho < b
+            c = np.sqrt(1 - x * x) if inside else 1.0
+            want = ((R(c, a / rho) if R else 0.0) if inside else 0.0, (F(c, a / rho) if F else 0.0) if inside else 0.0)
+            assert Er * b == pytest.approx(want[0], abs=0.01) and Ef * b == pytest.approx(want[1], abs=0.01), (j, x)
+
+
+def test_the_first_order_s_admittance_turns_with_the_holes():
+    """FrillKernels.Y between the cos and sin unknowns: of one hole they are alike and apart (from each other and
+    from the axisymmetric ones); of two holes the matrix is that of two dipoles, the same whatever direction the
+    second hole lies in once the shapes are taken along and across that direction."""
+    from types import SimpleNamespace as NS
+    from mom25d.frill import Frill, FrillKernels
+    st = LayerStack([Layer(0.2e-3, 4.3, 0.02) for _ in range(3)], pec=(2,))
+    a, b, d = 0.15e-3, 0.45e-3, 1.2e-3
+
+    def Y(gamma):
+        f1 = Frill(NS(x=0.3e-3, y=-0.2e-3, a=a), 2, b, modes=1, dipoles=2)
+        f2 = Frill(NS(x=0.3e-3 + d * np.cos(gamma), y=-0.2e-3 + d * np.sin(gamma), a=a), 2, b, modes=1, dipoles=2)
+        fk = FrillKernels(5e9, st, [f1, f2], [1, 3], 10e-3)
+        assert [u[1] for u in fk.unknowns[:5]] == [0, ('c', 0), ('s', 0), ('c', 1), ('s', 1)]
+        return np.array([[fk.Y(u, v) for v in fk.unknowns] for u in fk.unknowns])
+    Y0 = Y(0.0)
+    n = Y0.shape[0] // 2
+    assert n == 5 and np.abs(Y0 - Y0.T).max() < 1e-12 * np.abs(Y0).max()
+    own = Y0[:n, :n]
+    assert own[1, 1] == pytest.approx(own[2, 2], rel=1e-12) and own[1, 2] == 0 and own[0, 1] == 0 and own[1, 4] == 0
+    assert own[1, 3] == pytest.approx(own[2, 4], rel=1e-12) and abs(own[1, 3]) > 0      # two shapes of one hole
+    assert own[1, 1].imag < 0 < own[0, 0].imag              # (the dipoles' is the TE part's: inductive at 5 GHz)
+    g = 0.7
+    c, s = np.cos(g), np.sin(g)
+    R1 = np.eye(n, dtype=complex)                           # the hole's (c, s) along and across the direction g
+    for i in (1, 3):
+        R1[i:i + 2, i:i + 2] = [[c, -s], [s, c]]
+    R = np.block([[R1, 0 * R1], [0 * R1, R1]])
+    Yg = R.T @ Y(g) @ R
+    assert np.abs(Yg - Y0).max() < 1e-9 * np.abs(Y0).max()
+    cross = Y0[:n, n:]
+    assert abs(cross[0, 2]) < 1e-12 * abs(cross[0, 1]) and abs(cross[1, 2]) < 1e-12 * abs(cross[1, 1])  # along / across
+    assert cross[0, 1] == pytest.approx(-cross[1, 0], rel=1e-9)     # a dipole seen from either end
+
+
+def test_a_trace_over_a_plane_s_hole():
+    """What the axisymmetric hole lacked: a trace that crosses the hole's rim on its way to the via's pad (a
+    microstrip above the plane, a stripline below it). With the plane meshed and with the plane as PEC and the
+    hole's unknowns, S agrees to the meshes' own difference with the first azimuthal order (frill.dipoles), and
+    is three times as far without it."""
+    pytest.importorskip('mom25d._core')
+    from shapely.geometry import box, Point
+    from mom25d.frill import Frill
+    mm = 1e-3
+    a, b, L, w3, w1, pad = 0.15 * mm, 0.45 * mm, 4 * mm, 0.35 * mm, 0.15 * mm, 0.3 * mm
+    layers = [Layer(0.2 * mm, 4.3, 0.02) for _ in range(3)]
+    top = lambda: [box(-L, -w3 / 2, 0, w3 / 2), Point(0, 0).buffer(pad)]
+    bot = lambda: [box(0, -w1 / 2, L, w1 / 2), Point(0, 0).buffer(pad)]
+    ports = lambda: [ViaPort(Via(-L, 0, 2, 3, 0.1 * mm), name='P1'), ViaPort(Via(L, 0, 0, 1, 0.07 * mm), name='P2')]
+    gv = lambda: [Via(x * mm, s * 1.5 * mm, 0, 2, 0.15 * mm) for x in np.arange(-4.5, 4.51, 1.5) for s in (1, -1)]
+    kw = dict(dmax=0.3 * mm, w_ref={3: w3, 1: w1}, solver='direct', precision='double', gpu='off', verbose=False)
+    fs = (5e9, 10e9)
+    sig = Via(0, 0, 1, 3, a, name='sig')
+    plane = box(-6 * mm, -3 * mm, 6 * mm, 3 * mm).difference(Point(0, 0).buffer(b, 32))
+    meshed = Simulation(LayerStack(layers), {1: bot(), 2: [plane], 3: top()}, ports(), vias=[sig] + gv(),
+                        dmax_layer={2: 0.6 * mm}, **kw)
+    ref = np.array([meshed.sparams(f) for f in fs])
+    err = {}
+    for dip in (0, 2):
+        v = Via(0, 0, 1, 3, a, name='sig')
+        s = Simulation(LayerStack(layers, pec=(2,)), {1: bot(), 3: top()}, ports(), vias=[v] + gv(),
+                       frills=[Frill(v, 2, b, dipoles=dip)], **kw)
+        assert s.Nv == len(s.chains) + 2 + 2 * dip and s.Ne < 0.5 * meshed.Ne
+        S = np.array([s.sparams(f) for f in fs])
+        assert np.abs(S - S.transpose(0, 2, 1)).max() < 1e-6 and np.linalg.svd(S, compute_uv=False).max() < 1.0
+        err[dip] = np.abs(S - ref).max()
+    assert err[2] < 0.02 and err[0] > 3 * err[2], err
 
 
 def test_pads_joined_by_a_via_through_a_plane_s_hole():
@@ -180,7 +276,7 @@ def test_pads_joined_by_a_via_through_a_plane_s_hole():
     def holes(modes, couple=True):
         v = sig()
         s = Simulation(LayerStack(layers, pec=(2,)), {1: pad(), 3: pad()}, port(), vias=[v] + gv(),
-                       frills=[Frill(v, 2, b, modes=modes)], **kw)
+                       frills=[Frill(v, 2, b, modes=modes, dipoles=0)], **kw)
         if not couple:                                          # the hole closed: its unknown on its own
             blocks = s._frill_blocks
 
@@ -199,6 +295,9 @@ def test_pads_joined_by_a_via_through_a_plane_s_hole():
     assert cap(holes(1, couple=False)) > 1.3 * C
     with pytest.raises(AssertionError, match='a hole is in a PEC plane inside the stack'):
         Simulation(LayerStack(layers), {1: pad(), 3: pad()}, port(), vias=[sig()], frills=[Frill(sig(), 2, b)], **kw)
+    both = Simulation(LayerStack(layers, pec=(2,)), {1: pad(), 3: pad()}, port(), vias=[v := sig()] + gv(),
+                      frills=[Frill(v, 2, b)], **kw)             # the first order too: nothing here drives it much
+    assert both.Nv == len(one.chains) + 6 and cap(both) == pytest.approx(C, rel=0.01)
 
 
 def test_mesher_t_junction_port_lines():

@@ -1348,7 +1348,7 @@ class FastOperator:
         """Every unknown's place: the edges' midpoints, the via chains' axes, the PEC planes' holes'."""
         sim = self.sim
         border = [[v.x, v.y] for v, _, _ in sim.chains] + \
-            [list(fr.xy) for fr in getattr(sim, 'frills', ()) for _ in range(fr.modes)]
+            [list(fr.xy) for fr in getattr(sim, 'frills', ()) for _ in range(fr.count)]
         return np.vstack([sim.rwg.mid] + ([np.array(border)] if border else []))
 
     def _raw_entry(self, dZx):

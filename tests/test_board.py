@@ -143,9 +143,9 @@ def test_a_pair_s_modes_take_their_gamma_from_the_characterisation():
 
 def test_a_plane_only_vias_run_through_as_a_pec_plane_with_holes():
     """planes='holes' (experimental): the demo transition's inner plane, whose one hole is the signal via's, is a
-    PEC plane inside the stack, not meshed, and the hole a couple of unknowns (mom25d.frill): 1,500 unknowns for
-    3,900. The model is axisymmetric: the traces over the hole see the plane closed, and S is 0.08 from the
-    meshed plane's at most. A plane with any other hole stays meshed."""
+    PEC plane inside the stack, not meshed, and the hole a few unknowns (mom25d.frill): 1,500 unknowns for
+    3,900, S within 0.02 of the meshed plane's (0.09 before the hole had its first azimuthal order: the traces
+    over it saw the plane closed). A plane with any other hole stays meshed."""
     import copy
     from shapely.geometry import shape
     from mom25d.board import plane_holes
@@ -177,7 +177,7 @@ def test_a_plane_only_vias_run_through_as_a_pec_plane_with_holes():
     res = {p: solve_board(data, f, planes=p, port='via', log=quiet, max_solves=4) for p in ('pec', 'holes')}
     assert res['holes'].unknowns < 0.45 * res['pec'].unknowns
     S, ref = res['holes'].S, res['pec'].S
-    assert np.abs(S - ref).max() < 0.1 and np.abs(np.abs(S[:, 1, 0]) - np.abs(ref[:, 1, 0])).max() < 0.01
+    assert np.abs(S - ref).max() < 0.03 and np.abs(np.abs(S[:, 1, 0]) - np.abs(ref[:, 1, 0])).max() < 0.005
     assert np.abs(S - S.transpose(0, 2, 1)).max() < 1e-6 and np.linalg.svd(S, compute_uv=False).max() < 1.0
 
 

@@ -491,7 +491,7 @@ class Simulation:
             self.edge_layer = self.tri_layer[self.rwg.tp]
         r = self.rwg
         # Nv: the chains, then the holes' unknowns (their field shapes' amplitudes: frill.py)
-        self.Ne, self.Nv = r.Ne, len(self.chains) + sum(fr.modes for fr in self.frills)
+        self.Ne, self.Nv = r.Ne, len(self.chains) + sum(fr.count for fr in self.frills)
         if mesh_only:
             return
         self.tri_idx = {k: np.nonzero(self.tri_layer == k)[0] for k in self.layers}
@@ -796,7 +796,10 @@ class Simulation:
         return B, C
 
     def _frill_blocks(self, f, B, C):
-        """The columns and rows of the holes' voltages (frill.py: c and -Y), into B and C after the chains'."""
+        """The columns and rows of the holes' unknowns (frill.py: c and -Y), into B and C after the chains'. An
+        axisymmetric shape is a potential on each interface; one of the first order (a dipole shape, its cos or
+        its sin) a potential that goes as the angle about the hole, and a field with none (its TE part), tested
+        on the edges themselves."""
         from .frill import FrillKernels
         r, Nc = self.rwg, len(self.chains)
         fk = FrillKernels(f, self.st, self.frills, self.layers, self.rho_max)
@@ -805,18 +808,40 @@ class Simulation:
             spans.setdefault((kb, kt), []).append(n)
         for m, (fr, mode) in enumerate(fk.unknowns):
             s, col = fk.shape(fr, mode), Nc + m
+            dip = mode[0] if isinstance(mode, tuple) else None    # 'c' or 's'
             psi = np.zeros(len(r.tris), complex)              # the shape's potential over each triangle
+            field = np.zeros((3, len(r.tris)), complex) if dip else None    # int of r . E, E_x, E_y (its TE part)
             for k in self.layers:
-                if (s, k) in fk.psi:
-                    idx = self.tri_idx[k]
-                    dist = np.hypot(self.P6[idx, :, 0] - fr.via.x, self.P6[idx, :, 1] - fr.via.y)
+                if (s, k) not in fk.psi:
+                    continue
+                idx = self.tri_idx[k]
+                dx, dy = self.P6[idx, :, 0] - fr.via.x, self.P6[idx, :, 1] - fr.via.y
+                dist = np.hypot(dx, dy)
+                if not dip:
                     psi[idx] = (fk.psi[(s, k)](dist) * self.W6[idx]).sum(1)
+                    continue
+                cs, sn = dx / np.maximum(dist, 1e-12), dy / np.maximum(dist, 1e-12)
+                c2, s2 = cs * cs - sn * sn, 2 * sn * cs
+                psi[idx] = (fk.psi[(s, k)](dist) * (cs if dip == 'c' else sn) * self.W6[idx]).sum(1)
+                U = fk.U[(s, k)](dist)
+                ex, ey = (U[..., 0] + U[..., 1] * c2, U[..., 1] * s2) if dip == 'c' else \
+                    (U[..., 1] * s2, U[..., 0] - U[..., 1] * c2)
+                W = self.W6[idx]
+                field[:, idx] = ((self.P6[idx, :, 0] * ex + self.P6[idx, :, 1] * ey) * W).sum(1), (ex * W).sum(1), \
+                    (ey * W).sum(1)
             B[:, col] = -(r.D.T @ psi)
+            if dip:                                           # -<f, E>: f = Aal r - (Bx, By) on a triangle
+                B[:, col] -= r.Aal.T @ field[0] - r.Bx.T @ field[1] - r.By.T @ field[2]
             c = -(self.dF[:, :Nc].T @ psi[self.F]) if len(self.F) else np.zeros(Nc, complex)
             for span, ns in spans.items():                    # the chains' remainder, by span
-                d = np.array([max(np.hypot(self.chains[n][0].x - fr.via.x, self.chains[n][0].y - fr.via.y),
-                                  self.chains[n][0].a) for n in ns])
-                c[ns] += fk.rem(s, span, d)
+                dx = np.array([self.chains[n][0].x - fr.via.x for n in ns])
+                dy = np.array([self.chains[n][0].y - fr.via.y for n in ns])
+                d = np.maximum(np.hypot(dx, dy), [self.chains[n][0].a for n in ns])
+                rem = fk.rem(s, span, d)
+                if dip:                                       # (the via on the hole's own axis: none)
+                    off = np.hypot(dx, dy) > 1e-9
+                    rem = np.where(off, rem * (dx if dip == 'c' else dy) / np.where(off, np.hypot(dx, dy), 1.0), 0.0)
+                c[ns] += rem
             C[:Nc, col] = C[col, :Nc] = c
             for g, other in enumerate(fk.unknowns[:m + 1]):
                 C[Nc + g, col] = C[col, Nc + g] = -fk.Y(other, (fr, mode))
