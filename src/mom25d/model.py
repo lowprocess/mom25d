@@ -235,8 +235,15 @@ class PlanarModel:
                 pt = Point(*(0.5 * (a.c + b.c) + a.d * 0.5 * (a.s0 + a.s1)))
                 gap = abs((a.c - b.c) @ a.t) - 0.5 * (a.w + b.w)
                 planes = narrow(self._planes_at(a.layer, pt, a.d, a.w), a.w + b.w + gap)
-                ge, ze, go, zo = line_char_pair(self.stack, a.layer, 0.5 * (a.w + b.w), gap, fs, planes=planes, dmax=dmax,
-                                                length=length_for(a.w + b.w + gap))
+                # (char_length: a longer line where the two modes' speeds have to be told apart closely: a
+                # stretch cut out and put back as the pair's modal lines, kicad2ems/mixed.py)
+                length = max(length_for(a.w + b.w + gap), getattr(p, 'char_length', 0.0))
+                key = ('pair', a.layer, round(0.5 * (a.w + b.w) * 1e7), round(gap * 1e7), round(length * 1e5),
+                       tuple(sorted((k, round(W * 1e5)) for k, W in planes.items())))
+                if key not in cache:
+                    cache[key] = line_char_pair(self.stack, a.layer, 0.5 * (a.w + b.w), gap, fs, planes=planes,
+                                                dmax=dmax, length=length)
+                ge, ze, go, zo = cache[key]
                 zd, zcm = 2 * zo.real, ze.real / 2
                 p.zd_fn, p.zc_fn = _smooth(fs, zd), _smooth(fs, zcm)
                 # each mode's gamma too (gamma / f is nearly flat), as a single line's below: fitted from the

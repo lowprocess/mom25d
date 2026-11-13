@@ -221,6 +221,84 @@ def test_mixed_connect_cascades_lines():
     assert np.allclose(out, line_S(g, zc, 15e-3, z0), atol=1e-12)
 
 
+def _two_traces(gap, length=30.0, w=0.38, third=None, w2=None):
+    """thru.json's stack with two straight traces side by side (mm), a port on each end of each: P1-P2 one trace,
+    P3-P4 the other; third: a third trace that far (centre to centre) beyond the second."""
+    data = json.load(open(os.path.join(os.path.dirname(__file__), 'boards', 'thru.json'), encoding='utf-8'))
+    x0, x1, yc = 2.0, 2.0 + length, -5.0
+    box = lambda a, b, c, d: dict(type='Polygon', coordinates=[[[a, b], [c, b], [c, d], [a, d], [a, b]]])
+    data['outline'] = box(0.0, -10.0, x1 + 2.0, 0.0)
+    ys, ws = (yc + (gap + w) / 2, yc - (gap + w) / 2), (w, w2 or w)
+    tr = lambda y, net, wd: dict(net=net, polygon=box(x0, y - wd / 2, x1, y + wd / 2))
+    data['copper'] = {'B.Cu': [dict(net='GND', polygon=box(0.0, -10.0, x1 + 2.0, 0.0))],
+                      'F.Cu': [tr(ys[0], 'A', ws[0]), tr(ys[1], 'B', ws[1])] + ([tr(ys[1] - third, 'C', w)] if third else [])}
+    p0 = data['ports'][0]
+    data['ports'] = [dict(p0, name=f"P{2 * i + 1 + e}", c=[(x0 + 0.1, x1 - 0.1)[e], ys[i]], w=ws[i], sgn=(1, -1)[e])
+                     for i in range(2) for e in range(2)]
+    return data
+
+
+def test_mixed_plans_a_pair_s_stretch_as_one_cut():
+    """mixed.plan_pair_cuts: two traces of one width side by side are cut together where both run straight, less
+    the feed each face's mixed-mode port needs; not where a third trace runs beside them, not two of different
+    widths, and not two far enough apart to be lone lines (each then a cut of its own)."""
+    pytest.importorskip('triangle')
+    from mom25d.board import BoardModel
+    from mom25d.kicad2ems import mixed
+    quiet = lambda *a, **k: None
+
+    def plan(data, **kw):
+        model = BoardModel(data, port='via', log=quiet)
+        ctx = mixed._context(model, data, 0.3e-3)
+        pairs, taken = mixed.plan_pair_cuts(model, data, 0.3e-3, 2e9, ctx=ctx, **kw)
+        return pairs, mixed.plan_cuts(model, data, 0.3e-3, 2e9, ctx=ctx, skip=taken, log=quiet, **kw)
+    pairs, lone = plan(_two_traces(0.3))
+    assert len(pairs) == 1 and lone == []
+    ca, cb, need = pairs[0]
+    assert (ca.x0, ca.x1) == (cb.x0, cb.x1) and np.allclose(ca.t, cb.t) and ca.x1 - ca.x0 > 10e-3
+    assert abs(abs((cb.c0 - ca.c0) @ ca.n) - 0.68e-3) < 1e-9
+    lone_need = mixed._need(BoardModel(_two_traces(0.3), port='via', log=quiet), 1, 0.38e-3, 0.3e-3, 2e9)
+    assert lone_need + 3e-3 < need < 12e-3                           # (a pair's faces: more feed than a lone line's)
+    assert plan(_two_traces(0.3, third=0.9)) == ([], [])            # three side by side: three modes, none cut
+    assert plan(_two_traces(0.3, w2=0.3)) == ([], [])               # not a symmetric pair
+    pairs, lone = plan(_two_traces(3.0))                            # 8 widths apart: two lone lines
+    assert pairs == [] and len(lone) == 2
+    pairs, lone = plan(_two_traces(0.3), keep_out=0.2e-3)           # (a keep-out below the gap: lone, by request)
+    assert pairs == [] and len(lone) == 2
+
+
+def test_mixed_cuts_a_coupled_pair_as_two_modal_lines(monkeypatch):
+    """Two traces 0.3 mm apart over 30 mm: mixed cuts most of their length as one coupled line (each face a
+    mixed-mode wave port, the stretch two lines: its differential and its common mode) and agrees with mom25d on
+    every term (0.007 in |S|), the near- and far-end coupling among them, with under two thirds of the unknowns
+    (a 30 mm pair: the faces' feeds are half of it)."""
+    pytest.importorskip('triangle')
+    pytest.importorskip('mom25d._core')
+    from types import SimpleNamespace as NS
+    import kicad2ems.api.solver as ks
+    from mom25d.kicad2ems import mixed
+    from mom25d.api import solve_board
+    quiet = lambda *a, **k: None
+    data = _two_traces(0.3)
+    freq = np.linspace(3e9, 9e9, 13)
+    ref = solve_board(data, freq, log=quiet, max_solves=24)
+    monkeypatch.setattr(ks, 'mixed_mode', lambda S, m: (S, [p.name for p in m.ports], [50.0] * len(m.ports)))
+    monkeypatch.setattr(mixed, '_metal', lambda *a, **k: (None, None))
+    board = NS(to_dict=lambda: data, ports=[NS(name=p['name']) for p in data['ports']])
+    log, hold = [], {}
+    S, names, zref, info = mixed.solve_mixed(board, freq, log=log.append, hold=hold, max_solves=24)
+    assert info['cuts'] == 1 and info['pairs'] == 1 and info['cut_mm'] > 25 and info['unknowns'] < 0.65 * ref.unknowns
+    assert any('a pair w=0.380 mm, 0.300 mm apart' in line for line in log)
+    assert [j['mode'] for j in hold['joins']] == ['d', 'c'] and len(hold['stretches']) == 2
+    assert [share for _, share in hold['stretches'][1]['of']] == [-1.0, 0.5]        # I- = Ic / 2 - Id
+    assert names == ['P1', 'P2', 'P3', 'P4'] and np.abs(S - ref.S).max() < 0.015
+    far = np.abs(ref.S[:, 3, 0])                                    # the far-end coupling: the modes' two speeds
+    assert far.max() > 0.3 and np.abs(np.abs(S[:, 3, 0]) - far).max() < 0.01
+    assert np.abs(S - S.transpose(0, 2, 1)).max() < 1e-6
+    currents, extra = mixed.dump_fields(hold)                       # the joined solution's currents: a column a port
+    assert currents(6e9).shape == (hold['sim'].Ne + hold['sim'].Nv, len(hold['sim'].ports))
+
+
 def test_whole_stack_ports_below_the_ground(run_cli, tmp_path):
     """--mom-stack whole on rf_msvia (F.Cu microstrip through a via to B.Cu, two inner planes): the B.Cu port that
     no ground plane allows, lumped ports to the nearest plane, and S21 as gfdtd gives it (-0.38 dB at 5 GHz);
