@@ -7,6 +7,10 @@ low-rank factors U V (SVD at a relative tolerance), close tiles dense. A right-l
 with recompression of the low-rank updates gives an approximate factorisation (default 1e-4),
 used as the preconditioner of GMRES whose products are exact (compiled matrix-free operator).
 Memory ~ dense tiles + sum of ranks, typically a fraction of N^2; storage in complex64 by default.
+
+The compiled core has the same factorisation (core/mom25d_core.cpp, BLRFactor: ACA with full pivoting instead of
+an SVD of every tile, OpenMP over the tiles), which fast.solve_blr takes where it is built; this module stays its
+reference and the fallback.
 """
 import numpy as np
 import scipy.linalg as sla

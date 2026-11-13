@@ -316,12 +316,19 @@ def test_memory_plan_takes_the_backends_own_estimate():
     from mom25d.sim import memory_plan
     n = 40000
     need = 8.0 * n * n + 0.8e9
-    p = memory_plan(n, has_core=True, avail=8e9, gpu=('vulkan', 15.7e9, need, True), solver='auto')
+    p = memory_plan(n, has_core=True, avail=8e9, gpu=('vulkan', 15.7e9, need, True), solver='auto', has_blr=False)
     assert p['path'] == 'gpu-stream' and p['solver'] == 'direct' and p['host'] < 6e9
-    p = memory_plan(n, has_core=True, avail=30e9, gpu=('vulkan', 15.7e9, need, True), solver='auto')
+    p = memory_plan(n, has_core=True, avail=30e9, gpu=('vulkan', 15.7e9, need, True), solver='auto', has_blr=False)
     assert p['path'] == 'gpu-lu'
-    p = memory_plan(n, has_core=True, avail=8e9, gpu=('vulkan', 15.7e9), solver='auto')
+    p = memory_plan(n, has_core=True, avail=8e9, gpu=('vulkan', 15.7e9), solver='auto', has_blr=False)
     assert p['solver'] == 'blr'
+    # the compiled block low-rank LU there instead, from sim.BLR_MIN_N unknowns; the hybrid where it holds Z
+    p = memory_plan(n, has_core=True, avail=30e9, gpu=('vulkan', 15.7e9, need, True), solver='auto', has_blr=True)
+    assert p['solver'] == 'blr' and p['host'] < 8.0 * n * n
+    p = memory_plan(20000, has_core=True, avail=30e9, gpu=('vulkan', 15.7e9), solver='auto', has_blr=True)
+    assert p['path'] == 'hybrid' and p['solver'] == 'direct'
+    p = memory_plan(15000, has_core=True, avail=30e9, gpu=None, solver='auto', has_blr=True)
+    assert p['path'] == 'cpu-mixed' and p['solver'] == 'direct'     # (below BLR_MIN_N)
 
 
 def test_far_field_of_several_excitations_at_once_is_each_ones():

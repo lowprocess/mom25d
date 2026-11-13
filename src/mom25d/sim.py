@@ -69,6 +69,11 @@ GPU_MIN_N = int(os.environ.get('MOM25D_GPU_MIN_N', 3000))
 # (28.7k) 456 s hybrid against 296 s, antenna_slot (28.6k) 165 s against 139 s; antenna_vivaldi (21.9k) 148 s
 # hybrid against 171 s
 HYBRID_MAX_N = int(os.environ.get('MOM25D_HYBRID_MAX_N', 25000))
+# from this many unknowns the compiled block low-rank LU (fast.solve_blr) where the GPU's hybrid does not hold the
+# matrix (the tiled, GPU-LU, streamed and CPU complex64 paths): a sweep of rf_siw (28.7k) 272 s against 520 s
+# tiled, antenna_cp_patch's (40.8k) solve 22.5 s against 30.3 s on the GPU LU, antenna_vivaldi (21.9k) without a GPU
+# 202 s against 243 s; in a fifth of the memory or less (1.2 GB, 1.2 GB, 2.4 GB)
+BLR_MIN_N = int(os.environ.get('MOM25D_BLR_MIN_N', 20000))
 
 
 def gpu_info(b, n):
@@ -77,7 +82,7 @@ def gpu_info(b, n):
 
 
 def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver='auto', tiled='auto', block=1024,
-                n_lu=None):
+                n_lu=None, has_blr=None):
     """How the solver of n unknowns runs and the memory it needs: dict(solver, precision, path, host, gpu)
     (bytes). gpu: None, or (backend name, free bytes), or gpu_info's (name, free, the LU's bytes, fits): the
     backend's own estimate (the Vulkan LU factors in place: 8 N^2, not the 16 N^2 the 2-tuple assumes). path: 'dense' (NumPy, small n), 'double' (LU on the
@@ -86,7 +91,9 @@ def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver
     symmetric part as L L^T tiles on the GPU, no dense Z: fast.FastOperator._solve_tiled), 'gpu-lu' (complex64
     Z on the host and the GPU), 'cpu-mixed' (complex64 LU on the CPU), 'blr' / 'aca' (compressed, no dense Z).
     tiled: 'auto' (where the hybrid does not fit), 'on' (whenever a CuPy GPU is there) or 'off'. n_lu: the unknowns
-    the LU factors (fewer with quads; default n), which the thresholds GPU_MIN_N and MIXED_MIN_N compare."""
+    the LU factors (fewer with quads; default n), which the thresholds GPU_MIN_N and MIXED_MIN_N compare. has_blr:
+    whether the compiled core has the block low-rank LU (None: look), which 'auto' takes from BLR_MIN_N unknowns
+    where the hybrid does not fit."""
     avail = available_memory() if avail is None else avail
     name, free = gpu[:2] if gpu else (None, 0.0)
     if gpu and len(gpu) >= 4:                                   # the backend's own: gpu_info(backend, n)
@@ -129,8 +136,18 @@ def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver
         # (rf_stubnotch coarsened, 2.3k unknowns: 25.4 s against 7.3 s a sweep; docs/mom.md#core)
         solver = 'dense' if n <= 3500 and fits and not has_core else \
             ('direct' if fits else ('blr' if has_core else 'aca'))
+        if has_blr is None:
+            from .fast import _core
+            has_blr = hasattr(_core, 'BLRFactor')
+        if solver == 'direct' and has_blr and path in ('tiled', 'gpu-lu', 'gpu-stream', 'cpu-mixed') \
+                and n >= BLR_MIN_N and (n_lu is None or n_lu >= n):     # (quad cells: the direct solver's alone)
+            solver = 'blr'
     if solver == 'dense':
         path, host, dev = 'dense', 18.0 * n * n + 0.9e9, 0.0
+    elif solver == 'blr' and (has_blr if has_blr is not None else True):
+        # the compiled factor: measured 18-30 % of a complex64 matrix at 22-41k unknowns, with the sparse near
+        # field: antenna_cp_patch's run peaked at 5 GB
+        path, host, dev = solver, 3.0 * n * n + 2e4 * n + 0.9e9, 0.0
     elif solver in ('blr', 'aca', 'hodlr'):
         path, host, dev = solver, 2e4 * n + 0.9e9, 0.0
     return dict(solver=solver, precision=precision, path=path, host=host, gpu=dev, fits=fits)
@@ -329,7 +346,9 @@ class Simulation:
         self.precision = precision          # 'auto' | 'double' | 'mixed' (direct: complex64 Z + refinement)
         self.tiled = tiled                  # 'auto' | 'on' | 'off': mixed precision as L L^T tiles on the GPU (memory_plan)
         self.core_mode = core               # 'compiled': the compiled core's direct solver for small boards too
-        self.blr_tol, self.blr_tile, self.blr_eta = 1e-3, 512, 0.7   # solver='blr' preconditioner settings
+        # solver='blr' preconditioner settings: 1e-3 left antenna_cp_patch (40.8k unknowns) unsolved (GMRES 500
+        # iterations), 1e-5 solves it in 7; eta 0.3 against 0.7: less memory, as fast (fast.solve_blr)
+        self.blr_tol, self.blr_tile, self.blr_eta = 1e-5, 512, 0.3
         self.hodlr_tol, self.hodlr_leaf, self.hodlr_refine = 1e-6, 256, False   # solver='hodlr'
         self.hodlr_symmetric = False        # Z^T = Z: half the compression (the near correction is not quite)
         self.reuse = 'auto'                 # 'auto' | 'off': the CPU's complex64 LU kept for the next frequencies
@@ -577,9 +596,14 @@ class Simulation:
         plan = memory_plan(n, has_core, avail, g, precision, solver, self.tiled, n_lu=n_lu)
         self.plan, self.precision, precision = plan, plan['precision'], plan['precision']
         if solver in ('auto', 'direct'):
-            self.log.note(f"memory: direct solver needs ~{plan['host'] / 1e9:.1f} GB ({precision} precision, "
-                          f"{plan['path']}" + (f", {plan['gpu'] / 1e9:.1f} GB on the GPU" if plan['gpu'] else '')
-                          + f"), {avail / 1e9:.1f} GB available")
+            if plan['path'] == 'blr':
+                self.log.note(f"memory: the block low-rank solver needs ~{plan['host'] / 1e9:.1f} GB (from "
+                              f"{BLR_MIN_N} unknowns where the GPU's hybrid does not hold the matrix), "
+                              f"{avail / 1e9:.1f} GB available")
+            else:
+                self.log.note(f"memory: direct solver needs ~{plan['host'] / 1e9:.1f} GB ({precision} precision, "
+                              f"{plan['path']}" + (f", {plan['gpu'] / 1e9:.1f} GB on the GPU" if plan['gpu'] else '')
+                              + f"), {avail / 1e9:.1f} GB available")
             if solver == 'auto':
                 solver = plan['solver']
                 if solver == 'dense' and self.core_mode == 'compiled' and has_core:   # the core, not NumPy's

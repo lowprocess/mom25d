@@ -96,7 +96,7 @@ f, S, info = solve_band(sim, 1e9, 6e9, points=101, zref=m.port_z0)
 | `looptree.py` | the loop/tree basis the direct solver takes at low frequency (pcbqs's) |
 | `gpu.py`, `ldlt.py` | the GPU backends and the tiled solver |
 | `gpu_vk.py` | the Vulkan backend: a hybrid LU (panels on the CPU, updates on the GPU) and its GPU solves |
-| `blr.py`, `hodlr.py` | the compressed solvers: block low-rank, hierarchical |
+| `blr.py`, `hodlr.py` | the compressed solvers: block low-rank (compiled in `core/`, the large boards' path), hierarchical |
 | `afs.py`, `run.py` | the adaptive frequency sweep |
 | `farfield.py` | far and near fields from the currents |
 | `core/` | the compiled C++ kernels |

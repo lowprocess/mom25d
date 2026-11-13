@@ -266,6 +266,9 @@ FRESH_STALL = (4, 0.1)   # a fresh complex64 LU on the GPU is given up when the 
 REUSE_ITER = (8, 60)     # GMRES iterations a reused LU may take (FastOperator._solve_reused): the cap, from the cost of
                          # a fresh solve, is clamped to this range
 REUSE_KEEP = 4           # complex64 LUs the CPU keeps at most, memory allowing (FastOperator._solve_kept)
+BLR_STALL = (30, 1e-2)   # solve_blr: a compiled BLR factor is given up when the residual is above 1e-2 after 30
+                         # GMRES iterations (a good one takes 3-16), and factored again at a hundredth of the tolerance
+BLR_TOL_MIN = 1e-9       # ... down to this
 LOOP_TREE_BELOW = 1e-5   # sim.loop_tree 'auto': the loop/tree basis where (k h)^2 is below this (k in the densest
                          # dielectric, h the median edge), about the ratio of a cell's two MPIE parts. The RWG basis's
                          # complex64 LU stops preconditioning below ~2e-6 (the via transition: ~100 MHz), its double LU
@@ -1439,27 +1442,88 @@ class FastOperator:
         dZx = (self.dZ + Sx[:Ne, :Ne]).tocsr()
         tiles, boxes = cluster_tiles(self._points(), tile)
         raw = self._raw_entry(dZx)
-        with sim.log.timer('BLR assemble + factor', f"N={N}, {len(tiles)} tiles"):
-            diag = np.empty(N, complex)
-            for t in tiles:
-                diag[t] = np.diagonal(raw(t, t))
-            dsc = 1.0 / np.sqrt(np.abs(diag) + 1e-300)
-            self.blr = blr = BLRFactor(lambda r, c: raw(r, c) * dsc[r][:, None] * dsc[c][None, :], tiles, boxes,
-                                       tol=tol, eta=eta, dtype=dtype, scale=1.0)
-        sim.log.note(f"BLR: {blr.memory / 2 ** 20:.0f} MB ({100 * blr.memory / (8 * N * N):.0f}% of complex64 dense, "
-                     f"{100 * blr.memory / (16 * N * N):.0f}% of complex128), {blr.stats['lowrank']} low-rank tiles, "
-                     f"mean rank {blr.stats['rank_sum'] / max(1, blr.stats['lowrank']):.0f}")
-        with sim.log.timer('GMRES (BLR preconditioned)'):
-            t = time.time()
-            Y, infos = self._gmres_columns(LinearOperator((N, N), matvec=lambda y: dsc * self.matvec_exact(dsc * y, Sx),
-                                                      dtype=complex),
-                                       LinearOperator((N, N), matvec=blr.solve, dtype=complex),
-                                       dsc[:, None] * E, self.mixed_tol, 50, 10)
-            self._t_iter = (time.time() - t) / max(1, sum(self.iters))     # column by column
-        sim.log.note(f"BLR: GMRES iterations per port {self.iters}")
-        if all(i == 0 for i in infos):
+        compiled = hasattr(self.core, 'BLRFactor') and dtype == np.complex64
+        diag = np.empty(N, complex)
+        for t in tiles:
+            diag[t] = np.diagonal(raw(t, t))
+        dsc = 1.0 / np.sqrt(np.abs(diag) + 1e-300)
+        tol = min(tol, getattr(self, '_blr_tol', tol))       # tighter after a factor that did not precondition
+        while True:
+            with sim.log.timer('BLR assemble + factor', f"N={N}, {len(tiles)} tiles, tolerance {tol:g}"
+                               + (", compiled" if compiled else '')):
+                if compiled:
+                    self.blr = blr = _CompiledBLR(self, tiles, boxes, dZx, dsc, tol, eta)
+                else:
+                    self.blr = blr = BLRFactor(lambda r, c: raw(r, c) * dsc[r][:, None] * dsc[c][None, :], tiles,
+                                               boxes, tol=tol, eta=eta, dtype=dtype, scale=1.0)
+            sim.log.note(f"BLR: {blr.memory / 2 ** 20:.0f} MB ({100 * blr.memory / (8 * N * N):.0f}% of complex64 "
+                         f"dense, {100 * blr.memory / (16 * N * N):.0f}% of complex128), {blr.stats['lowrank']} "
+                         f"low-rank tiles, mean rank {blr.stats['rank_sum'] / max(1, blr.stats['lowrank']):.0f}"
+                         + (f"; assembled {blr.stats['seconds_assemble']:.1f} s, factored "
+                            f"{blr.stats['seconds_factor']:.1f} s" if compiled else ''))
+            if compiled and blr.stats['singular']:
+                sim.log.note(f"WARNING BLR: {blr.stats['singular']} diagonal tiles singular - GMRES may not converge")
+            with sim.log.timer('GMRES (BLR preconditioned)'):
+                # the ports' columns together (gmres_batched): one pass of the far kernel a product for all of them
+                # (rf_siw, 28.7k unknowns, 2 ports: 11.6 s column by column, 5.0 s together)
+                t = time.time()
+                Y, ok, rel = self._refine(lambda V: dsc[:, None] * self.matvec_exact(dsc[:, None] * V, Sx),
+                                          dsc[:, None] * E, blr.solve, 50, 10, BLR_STALL if compiled else None)
+                self._t_iter = (time.time() - t) / max(1, max(self.iters, default=1))
+            sim.log.note(f"BLR: GMRES iterations per port {list(self.iters)}")
+            if ok or not compiled or tol <= BLR_TOL_MIN:
+                break
+            # too loose a compression for this matrix (a fine mesh, a resonance: antenna_cp_patch, 40.8k
+            # unknowns, at 1e-3: residual 0.6 after 500 iterations; at 1e-5: 7 iterations): a hundredth of it, here
+            # and for the frequencies after
+            sim.log.note(f"the BLR factor at tolerance {tol:g} left GMRES at residual {rel:.1e} after "
+                         f"{max(self.iters, default=0)} iterations at {f / 1e9:.4g} GHz - factored again at {tol / 100:g}")
+            tol = self._blr_tol = tol / 100
+        if not ok:
+            sim.log.note(f"WARNING BLR: GMRES did not converge at {f / 1e9:.4g} GHz (residual {rel:.1e})")
+        else:
             self._kept = [(f, blr.solve, dsc, time.time() - t_fresh)]
         return dsc[:, None] * Y
+
+
+class _CompiledBLR:
+    """The compiled core's BLRFactor (core/mom25d_core.cpp) with blr.BLRFactor's face (solve, memory, stats): the
+    tiles in elimination order, the pairs compressed where their clusters are apart (gap > eta x the larger's
+    diameter, as blr.py's), the near correction and extra blocks as CSR, the via rows and columns, the
+    equilibration. Its BLAS calls run on OpenMP's threads, so SciPy's are held at one while it factors and solves."""
+
+    def __init__(self, fo, tiles, boxes, dZx, dsc, tol, eta):
+        lo, hi = np.array([b[0] for b in boxes]), np.array([b[1] for b in boxes])
+        gap = np.linalg.norm(np.maximum(0, np.maximum(lo[:, None] - hi[None], lo[None] - hi[:, None])), axis=2)
+        diam = np.linalg.norm(hi - lo, axis=1)
+        far = (gap > eta * np.maximum(diam[:, None], diam[None])) & ~np.eye(len(tiles), dtype=bool)
+        order = np.concatenate(tiles).astype(np.int32)
+        start = np.r_[0, np.cumsum([len(t) for t in tiles])].astype(np.int32)
+        sim, c = fo.sim, np.ascontiguousarray
+        Nv = sim.Nv
+        dZx = dZx.tocsr()
+        B = c(fo.B, complex) if Nv else np.zeros((sim.Ne, 0), complex)
+        C = c(fo.C, complex) if Nv else np.zeros((0, 0), complex)
+        with _one_blas_thread():
+            self.f = fo.core.BLRFactor(order, start, far.astype(np.uint8), fo.g, fo.tb, fo.w,
+                                       dZx.indptr.astype(np.int64), dZx.indices.astype(np.int32),
+                                       c(dZx.data, complex), B, C, c(dsc, float), float(tol), 0)
+        self.stats = self.f.stats()
+        self.memory = self.stats['bytes']
+
+    def solve(self, b):
+        with _one_blas_thread():
+            return self.f.solve(np.ascontiguousarray(b, complex))
+
+
+def _one_blas_thread():
+    """threadpoolctl's limit of one BLAS thread (a no-op context without it)."""
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        from contextlib import nullcontext
+        return nullcontext()
+    return threadpool_limits(limits=1, user_api='blas')
 
 
 def gmres_batched(A, B, M=None, x0=None, rtol=1e-6, restart=30, maxiter=10, stall=None):

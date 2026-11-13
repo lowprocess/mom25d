@@ -25,6 +25,9 @@ T0, DENSE_N2, LU_N3, VIA2, SOLVES, REF_CORES = 1.0, 1.6e-7, 3.7e-12, 7.6e-5, 16,
 # with a GPU (RX 7800 XT, sma_launch, 16.1k unknowns): the fill, the complex64 LU and the refinement 6.3 s a solve
 # (hybrid), the tiled path 10.5 s (its fill block by block, the symmetric near field)
 LU_GPU_N3, LU_TILED_N3 = 1.5e-12, 2.5e-12
+# the compiled block low-rank LU (from 20k unknowns where the hybrid does not fit: sim.BLR_MIN_N), seconds per solve
+# over N^2 on 16 cores, the reused factors with the fresh: rf_siw 9.7 s (28.7k), antenna_vivaldi 8.1 s (21.9k)
+BLR_N2, BLR_CORES = 1.4e-8, 16
 ANT_FREQS = 11                  # antenna mode: frequencies of the far field over the band (+ the pattern one)
 
 
@@ -236,7 +239,7 @@ def save_mesh(run, sim, model, solver='mom25d'):
 HOW = {'dense': 'dense, NumPy', 'double': 'direct LU in double on the CPU',
        'hybrid': 'complex64 LU on the GPU, double refinement on the host', 'tiled': 'tiled L L^T on the GPU',
        'gpu-lu': 'complex64 LU on the GPU, matrix-free refinement', 'cpu-mixed': 'complex64 LU on the CPU',
-       'blr': 'block low-rank, no dense matrix', 'aca': 'H-matrix and GMRES, no dense matrix'}
+       'blr': 'block low-rank LU (compiled), no dense matrix', 'aca': 'H-matrix and GMRES, no dense matrix'}
 
 
 def memory_plan_for(n, tiled='auto'):
@@ -563,8 +566,10 @@ class MoM25D(Solver):
         plan = memory_plan_for(n, s.mom_tiled)
         lu = LU_N3 * REF_CORES / (os.cpu_count() or 1)                 # the CPU LU scales with the cores, a GPU's not
         lu = dict(hybrid=LU_GPU_N3, tiled=LU_TILED_N3).get(plan['path'], lu)
+        factor = BLR_N2 * n ** 2 * BLR_CORES / (os.cpu_count() or 1) if plan['path'] == 'blr' else \
+            (lu * n ** 3 if n > 3500 else 0)
         per = (T0 * layers * (layers + 1) / 2 + VIA2 * len(bm.vias) ** 2 + (DENSE_N2 * n ** 2 if n <= 3500 else 0)) \
-            * REF_CORES / (os.cpu_count() or 1) + (lu * n ** 3 if n > 3500 else 0)
+            * REF_CORES / (os.cpu_count() or 1) + factor
         return dict(seconds=solves * per, gb=plan['host'] / 1e9,
                     gpu_gb=plan['gpu'] / 1e9 or None, how=HOW.get(plan['path'], plan['path']),
                     what=f"{n:,} unknowns, ~{solves} EM solves")

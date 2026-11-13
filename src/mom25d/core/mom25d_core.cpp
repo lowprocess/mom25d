@@ -15,6 +15,7 @@
 //   fan_q         : G_q moments between every triangle and the via fan triangles (centroid rule)
 //   near_q        : the near pairs' G_q moment corrections alone (the loop/tree basis's charge matrix)
 //   tree_cols/rows: X K and K^T X for the loop/tree basis; charge_into: its charge block into Z
+//   BLRFactor     : the block low-rank LU (solve_blr's preconditioner), SciPy's BLAS and LAPACK
 //   project       : T^T Z T for the quad cells / line functions (quads.project), Z's rows reduced in place
 //
 // Everything mirrors the NumPy implementation in mom25d_fast.py (same tables and conventions),
@@ -28,6 +29,7 @@
 #include <stdexcept>
 #include <math.h>
 #include <cstdint>
+#include <chrono>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -684,6 +686,509 @@ void charge_into(py::array_t<cd> Z, arr<cd> Mq, arr<int> tree, arr<int> u, arr<i
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// BLRFactor: a block low-rank LU (blr.py's, compiled; fast.FastOperator.solve_blr). The equilibrated matrix cut
+// into the tiles of a geometric cluster tree, in elimination order; tiles between well-separated clusters (`far`)
+// assembled, compressed by adaptive cross approximation with full pivoting and recompressed (QR, SVD), the others
+// dense; a right-looking tile LU, pivoting inside the diagonal tiles, the low-rank updates recompressed; complex64.
+// solve() applies the approximate inverse (GMRES's preconditioner). BLAS and LAPACK are SciPy's
+// (scipy.linalg.cython_blas / cython_lapack capsules: nothing to link); the caller keeps their own threads at one
+// (threadpoolctl), the tiles being OpenMP's.
+// ---------------------------------------------------------------------------------------------
+namespace blrk {
+static double wall() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+typedef void (*gemm_t)(char *, char *, int *, int *, int *, cf *, cf *, int *, cf *, int *, cf *, cf *, int *);
+typedef void (*trsm_t)(char *, char *, char *, char *, int *, int *, cf *, cf *, int *, cf *, int *);
+typedef void (*getrf_t)(int *, int *, cf *, int *, int *, int *);
+typedef void (*geqrf_t)(int *, int *, cf *, int *, cf *, cf *, int *, int *);
+typedef void (*ungqr_t)(int *, int *, int *, cf *, int *, cf *, cf *, int *, int *);
+typedef void (*gesvd_t)(char *, char *, int *, int *, cf *, int *, float *, cf *, int *, cf *, int *, cf *, int *,
+                        float *, int *);
+struct Lapack { gemm_t gemm; trsm_t trsm; getrf_t getrf; geqrf_t geqrf; ungqr_t ungqr; gesvd_t gesvd; };
+
+static void *capsule(const char *mod, const char *name) {
+    py::dict capi = py::module_::import(mod).attr("__pyx_capi__");
+    py::object c = capi[name];
+    void *p = PyCapsule_GetPointer(c.ptr(), PyCapsule_GetName(c.ptr()));
+    if (!p) throw std::runtime_error(std::string("BLRFactor: no ") + name + " in " + mod);
+    return p;
+}
+static const Lapack &lapack() {             // first called under the GIL (the constructor)
+    static const Lapack L{(gemm_t)capsule("scipy.linalg.cython_blas", "cgemm"),
+                          (trsm_t)capsule("scipy.linalg.cython_blas", "ctrsm"),
+                          (getrf_t)capsule("scipy.linalg.cython_lapack", "cgetrf"),
+                          (geqrf_t)capsule("scipy.linalg.cython_lapack", "cgeqrf"),
+                          (ungqr_t)capsule("scipy.linalg.cython_lapack", "cungqr"),
+                          (gesvd_t)capsule("scipy.linalg.cython_lapack", "cgesvd")};
+    return L;
+}
+// C (m x n) = alpha op(A) op(B) + beta C, column major
+static void gemm(char ta, char tb, int m, int n, int k, cf alpha, const cf *A, int lda, const cf *B, int ldb,
+                 cf beta, cf *C, int ldc) {
+    if (m <= 0 || n <= 0) return;
+    lda = std::max(lda, 1); ldb = std::max(ldb, 1); ldc = std::max(ldc, 1);
+    lapack().gemm(&ta, &tb, &m, &n, &k, &alpha, const_cast<cf *>(A), &lda, const_cast<cf *>(B), &ldb, &beta, C, &ldc);
+}
+static void trsm(char side, char uplo, char trans, char diag, int m, int n, const cf *A, int lda, cf *B, int ldb) {
+    if (m <= 0 || n <= 0) return;
+    cf one(1);
+    lda = std::max(lda, 1); ldb = std::max(ldb, 1);
+    lapack().trsm(&side, &uplo, &trans, &diag, &m, &n, &one, const_cast<cf *>(A), &lda, B, &ldb);
+}
+// LAPACK's row interchanges (ipiv, 1-based, in order) on the m rows of A (ld x ncols)
+static void swaps(cf *A, int ld, int ncols, const int *ipiv, int m) {
+    for (int c = 0; c < ncols; ++c) {
+        cf *a = A + (size_t)c * ld;
+        for (int i = 0; i < m; ++i) {
+            int p = ipiv[i] - 1;
+            if (p != i) std::swap(a[i], a[p]);
+        }
+    }
+}
+
+struct Tile {
+    char kind = 'N';                        // 'D' dense (m x n), 'L' low rank U (m x r) V (r x n), 'N' none
+    int m = 0, n = 0, r = 0;
+    std::vector<cf> D, U, V;                // column major
+    size_t bytes() const { return (D.size() + U.size() + V.size()) * sizeof(cf); }
+    void dense() {                          // a low-rank tile as dense
+        if (kind == 'D') return;
+        D.assign((size_t)m * n, cf(0));
+        if (kind == 'L' && r) gemm('N', 'N', m, n, r, cf(1), U.data(), m, V.data(), r, cf(0), D.data(), m);
+        U.clear(); U.shrink_to_fit(); V.clear(); V.shrink_to_fit(); r = 0; kind = 'D';
+    }
+};
+
+// t <- U V (m x r, r x n) recompressed: QR of U and of V^T, SVD of the r x r core, singular values above atol;
+// dense where the rank does not pay (r (m + n) >= 0.6 m n) or passes rmax
+static void recompress(Tile &t, int m, int n, std::vector<cf> &U, std::vector<cf> &V, int r, double atol, int rmax) {
+    const Lapack &L = lapack();
+    t.m = m; t.n = n; t.D.clear();
+    if (r == 0) { t.kind = 'L'; t.r = 0; t.U.clear(); t.V.clear(); return; }
+    if (r >= std::min(m, n)) {
+        t.kind = 'D'; t.D.assign((size_t)m * n, cf(0));
+        gemm('N', 'N', m, n, r, cf(1), U.data(), m, V.data(), r, cf(0), t.D.data(), m);
+        t.U.clear(); t.V.clear(); t.r = 0;
+        return;
+    }
+    int info = 0, lw = -1;
+    std::vector<cf> tu(r), tv(r);
+    cf q;
+    L.geqrf(&m, &r, U.data(), &m, tu.data(), &q, &lw, &info);
+    int lwork = std::max(1, (int)q.real());
+    std::vector<cf> Vt((size_t)n * r);             // V^T, n x r
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < r; ++i) Vt[j + (size_t)i * n] = V[i + (size_t)j * r];
+    lw = -1; L.geqrf(&n, &r, Vt.data(), &n, tv.data(), &q, &lw, &info);
+    lwork = std::max(lwork, (int)q.real());
+    std::vector<cf> work(std::max(lwork, 1));
+    L.geqrf(&m, &r, U.data(), &m, tu.data(), work.data(), &lwork, &info);
+    L.geqrf(&n, &r, Vt.data(), &n, tv.data(), work.data(), &lwork, &info);
+    std::vector<cf> Ru((size_t)r * r, cf(0)), Rv((size_t)r * r, cf(0));
+    for (int j = 0; j < r; ++j)
+        for (int i = 0; i <= j; ++i) { Ru[i + (size_t)j * r] = U[i + (size_t)j * m]; Rv[i + (size_t)j * r] = Vt[i + (size_t)j * n]; }
+    lw = -1; L.ungqr(&m, &r, &r, U.data(), &m, tu.data(), &q, &lw, &info);
+    int lw2 = std::max(1, (int)q.real());
+    lw = -1; L.ungqr(&n, &r, &r, Vt.data(), &n, tv.data(), &q, &lw, &info);
+    lw2 = std::max(lw2, (int)q.real());
+    if ((int)work.size() < lw2) work.resize(lw2);
+    L.ungqr(&m, &r, &r, U.data(), &m, tu.data(), work.data(), &lw2, &info);       // U <- Q_u (m x r)
+    L.ungqr(&n, &r, &r, Vt.data(), &n, tv.data(), work.data(), &lw2, &info);      // Vt <- Q_v (n x r)
+    std::vector<cf> S((size_t)r * r);
+    gemm('N', 'T', r, r, r, cf(1), Ru.data(), r, Rv.data(), r, cf(0), S.data(), r);   // R_u R_v^T
+    std::vector<cf> S0(S), W((size_t)r * r), Zh((size_t)r * r);
+    std::vector<float> sig(r), rw(5 * (size_t)r + 1);
+    char js = 'S';
+    lw = -1; L.gesvd(&js, &js, &r, &r, S.data(), &r, sig.data(), W.data(), &r, Zh.data(), &r, &q, &lw, rw.data(), &info);
+    int lw3 = std::max(1, (int)q.real());
+    std::vector<cf> w3(lw3);
+    L.gesvd(&js, &js, &r, &r, S.data(), &r, sig.data(), W.data(), &r, Zh.data(), &r, w3.data(), &lw3, rw.data(), &info);
+    int k = 0;
+    while (k < r && sig[k] > atol) ++k;
+    if (info != 0) k = r;                           // (no SVD: keep them all)
+    if (k > rmax || (double)k * (m + n) >= 0.6 * (double)m * n) {
+        std::vector<cf> T1((size_t)m * r);         // Q_u S0 Q_v^T
+        gemm('N', 'N', m, r, r, cf(1), U.data(), m, S0.data(), r, cf(0), T1.data(), m);
+        t.kind = 'D'; t.r = 0; t.U.clear(); t.V.clear();
+        t.D.assign((size_t)m * n, cf(0));
+        gemm('N', 'T', m, n, r, cf(1), T1.data(), m, Vt.data(), n, cf(0), t.D.data(), m);
+        return;
+    }
+    for (int j = 0; j < k; ++j)
+        for (int i = 0; i < r; ++i) W[i + (size_t)j * r] *= sig[j];
+    t.kind = 'L'; t.r = k;
+    t.U.assign((size_t)m * k, cf(0)); t.V.assign((size_t)k * n, cf(0));
+    if (k) {
+        gemm('N', 'N', m, k, r, cf(1), U.data(), m, W.data(), r, cf(0), t.U.data(), m);
+        gemm('N', 'T', k, n, r, cf(1), Zh.data(), r, Vt.data(), n, cf(0), t.V.data(), k);
+    }
+}
+
+// adaptive cross approximation with full pivoting of the dense residual R (m x n, column major, overwritten):
+// U (m x k), V (k x n) until ||R||_F <= atol; false where it needs more than rmax
+static bool aca_full(std::vector<cd> &R, int m, int n, double atol, int rmax, std::vector<cf> &U, std::vector<cf> &V,
+                     int &k) {
+    double fro2 = 0; size_t imax = 0; double amax = -1;
+    for (size_t p = 0; p < R.size(); ++p) { double a = std::norm(R[p]); fro2 += a; if (a > amax) { amax = a; imax = p; } }
+    std::vector<cd> us, vs;                         // k columns of m, k rows of n
+    k = 0;
+    while (std::sqrt(fro2) > atol) {
+        if (k >= rmax || amax <= 0) return false;
+        const int is = (int)(imax % m), js = (int)(imax / m);
+        const cd piv = R[imax];
+        us.resize((size_t)(k + 1) * m); vs.resize((size_t)(k + 1) * n);
+        cd *u = &us[(size_t)k * m], *v = &vs[(size_t)k * n];
+        for (int i = 0; i < m; ++i) u[i] = R[i + (size_t)js * m];
+        for (int j = 0; j < n; ++j) v[j] = R[is + (size_t)j * m] / piv;
+        fro2 = 0; amax = -1;
+        for (int j = 0; j < n; ++j) {
+            cd *col = &R[(size_t)j * m];
+            const cd vj = v[j];
+            for (int i = 0; i < m; ++i) {
+                col[i] -= u[i] * vj;
+                double a = std::norm(col[i]);
+                fro2 += a;
+                if (a > amax) { amax = a; imax = i + (size_t)j * m; }
+            }
+        }
+        ++k;
+    }
+    U.resize((size_t)m * k); V.resize((size_t)k * n);
+    for (int c = 0; c < k; ++c)
+        for (int i = 0; i < m; ++i) U[i + (size_t)c * m] = cf(us[(size_t)c * m + i]);
+    for (int j = 0; j < n; ++j)
+        for (int c = 0; c < k; ++c) V[c + (size_t)j * k] = cf(vs[(size_t)c * n + j]);
+    return true;
+}
+}  // namespace blrk
+
+class BLRFactor {
+public:
+    // order: the unknowns in elimination order, start: each tile's first (nb + 1); far: nb x nb, 1 where the tile
+    // pair is compressed; geom, tabs, w: the far kernel; nptr / nidx / nval: the near correction and the extra
+    // blocks (CSR, Ne x Ne); B (Ne x Nv), C (Nv x Nv): the via rows and columns; dsc: the equilibration; atol:
+    // the compression's absolute tolerance (on the equilibrated matrix); max_rank: 0 for half a tile
+    BLRFactor(arr<int> order, arr<int> start, arr<uint8_t> far, py::dict geom, py::dict tabs, double w, arr<i64> nptr,
+              arr<int> nidx, arr<cd> nval, arr<cd> B, arr<cd> C, arr<double> dsc, double atol, int max_rank)
+        : atol_(atol) {
+        using namespace blrk;
+        lapack();
+        MeshHold mh(geom); TabHold th(tabs);
+        const Mesh &g = mh.m; const Tables &tb = th.t;
+        N_ = (int)order.shape(0); nb_ = (int)start.shape(0) - 1;
+        order_.assign(order.data(), order.data() + N_);
+        start_.assign(start.data(), start.data() + nb_ + 1);
+        const int Ne = g.Ne, Nv = N_ - Ne, Nt = g.Nt, nb = nb_;
+        if ((i64)far.size() != (i64)nb * nb) throw std::invalid_argument("BLRFactor: far must be nb x nb");
+        std::vector<int> tile_of(N_), local_of(N_);
+        for (int k = 0; k < nb; ++k)
+            for (int p = start_[k]; p < start_[k + 1]; ++p) { tile_of[order_[p]] = k; local_of[order_[p]] = p - start_[k]; }
+        T_.resize((size_t)nb * nb);
+        const uint8_t *fa = far.data();
+        const i64 *np_ = nptr.data(); const int *ni = nidx.data(); const cd *nv = nval.data();
+        const cd *Bp = B.data(), *Cp = C.data(); const double *ds = dsc.data();
+        const cd jw(0, w), inv_jw = 1.0 / cd(0, w);
+        const int *ord = order_.data(), *st = start_.data(), *tof = tile_of.data(), *lof = local_of.data();
+        double t0 = blrk::wall();
+        {
+            py::gil_scoped_release nogil;
+#pragma omp parallel
+            {
+                std::vector<int> mark_r(Nt, -1), mark_c(Nt, -1), tr, tc;
+                std::vector<cd> M, Mc, GA, GQ;
+                std::vector<cf> U, V;
+#pragma omp for schedule(dynamic, 1)
+                for (i64 p = 0; p < (i64)nb * nb; ++p) {
+                    const int I = (int)(p / nb), J = (int)(p % nb);
+                    const int m = st[I + 1] - st[I], n = st[J + 1] - st[J];
+                    const int *rows = ord + st[I], *cols = ord + st[J];
+                    // the triangles of the tile's edges, and the kernel between them (each triangle-pair once)
+                    tr.clear(); tc.clear();
+                    for (int i = 0; i < m; ++i) if (rows[i] < Ne) for (int t : {g.ep[rows[i]], g.em[rows[i]]})
+                        if (mark_r[t] < 0) { mark_r[t] = (int)tr.size(); tr.push_back(t); }
+                    for (int j = 0; j < n; ++j) if (cols[j] < Ne) for (int t : {g.ep[cols[j]], g.em[cols[j]]})
+                        if (mark_c[t] < 0) { mark_c[t] = (int)tc.size(); tc.push_back(t); }
+                    const size_t nr = tr.size(), nc = tc.size();
+                    GA.resize(nr * nc); GQ.resize(nr * nc);
+                    for (size_t a = 0; a < nr; ++a)
+                        for (size_t b = 0; b < nc; ++b)
+                            tb.kern(g.lt[tr[a]], g.lt[tc[b]], dist(g.cent, tr[a], tc[b]), GA[a * nc + b], GQ[a * nc + b]);
+                    M.assign((size_t)m * n, cd(0));
+                    for (int j = 0; j < n; ++j) {
+                        const int c = cols[j];
+                        cd *col = &M[(size_t)j * m];
+                        if (c < Ne) {
+                            const int pn[2] = {g.ep[c], g.em[c]};
+                            const int qn[2] = {mark_c[pn[0]], mark_c[pn[1]]};
+                            const double an[2] = {g.ap[c] * g.area[pn[0]], g.am[c] * g.area[pn[1]]};
+                            const double ex[2] = {g.cent[2 * pn[0]] - g.vp[2 * c], g.cent[2 * pn[1]] - g.vm[2 * c]};
+                            const double ey[2] = {g.cent[2 * pn[0] + 1] - g.vp[2 * c + 1], g.cent[2 * pn[1] + 1] - g.vm[2 * c + 1]};
+                            for (int i = 0; i < m; ++i) {
+                                const int u = rows[i];
+                                if (u < Ne) {
+                                    const int pm[2] = {g.ep[u], g.em[u]};
+                                    const int qm[2] = {mark_r[pm[0]], mark_r[pm[1]]};
+                                    const double am_[2] = {g.ap[u] * g.area[pm[0]], g.am[u] * g.area[pm[1]]};
+                                    const double dx[2] = {g.cent[2 * pm[0]] - g.vp[2 * u], g.cent[2 * pm[1]] - g.vm[2 * u]};
+                                    const double dy[2] = {g.cent[2 * pm[0] + 1] - g.vp[2 * u + 1], g.cent[2 * pm[1] + 1] - g.vm[2 * u + 1]};
+                                    cd v = 0;
+                                    for (int s = 0; s < 2; ++s)
+                                        for (int t = 0; t < 2; ++t) {
+                                            const size_t q = (size_t)qm[s] * nc + qn[t];
+                                            v += am_[s] * an[t] * (jw * (dx[s] * ex[t] + dy[s] * ey[t]) * GA[q] + 4.0 * GQ[q] * inv_jw);
+                                        }
+                                    col[i] = v;
+                                } else {
+                                    col[i] = Bp[(size_t)c * Nv + (u - Ne)];
+                                }
+                            }
+                        } else {
+                            for (int i = 0; i < m; ++i) {
+                                const int u = rows[i];
+                                col[i] = u < Ne ? Bp[(size_t)u * Nv + (c - Ne)] : Cp[(size_t)(u - Ne) * Nv + (c - Ne)];
+                            }
+                        }
+                    }
+                    for (int i = 0; i < m; ++i) {           // the near correction and the extra blocks
+                        const int u = rows[i];
+                        if (u >= Ne) continue;
+                        for (i64 q = np_[u]; q < np_[u + 1]; ++q)
+                            if (tof[ni[q]] == J) M[i + (size_t)lof[ni[q]] * m] += nv[q];
+                    }
+                    for (int j = 0; j < n; ++j)
+                        for (int i = 0; i < m; ++i) M[i + (size_t)j * m] *= ds[rows[i]] * ds[cols[j]];
+                    for (int t : tr) mark_r[t] = -1;
+                    for (int t : tc) mark_c[t] = -1;
+                    Tile &T = T_[(size_t)I * nb + J];
+                    T.m = m; T.n = n;
+                    bool low = false;
+                    if (fa[(size_t)I * nb + J]) {
+                        const int rmax = std::min(max_rank > 0 ? max_rank : std::min(m, n) / 2,
+                                                  (int)(0.6 * (double)m * n / (m + n)));
+                        Mc = M;
+                        int k = 0;
+                        if (aca_full(Mc, m, n, atol, rmax, U, V, k)) {
+                            recompress(T, m, n, U, V, k, atol, rmax);
+                            low = true;
+                        }
+                    }
+                    if (!low) {
+                        T.kind = 'D'; T.D.resize((size_t)m * n);
+                        for (size_t q = 0; q < M.size(); ++q) T.D[q] = cf(M[q]);
+                    }
+                }
+            }
+            t_assemble_ = blrk::wall() - t0;
+            for (const auto &T : T_) {
+                if (T.kind == 'L') { ++lowrank0_; rank0_ += T.r; }
+                else ++dense0_;
+            }
+            bytes0_ = bytes();
+            t0 = blrk::wall();
+            factor(max_rank);
+            t_factor_ = blrk::wall() - t0;
+        }
+    }
+
+    // the approximate inverse: R (N, or N x m) in the original numbering
+    py::array_t<cd> solve(py::array_t<cd, py::array::c_style | py::array::forcecast> R) {
+        using namespace blrk;
+        const bool vec = R.ndim() == 1;
+        const int nr = vec ? 1 : (int)R.shape(1);
+        if (R.shape(0) != N_) throw std::invalid_argument("BLRFactor.solve: R must have N rows");
+        const cd *r = R.data();
+        py::array_t<cd> out = vec ? py::array_t<cd>(N_) : py::array_t<cd>({N_, nr});
+        cd *o = out.mutable_data();
+        const int nb = nb_;
+        std::vector<std::vector<cf>> y(nb);
+        {
+            py::gil_scoped_release nogil;
+            for (int k = 0; k < nb; ++k) {
+                const int m = start_[k + 1] - start_[k];
+                y[k].resize((size_t)m * nr);
+                for (int i = 0; i < m; ++i)
+                    for (int c = 0; c < nr; ++c) y[k][i + (size_t)c * m] = cf(r[(size_t)order_[start_[k] + i] * nr + c]);
+            }
+            for (int k = 0; k < nb; ++k) {                  // L y = P b
+                const int m = start_[k + 1] - start_[k];
+                swaps(y[k].data(), m, nr, piv_[k].data(), m);
+                subtract(k, 0, k, y, nr);
+                trsm('L', 'L', 'N', 'U', m, nr, LU_[k].data(), m, y[k].data(), m);
+            }
+            for (int k = nb - 1; k >= 0; --k) {             // U z = y
+                const int m = start_[k + 1] - start_[k];
+                subtract(k, k + 1, nb, y, nr);
+                trsm('L', 'U', 'N', 'N', m, nr, LU_[k].data(), m, y[k].data(), m);
+            }
+            for (int k = 0; k < nb; ++k) {
+                const int m = start_[k + 1] - start_[k];
+                for (int i = 0; i < m; ++i)
+                    for (int c = 0; c < nr; ++c) o[(size_t)order_[start_[k] + i] * nr + c] = cd(y[k][i + (size_t)c * m]);
+            }
+        }
+        return out;
+    }
+
+    py::dict stats() const {
+        py::dict d;
+        int dense = 0, low = 0; long rank = 0;
+        for (const auto &T : T_) { if (T.kind == 'L') { ++low; rank += T.r; } else if (T.kind == 'D') ++dense; }
+        d["tiles"] = nb_; d["dense"] = dense; d["lowrank"] = low; d["rank_sum"] = rank;
+        d["dense_assembled"] = dense0_; d["lowrank_assembled"] = lowrank0_; d["rank_sum_assembled"] = rank0_;
+        d["bytes"] = (double)bytes(); d["bytes_assembled"] = (double)bytes0_;
+        d["seconds_assemble"] = t_assemble_; d["seconds_factor"] = t_factor_;
+        d["singular"] = singular_;
+        return d;
+    }
+
+private:
+    size_t bytes() const {
+        size_t b = 0;
+        for (const auto &T : T_) b += T.bytes();
+        for (const auto &l : LU_) b += l.size() * sizeof(cf);
+        return b;
+    }
+
+    // y[k] -= sum over j in [j0, j1) of T[k][j] y[j]: the tiles' products on the threads, summed into y[k]
+    void subtract(int k, int j0, int j1, std::vector<std::vector<cf>> &y, int nr) const {
+        using namespace blrk;
+        if (j1 <= j0) return;
+        const int m = start_[k + 1] - start_[k], nb = nb_;
+#pragma omp parallel
+        {
+            std::vector<cf> acc((size_t)m * nr, cf(0)), tmp;
+            bool any = false;
+#pragma omp for schedule(dynamic, 1) nowait
+            for (int j = j0; j < j1; ++j) {
+                const Tile &T = T_[(size_t)k * nb + j];
+                const int n = T.n;
+                if (T.kind == 'D') {
+                    gemm('N', 'N', m, nr, n, cf(1), T.D.data(), m, y[j].data(), n, cf(1), acc.data(), m);
+                    any = true;
+                } else if (T.kind == 'L' && T.r) {
+                    tmp.assign((size_t)T.r * nr, cf(0));
+                    gemm('N', 'N', T.r, nr, n, cf(1), T.V.data(), T.r, y[j].data(), n, cf(0), tmp.data(), T.r);
+                    gemm('N', 'N', m, nr, T.r, cf(1), T.U.data(), m, tmp.data(), T.r, cf(1), acc.data(), m);
+                    any = true;
+                }
+            }
+            if (any) {
+#pragma omp critical
+                for (size_t q = 0; q < acc.size(); ++q) y[k][q] -= acc[q];
+            }
+        }
+    }
+
+    // C -= A B (the Schur update of tile (i, j) by step k)
+    void schur(blrk::Tile &c, const blrk::Tile &a, const blrk::Tile &b, int max_rank) {
+        using namespace blrk;
+        const int mi = a.m, mk = a.n, nj = b.n;
+        if ((a.kind == 'L' && a.r == 0) || (b.kind == 'L' && b.r == 0)) return;
+        if (a.kind == 'D' && b.kind == 'D') {
+            c.dense();
+            gemm('N', 'N', mi, nj, mk, cf(-1), a.D.data(), mi, b.D.data(), mk, cf(1), c.D.data(), mi);
+            return;
+        }
+        std::vector<cf> Uw, Vw;                         // the update U_u V_u (rank ru), where computed
+        const cf *Uu, *Vu;
+        int ru;
+        if (a.kind == 'L' && b.kind == 'D') {
+            ru = a.r; Uu = a.U.data();
+            Vw.assign((size_t)ru * nj, cf(0));
+            gemm('N', 'N', ru, nj, mk, cf(1), a.V.data(), ru, b.D.data(), mk, cf(0), Vw.data(), ru);
+            Vu = Vw.data();
+        } else if (a.kind == 'D' && b.kind == 'L') {
+            ru = b.r; Vu = b.V.data();
+            Uw.assign((size_t)mi * ru, cf(0));
+            gemm('N', 'N', mi, ru, mk, cf(1), a.D.data(), mi, b.U.data(), mk, cf(0), Uw.data(), mi);
+            Uu = Uw.data();
+        } else {
+            std::vector<cf> t((size_t)a.r * b.r);        // V_a U_b
+            gemm('N', 'N', a.r, b.r, mk, cf(1), a.V.data(), a.r, b.U.data(), mk, cf(0), t.data(), a.r);
+            if (a.r <= b.r) {
+                ru = a.r; Uu = a.U.data();
+                Vw.assign((size_t)ru * nj, cf(0));
+                gemm('N', 'N', ru, nj, b.r, cf(1), t.data(), a.r, b.V.data(), b.r, cf(0), Vw.data(), ru);
+                Vu = Vw.data();
+            } else {
+                ru = b.r; Vu = b.V.data();
+                Uw.assign((size_t)mi * ru, cf(0));
+                gemm('N', 'N', mi, ru, a.r, cf(1), a.U.data(), mi, t.data(), a.r, cf(0), Uw.data(), mi);
+                Uu = Uw.data();
+            }
+        }
+        if (c.kind == 'D') {
+            gemm('N', 'N', mi, nj, ru, cf(-1), Uu, mi, Vu, ru, cf(1), c.D.data(), mi);
+            return;
+        }
+        const int rc = c.r, r2 = rc + ru;               // [U_c, -U_u] [V_c; V_u], recompressed
+        std::vector<cf> U2((size_t)mi * r2), V2((size_t)r2 * nj);
+        std::copy(c.U.begin(), c.U.end(), U2.begin());
+        for (size_t q = 0; q < (size_t)mi * ru; ++q) U2[(size_t)mi * rc + q] = -Uu[q];
+        for (int j = 0; j < nj; ++j) {
+            for (int q = 0; q < rc; ++q) V2[q + (size_t)j * r2] = c.V[q + (size_t)j * rc];
+            for (int q = 0; q < ru; ++q) V2[rc + q + (size_t)j * r2] = Vu[q + (size_t)j * ru];
+        }
+        const int rmax = std::min(max_rank > 0 ? max_rank : std::min(mi, nj) / 2,
+                                  (int)(0.6 * (double)mi * nj / (mi + nj)));
+        recompress(c, mi, nj, U2, V2, r2, atol_, rmax);
+    }
+
+    // the right-looking tile LU: the diagonal tile factored (its pivots kept), its row's tiles permuted and solved
+    // with L, its column's with U, the trailing tiles updated - each step's tiles on the threads
+    void factor(int max_rank) {
+        using namespace blrk;
+        const int nb = nb_;
+        LU_.resize(nb); piv_.resize(nb);
+        for (int k = 0; k < nb; ++k) {
+            Tile &dk = T_[(size_t)k * nb + k];
+            dk.dense();
+            const int mk = dk.m;
+            LU_[k] = std::move(dk.D);
+            dk.D.clear(); dk.kind = 'N';
+            piv_[k].resize(mk);
+            int info = 0, mm = mk;
+            lapack().getrf(&mm, &mm, LU_[k].data(), &mm, piv_[k].data(), &info);
+            if (info > 0) ++singular_;
+            const cf *L = LU_[k].data();
+            const int *pv = piv_[k].data();
+#pragma omp parallel for schedule(dynamic, 1)
+            for (int j = 0; j < nb; ++j) {              // the row: P, then L^-1 (right of the diagonal)
+                if (j == k) continue;
+                Tile &t = T_[(size_t)k * nb + j];
+                if (t.kind == 'D') {
+                    swaps(t.D.data(), mk, t.n, pv, mk);
+                    if (j > k) trsm('L', 'L', 'N', 'U', mk, t.n, L, mk, t.D.data(), mk);
+                } else if (t.kind == 'L' && t.r) {
+                    swaps(t.U.data(), mk, t.r, pv, mk);
+                    if (j > k) trsm('L', 'L', 'N', 'U', mk, t.r, L, mk, t.U.data(), mk);
+                }
+            }
+#pragma omp parallel for schedule(dynamic, 1)
+            for (int i = k + 1; i < nb; ++i) {          // the column: U^-1 from the right
+                Tile &t = T_[(size_t)i * nb + k];
+                if (t.kind == 'D') trsm('R', 'U', 'N', 'N', t.m, mk, L, mk, t.D.data(), t.m);
+                else if (t.kind == 'L' && t.r) trsm('R', 'U', 'N', 'N', t.r, mk, L, mk, t.V.data(), t.r);
+            }
+            const int rest = nb - k - 1;
+#pragma omp parallel for schedule(dynamic, 1)
+            for (i64 p = 0; p < (i64)rest * rest; ++p) {
+                const int i = k + 1 + (int)(p / rest), j = k + 1 + (int)(p % rest);
+                schur(T_[(size_t)i * nb + j], T_[(size_t)i * nb + k], T_[(size_t)k * nb + j], max_rank);
+            }
+        }
+    }
+
+    int N_ = 0, nb_ = 0; double atol_ = 0, t_assemble_ = 0, t_factor_ = 0;
+    std::vector<int> order_, start_;
+    std::vector<blrk::Tile> T_;
+    std::vector<std::vector<cf>> LU_;
+    std::vector<std::vector<int>> piv_;
+    int dense0_ = 0, lowrank0_ = 0, singular_ = 0; long rank0_ = 0; size_t bytes0_ = 0;
+};
+
 int num_threads() {
 #ifdef _OPENMP
     return omp_get_max_threads();
@@ -893,6 +1398,11 @@ PYBIND11_MODULE(_core, m) {
     m.def("tree_cols", &tree_cols, "X <- X K, the loop/tree basis (looptree.py)");
     m.def("tree_rows", &tree_rows, "X <- K^T X, the loop/tree basis (looptree.py)");
     m.def("charge_into", &charge_into, "the loop/tree basis's charge block into Z[tree, tree]");
+    py::class_<BLRFactor>(m, "BLRFactor", "block low-rank LU of the equilibrated matrix (blr.py's, compiled)")
+        .def(py::init<arr<int>, arr<int>, arr<uint8_t>, py::dict, py::dict, double, arr<i64>, arr<int>, arr<cd>,
+                      arr<cd>, arr<cd>, arr<double>, double, int>())
+        .def("solve", &BLRFactor::solve, "the approximate inverse applied to R (N or N x m)")
+        .def("stats", &BLRFactor::stats);
     m.def("num_threads", &num_threads);
     m.def("near_pairs", &near_pairs, "near triangle pairs (sorted by p, q)");
     m.def("hankel_real", &hankel_real, "sum_k J0(rho kr_k) W[s, k] for real kr");
