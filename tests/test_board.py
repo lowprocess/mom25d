@@ -304,11 +304,12 @@ def test_a_feed_with_another_trace_beside_it_takes_a_lumped_port():
     """port auto: a wave port fits one line's two waves, and what a neighbour couples in along the feed is not
     one of them (kicad2ems's rf_crosstalk, two lines 3 mm apart on 0.8 mm: NEXT 20 dB low with wave ports). A
     lone line keeps its wave ports, and port='wave' is the user's word."""
-    m = BoardModel(board('xtalk'), log=quiet)
+    xtalk = board(os.path.join('rf', 'xtalk'))                      # (kicad2ems's rf_crosstalk: make_rf_examples.py)
+    m = BoardModel(xtalk, log=quiet)
     ps = m.ports(dmax=0.3e-3)
     assert [type(p).__name__ for p in ps] == ['ViaPort'] * 4
     assert sum('another trace runs beside its feed' in n for n in m.notes) == 4
-    m = BoardModel(board('xtalk'), port='wave', log=quiet)
+    m = BoardModel(xtalk, port='wave', log=quiet)
     assert [type(p).__name__ for p in m.ports(dmax=0.3e-3)] == ['LinePort'] * 4
     m = BoardModel(board('thru'), log=quiet)
     assert [type(p).__name__ for p in m.ports(dmax=0.3e-3)] == ['LinePort'] * 2 and not any('beside' in n for n in m.notes)

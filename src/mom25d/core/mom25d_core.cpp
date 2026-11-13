@@ -30,6 +30,7 @@
 #include <math.h>
 #include <cstdint>
 #include <chrono>
+#include <string>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -699,48 +700,52 @@ namespace blrk {
 static double wall() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-typedef void (*gemm_t)(char *, char *, int *, int *, int *, cf *, cf *, int *, cf *, int *, cf *, cf *, int *);
-typedef void (*trsm_t)(char *, char *, char *, char *, int *, int *, cf *, cf *, int *, cf *, int *);
-typedef void (*getrf_t)(int *, int *, cf *, int *, int *, int *);
-typedef void (*geqrf_t)(int *, int *, cf *, int *, cf *, cf *, int *, int *);
-typedef void (*ungqr_t)(int *, int *, int *, cf *, int *, cf *, cf *, int *, int *);
-typedef void (*gesvd_t)(char *, char *, int *, int *, cf *, int *, float *, cf *, int *, cf *, int *, cf *, int *,
-                        float *, int *);
-struct Lapack { gemm_t gemm; trsm_t trsm; getrf_t getrf; geqrf_t geqrf; ungqr_t ungqr; gesvd_t gesvd; };
+template <class T> struct Lapack {         // SciPy's BLAS and LAPACK of T (complex64: c..., complex128: z...)
+    typedef typename T::value_type R;
+    typedef void (*gemm_t)(char *, char *, int *, int *, int *, T *, T *, int *, T *, int *, T *, T *, int *);
+    typedef void (*trsm_t)(char *, char *, char *, char *, int *, int *, T *, T *, int *, T *, int *);
+    typedef void (*getrf_t)(int *, int *, T *, int *, int *, int *);
+    typedef void (*geqrf_t)(int *, int *, T *, int *, T *, T *, int *, int *);
+    typedef void (*ungqr_t)(int *, int *, int *, T *, int *, T *, T *, int *, int *);
+    typedef void (*gesvd_t)(char *, char *, int *, int *, T *, int *, R *, T *, int *, T *, int *, T *, int *, R *,
+                            int *);
+    gemm_t gemm; trsm_t trsm; getrf_t getrf; geqrf_t geqrf; ungqr_t ungqr; gesvd_t gesvd;
+};
 
-static void *capsule(const char *mod, const char *name) {
+static void *capsule(const char *mod, const std::string &name) {
     py::dict capi = py::module_::import(mod).attr("__pyx_capi__");
-    py::object c = capi[name];
+    py::object c = capi[name.c_str()];
     void *p = PyCapsule_GetPointer(c.ptr(), PyCapsule_GetName(c.ptr()));
     if (!p) throw std::runtime_error(std::string("BLRFactor: no ") + name + " in " + mod);
     return p;
 }
-static const Lapack &lapack() {             // first called under the GIL (the constructor)
-    static const Lapack L{(gemm_t)capsule("scipy.linalg.cython_blas", "cgemm"),
-                          (trsm_t)capsule("scipy.linalg.cython_blas", "ctrsm"),
-                          (getrf_t)capsule("scipy.linalg.cython_lapack", "cgetrf"),
-                          (geqrf_t)capsule("scipy.linalg.cython_lapack", "cgeqrf"),
-                          (ungqr_t)capsule("scipy.linalg.cython_lapack", "cungqr"),
-                          (gesvd_t)capsule("scipy.linalg.cython_lapack", "cgesvd")};
+template <class T> static const Lapack<T> &lapack() {      // first called under the GIL (the constructor)
+    static const std::string k = sizeof(T) == sizeof(cf) ? "c" : "z";
+    static const Lapack<T> L{(typename Lapack<T>::gemm_t)capsule("scipy.linalg.cython_blas", k + "gemm"),
+                             (typename Lapack<T>::trsm_t)capsule("scipy.linalg.cython_blas", k + "trsm"),
+                             (typename Lapack<T>::getrf_t)capsule("scipy.linalg.cython_lapack", k + "getrf"),
+                             (typename Lapack<T>::geqrf_t)capsule("scipy.linalg.cython_lapack", k + "geqrf"),
+                             (typename Lapack<T>::ungqr_t)capsule("scipy.linalg.cython_lapack", k + "ungqr"),
+                             (typename Lapack<T>::gesvd_t)capsule("scipy.linalg.cython_lapack", k + "gesvd")};
     return L;
 }
 // C (m x n) = alpha op(A) op(B) + beta C, column major
-static void gemm(char ta, char tb, int m, int n, int k, cf alpha, const cf *A, int lda, const cf *B, int ldb,
-                 cf beta, cf *C, int ldc) {
+template <class Sc> static void gemm(char ta, char tb, int m, int n, int k, Sc alpha, const Sc *A, int lda, const Sc *B, int ldb,
+                 Sc beta, Sc *C, int ldc) {
     if (m <= 0 || n <= 0) return;
     lda = std::max(lda, 1); ldb = std::max(ldb, 1); ldc = std::max(ldc, 1);
-    lapack().gemm(&ta, &tb, &m, &n, &k, &alpha, const_cast<cf *>(A), &lda, const_cast<cf *>(B), &ldb, &beta, C, &ldc);
+    lapack<Sc>().gemm(&ta, &tb, &m, &n, &k, &alpha, const_cast<Sc *>(A), &lda, const_cast<Sc *>(B), &ldb, &beta, C, &ldc);
 }
-static void trsm(char side, char uplo, char trans, char diag, int m, int n, const cf *A, int lda, cf *B, int ldb) {
+template <class Sc> static void trsm(char side, char uplo, char trans, char diag, int m, int n, const Sc *A, int lda, Sc *B, int ldb) {
     if (m <= 0 || n <= 0) return;
-    cf one(1);
+    Sc one(1);
     lda = std::max(lda, 1); ldb = std::max(ldb, 1);
-    lapack().trsm(&side, &uplo, &trans, &diag, &m, &n, &one, const_cast<cf *>(A), &lda, B, &ldb);
+    lapack<Sc>().trsm(&side, &uplo, &trans, &diag, &m, &n, &one, const_cast<Sc *>(A), &lda, B, &ldb);
 }
 // LAPACK's row interchanges (ipiv, 1-based, in order) on the m rows of A (ld x ncols)
-static void swaps(cf *A, int ld, int ncols, const int *ipiv, int m) {
+template <class Sc> static void swaps(Sc *A, int ld, int ncols, const int *ipiv, int m) {
     for (int c = 0; c < ncols; ++c) {
-        cf *a = A + (size_t)c * ld;
+        Sc *a = A + (size_t)c * ld;
         for (int i = 0; i < m; ++i) {
             int p = ipiv[i] - 1;
             if (p != i) std::swap(a[i], a[p]);
@@ -748,45 +753,45 @@ static void swaps(cf *A, int ld, int ncols, const int *ipiv, int m) {
     }
 }
 
-struct Tile {
+template <class Sc> struct Tile {
     char kind = 'N';                        // 'D' dense (m x n), 'L' low rank U (m x r) V (r x n), 'N' none
     int m = 0, n = 0, r = 0;
-    std::vector<cf> D, U, V;                // column major
-    size_t bytes() const { return (D.size() + U.size() + V.size()) * sizeof(cf); }
+    std::vector<Sc> D, U, V;                // column major
+    size_t bytes() const { return (D.size() + U.size() + V.size()) * sizeof(Sc); }
     void dense() {                          // a low-rank tile as dense
         if (kind == 'D') return;
-        D.assign((size_t)m * n, cf(0));
-        if (kind == 'L' && r) gemm('N', 'N', m, n, r, cf(1), U.data(), m, V.data(), r, cf(0), D.data(), m);
+        D.assign((size_t)m * n, Sc(0));
+        if (kind == 'L' && r) gemm('N', 'N', m, n, r, Sc(1), U.data(), m, V.data(), r, Sc(0), D.data(), m);
         U.clear(); U.shrink_to_fit(); V.clear(); V.shrink_to_fit(); r = 0; kind = 'D';
     }
 };
 
 // t <- U V (m x r, r x n) recompressed: QR of U and of V^T, SVD of the r x r core, singular values above atol;
 // dense where the rank does not pay (r (m + n) >= 0.6 m n) or passes rmax
-static void recompress(Tile &t, int m, int n, std::vector<cf> &U, std::vector<cf> &V, int r, double atol, int rmax) {
-    const Lapack &L = lapack();
+template <class Sc> static void recompress(Tile<Sc> &t, int m, int n, std::vector<Sc> &U, std::vector<Sc> &V, int r, double atol, int rmax) {
+    const Lapack<Sc> &L = lapack<Sc>();
     t.m = m; t.n = n; t.D.clear();
     if (r == 0) { t.kind = 'L'; t.r = 0; t.U.clear(); t.V.clear(); return; }
     if (r >= std::min(m, n)) {
-        t.kind = 'D'; t.D.assign((size_t)m * n, cf(0));
-        gemm('N', 'N', m, n, r, cf(1), U.data(), m, V.data(), r, cf(0), t.D.data(), m);
+        t.kind = 'D'; t.D.assign((size_t)m * n, Sc(0));
+        gemm('N', 'N', m, n, r, Sc(1), U.data(), m, V.data(), r, Sc(0), t.D.data(), m);
         t.U.clear(); t.V.clear(); t.r = 0;
         return;
     }
     int info = 0, lw = -1;
-    std::vector<cf> tu(r), tv(r);
-    cf q;
+    std::vector<Sc> tu(r), tv(r);
+    Sc q;
     L.geqrf(&m, &r, U.data(), &m, tu.data(), &q, &lw, &info);
     int lwork = std::max(1, (int)q.real());
-    std::vector<cf> Vt((size_t)n * r);             // V^T, n x r
+    std::vector<Sc> Vt((size_t)n * r);             // V^T, n x r
     for (int j = 0; j < n; ++j)
         for (int i = 0; i < r; ++i) Vt[j + (size_t)i * n] = V[i + (size_t)j * r];
     lw = -1; L.geqrf(&n, &r, Vt.data(), &n, tv.data(), &q, &lw, &info);
     lwork = std::max(lwork, (int)q.real());
-    std::vector<cf> work(std::max(lwork, 1));
+    std::vector<Sc> work(std::max(lwork, 1));
     L.geqrf(&m, &r, U.data(), &m, tu.data(), work.data(), &lwork, &info);
     L.geqrf(&n, &r, Vt.data(), &n, tv.data(), work.data(), &lwork, &info);
-    std::vector<cf> Ru((size_t)r * r, cf(0)), Rv((size_t)r * r, cf(0));
+    std::vector<Sc> Ru((size_t)r * r, Sc(0)), Rv((size_t)r * r, Sc(0));
     for (int j = 0; j < r; ++j)
         for (int i = 0; i <= j; ++i) { Ru[i + (size_t)j * r] = U[i + (size_t)j * m]; Rv[i + (size_t)j * r] = Vt[i + (size_t)j * n]; }
     lw = -1; L.ungqr(&m, &r, &r, U.data(), &m, tu.data(), &q, &lw, &info);
@@ -796,39 +801,39 @@ static void recompress(Tile &t, int m, int n, std::vector<cf> &U, std::vector<cf
     if ((int)work.size() < lw2) work.resize(lw2);
     L.ungqr(&m, &r, &r, U.data(), &m, tu.data(), work.data(), &lw2, &info);       // U <- Q_u (m x r)
     L.ungqr(&n, &r, &r, Vt.data(), &n, tv.data(), work.data(), &lw2, &info);      // Vt <- Q_v (n x r)
-    std::vector<cf> S((size_t)r * r);
-    gemm('N', 'T', r, r, r, cf(1), Ru.data(), r, Rv.data(), r, cf(0), S.data(), r);   // R_u R_v^T
-    std::vector<cf> S0(S), W((size_t)r * r), Zh((size_t)r * r);
-    std::vector<float> sig(r), rw(5 * (size_t)r + 1);
+    std::vector<Sc> S((size_t)r * r);
+    gemm('N', 'T', r, r, r, Sc(1), Ru.data(), r, Rv.data(), r, Sc(0), S.data(), r);   // R_u R_v^T
+    std::vector<Sc> S0(S), W((size_t)r * r), Zh((size_t)r * r);
+    std::vector<typename Sc::value_type> sig(r), rw(5 * (size_t)r + 1);
     char js = 'S';
     lw = -1; L.gesvd(&js, &js, &r, &r, S.data(), &r, sig.data(), W.data(), &r, Zh.data(), &r, &q, &lw, rw.data(), &info);
     int lw3 = std::max(1, (int)q.real());
-    std::vector<cf> w3(lw3);
+    std::vector<Sc> w3(lw3);
     L.gesvd(&js, &js, &r, &r, S.data(), &r, sig.data(), W.data(), &r, Zh.data(), &r, w3.data(), &lw3, rw.data(), &info);
     int k = 0;
     while (k < r && sig[k] > atol) ++k;
     if (info != 0) k = r;                           // (no SVD: keep them all)
     if (k > rmax || (double)k * (m + n) >= 0.6 * (double)m * n) {
-        std::vector<cf> T1((size_t)m * r);         // Q_u S0 Q_v^T
-        gemm('N', 'N', m, r, r, cf(1), U.data(), m, S0.data(), r, cf(0), T1.data(), m);
+        std::vector<Sc> T1((size_t)m * r);         // Q_u S0 Q_v^T
+        gemm('N', 'N', m, r, r, Sc(1), U.data(), m, S0.data(), r, Sc(0), T1.data(), m);
         t.kind = 'D'; t.r = 0; t.U.clear(); t.V.clear();
-        t.D.assign((size_t)m * n, cf(0));
-        gemm('N', 'T', m, n, r, cf(1), T1.data(), m, Vt.data(), n, cf(0), t.D.data(), m);
+        t.D.assign((size_t)m * n, Sc(0));
+        gemm('N', 'T', m, n, r, Sc(1), T1.data(), m, Vt.data(), n, Sc(0), t.D.data(), m);
         return;
     }
     for (int j = 0; j < k; ++j)
         for (int i = 0; i < r; ++i) W[i + (size_t)j * r] *= sig[j];
     t.kind = 'L'; t.r = k;
-    t.U.assign((size_t)m * k, cf(0)); t.V.assign((size_t)k * n, cf(0));
+    t.U.assign((size_t)m * k, Sc(0)); t.V.assign((size_t)k * n, Sc(0));
     if (k) {
-        gemm('N', 'N', m, k, r, cf(1), U.data(), m, W.data(), r, cf(0), t.U.data(), m);
-        gemm('N', 'T', k, n, r, cf(1), Zh.data(), r, Vt.data(), n, cf(0), t.V.data(), k);
+        gemm('N', 'N', m, k, r, Sc(1), U.data(), m, W.data(), r, Sc(0), t.U.data(), m);
+        gemm('N', 'T', k, n, r, Sc(1), Zh.data(), r, Vt.data(), n, Sc(0), t.V.data(), k);
     }
 }
 
 // adaptive cross approximation with full pivoting of the dense residual R (m x n, column major, overwritten):
 // U (m x k), V (k x n) until ||R||_F <= atol; false where it needs more than rmax
-static bool aca_full(std::vector<cd> &R, int m, int n, double atol, int rmax, std::vector<cf> &U, std::vector<cf> &V,
+template <class Sc> static bool aca_full(std::vector<cd> &R, int m, int n, double atol, int rmax, std::vector<Sc> &U, std::vector<Sc> &V,
                      int &k) {
     double fro2 = 0; size_t imax = 0; double amax = -1;
     for (size_t p = 0; p < R.size(); ++p) { double a = std::norm(R[p]); fro2 += a; if (a > amax) { amax = a; imax = p; } }
@@ -857,24 +862,24 @@ static bool aca_full(std::vector<cd> &R, int m, int n, double atol, int rmax, st
     }
     U.resize((size_t)m * k); V.resize((size_t)k * n);
     for (int c = 0; c < k; ++c)
-        for (int i = 0; i < m; ++i) U[i + (size_t)c * m] = cf(us[(size_t)c * m + i]);
+        for (int i = 0; i < m; ++i) U[i + (size_t)c * m] = Sc(us[(size_t)c * m + i]);
     for (int j = 0; j < n; ++j)
-        for (int c = 0; c < k; ++c) V[c + (size_t)j * k] = cf(vs[(size_t)c * n + j]);
+        for (int c = 0; c < k; ++c) V[c + (size_t)j * k] = Sc(vs[(size_t)c * n + j]);
     return true;
 }
 }  // namespace blrk
 
-class BLRFactor {
+template <class Sc> class BLRFactorT {
 public:
     // order: the unknowns in elimination order, start: each tile's first (nb + 1); far: nb x nb, 1 where the tile
     // pair is compressed; geom, tabs, w: the far kernel; nptr / nidx / nval: the near correction and the extra
     // blocks (CSR, Ne x Ne); B (Ne x Nv), C (Nv x Nv): the via rows and columns; dsc: the equilibration; atol:
     // the compression's absolute tolerance (on the equilibrated matrix); max_rank: 0 for half a tile
-    BLRFactor(arr<int> order, arr<int> start, arr<uint8_t> far, py::dict geom, py::dict tabs, double w, arr<i64> nptr,
+    BLRFactorT(arr<int> order, arr<int> start, arr<uint8_t> far, py::dict geom, py::dict tabs, double w, arr<i64> nptr,
               arr<int> nidx, arr<cd> nval, arr<cd> B, arr<cd> C, arr<double> dsc, double atol, int max_rank)
         : atol_(atol) {
         using namespace blrk;
-        lapack();
+        lapack<Sc>();
         MeshHold mh(geom); TabHold th(tabs);
         const Mesh &g = mh.m; const Tables &tb = th.t;
         N_ = (int)order.shape(0); nb_ = (int)start.shape(0) - 1;
@@ -898,7 +903,7 @@ public:
             {
                 std::vector<int> mark_r(Nt, -1), mark_c(Nt, -1), tr, tc;
                 std::vector<cd> M, Mc, GA, GQ;
-                std::vector<cf> U, V;
+                std::vector<Sc> U, V;
 #pragma omp for schedule(dynamic, 1)
                 for (i64 p = 0; p < (i64)nb * nb; ++p) {
                     const int I = (int)(p / nb), J = (int)(p % nb);
@@ -961,7 +966,7 @@ public:
                         for (int i = 0; i < m; ++i) M[i + (size_t)j * m] *= ds[rows[i]] * ds[cols[j]];
                     for (int t : tr) mark_r[t] = -1;
                     for (int t : tc) mark_c[t] = -1;
-                    Tile &T = T_[(size_t)I * nb + J];
+                    Tile<Sc> &T = T_[(size_t)I * nb + J];
                     T.m = m; T.n = n;
                     bool low = false;
                     if (fa[(size_t)I * nb + J]) {
@@ -976,7 +981,7 @@ public:
                     }
                     if (!low) {
                         T.kind = 'D'; T.D.resize((size_t)m * n);
-                        for (size_t q = 0; q < M.size(); ++q) T.D[q] = cf(M[q]);
+                        for (size_t q = 0; q < M.size(); ++q) T.D[q] = Sc(M[q]);
                     }
                 }
             }
@@ -1002,14 +1007,14 @@ public:
         py::array_t<cd> out = vec ? py::array_t<cd>(N_) : py::array_t<cd>({N_, nr});
         cd *o = out.mutable_data();
         const int nb = nb_;
-        std::vector<std::vector<cf>> y(nb);
+        std::vector<std::vector<Sc>> y(nb);
         {
             py::gil_scoped_release nogil;
             for (int k = 0; k < nb; ++k) {
                 const int m = start_[k + 1] - start_[k];
                 y[k].resize((size_t)m * nr);
                 for (int i = 0; i < m; ++i)
-                    for (int c = 0; c < nr; ++c) y[k][i + (size_t)c * m] = cf(r[(size_t)order_[start_[k] + i] * nr + c]);
+                    for (int c = 0; c < nr; ++c) y[k][i + (size_t)c * m] = Sc(r[(size_t)order_[start_[k] + i] * nr + c]);
             }
             for (int k = 0; k < nb; ++k) {                  // L y = P b
                 const int m = start_[k + 1] - start_[k];
@@ -1047,30 +1052,30 @@ private:
     size_t bytes() const {
         size_t b = 0;
         for (const auto &T : T_) b += T.bytes();
-        for (const auto &l : LU_) b += l.size() * sizeof(cf);
+        for (const auto &l : LU_) b += l.size() * sizeof(Sc);
         return b;
     }
 
     // y[k] -= sum over j in [j0, j1) of T[k][j] y[j]: the tiles' products on the threads, summed into y[k]
-    void subtract(int k, int j0, int j1, std::vector<std::vector<cf>> &y, int nr) const {
+    void subtract(int k, int j0, int j1, std::vector<std::vector<Sc>> &y, int nr) const {
         using namespace blrk;
         if (j1 <= j0) return;
         const int m = start_[k + 1] - start_[k], nb = nb_;
 #pragma omp parallel
         {
-            std::vector<cf> acc((size_t)m * nr, cf(0)), tmp;
+            std::vector<Sc> acc((size_t)m * nr, Sc(0)), tmp;
             bool any = false;
 #pragma omp for schedule(dynamic, 1) nowait
             for (int j = j0; j < j1; ++j) {
-                const Tile &T = T_[(size_t)k * nb + j];
+                const Tile<Sc> &T = T_[(size_t)k * nb + j];
                 const int n = T.n;
                 if (T.kind == 'D') {
-                    gemm('N', 'N', m, nr, n, cf(1), T.D.data(), m, y[j].data(), n, cf(1), acc.data(), m);
+                    gemm('N', 'N', m, nr, n, Sc(1), T.D.data(), m, y[j].data(), n, Sc(1), acc.data(), m);
                     any = true;
                 } else if (T.kind == 'L' && T.r) {
-                    tmp.assign((size_t)T.r * nr, cf(0));
-                    gemm('N', 'N', T.r, nr, n, cf(1), T.V.data(), T.r, y[j].data(), n, cf(0), tmp.data(), T.r);
-                    gemm('N', 'N', m, nr, T.r, cf(1), T.U.data(), m, tmp.data(), T.r, cf(1), acc.data(), m);
+                    tmp.assign((size_t)T.r * nr, Sc(0));
+                    gemm('N', 'N', T.r, nr, n, Sc(1), T.V.data(), T.r, y[j].data(), n, Sc(0), tmp.data(), T.r);
+                    gemm('N', 'N', m, nr, T.r, Sc(1), T.U.data(), m, tmp.data(), T.r, Sc(1), acc.data(), m);
                     any = true;
                 }
             }
@@ -1082,49 +1087,49 @@ private:
     }
 
     // C -= A B (the Schur update of tile (i, j) by step k)
-    void schur(blrk::Tile &c, const blrk::Tile &a, const blrk::Tile &b, int max_rank) {
+    void schur(blrk::Tile<Sc> &c, const blrk::Tile<Sc> &a, const blrk::Tile<Sc> &b, int max_rank) {
         using namespace blrk;
         const int mi = a.m, mk = a.n, nj = b.n;
         if ((a.kind == 'L' && a.r == 0) || (b.kind == 'L' && b.r == 0)) return;
         if (a.kind == 'D' && b.kind == 'D') {
             c.dense();
-            gemm('N', 'N', mi, nj, mk, cf(-1), a.D.data(), mi, b.D.data(), mk, cf(1), c.D.data(), mi);
+            gemm('N', 'N', mi, nj, mk, Sc(-1), a.D.data(), mi, b.D.data(), mk, Sc(1), c.D.data(), mi);
             return;
         }
-        std::vector<cf> Uw, Vw;                         // the update U_u V_u (rank ru), where computed
-        const cf *Uu, *Vu;
+        std::vector<Sc> Uw, Vw;                         // the update U_u V_u (rank ru), where computed
+        const Sc *Uu, *Vu;
         int ru;
         if (a.kind == 'L' && b.kind == 'D') {
             ru = a.r; Uu = a.U.data();
-            Vw.assign((size_t)ru * nj, cf(0));
-            gemm('N', 'N', ru, nj, mk, cf(1), a.V.data(), ru, b.D.data(), mk, cf(0), Vw.data(), ru);
+            Vw.assign((size_t)ru * nj, Sc(0));
+            gemm('N', 'N', ru, nj, mk, Sc(1), a.V.data(), ru, b.D.data(), mk, Sc(0), Vw.data(), ru);
             Vu = Vw.data();
         } else if (a.kind == 'D' && b.kind == 'L') {
             ru = b.r; Vu = b.V.data();
-            Uw.assign((size_t)mi * ru, cf(0));
-            gemm('N', 'N', mi, ru, mk, cf(1), a.D.data(), mi, b.U.data(), mk, cf(0), Uw.data(), mi);
+            Uw.assign((size_t)mi * ru, Sc(0));
+            gemm('N', 'N', mi, ru, mk, Sc(1), a.D.data(), mi, b.U.data(), mk, Sc(0), Uw.data(), mi);
             Uu = Uw.data();
         } else {
-            std::vector<cf> t((size_t)a.r * b.r);        // V_a U_b
-            gemm('N', 'N', a.r, b.r, mk, cf(1), a.V.data(), a.r, b.U.data(), mk, cf(0), t.data(), a.r);
+            std::vector<Sc> t((size_t)a.r * b.r);        // V_a U_b
+            gemm('N', 'N', a.r, b.r, mk, Sc(1), a.V.data(), a.r, b.U.data(), mk, Sc(0), t.data(), a.r);
             if (a.r <= b.r) {
                 ru = a.r; Uu = a.U.data();
-                Vw.assign((size_t)ru * nj, cf(0));
-                gemm('N', 'N', ru, nj, b.r, cf(1), t.data(), a.r, b.V.data(), b.r, cf(0), Vw.data(), ru);
+                Vw.assign((size_t)ru * nj, Sc(0));
+                gemm('N', 'N', ru, nj, b.r, Sc(1), t.data(), a.r, b.V.data(), b.r, Sc(0), Vw.data(), ru);
                 Vu = Vw.data();
             } else {
                 ru = b.r; Vu = b.V.data();
-                Uw.assign((size_t)mi * ru, cf(0));
-                gemm('N', 'N', mi, ru, a.r, cf(1), a.U.data(), mi, t.data(), a.r, cf(0), Uw.data(), mi);
+                Uw.assign((size_t)mi * ru, Sc(0));
+                gemm('N', 'N', mi, ru, a.r, Sc(1), a.U.data(), mi, t.data(), a.r, Sc(0), Uw.data(), mi);
                 Uu = Uw.data();
             }
         }
         if (c.kind == 'D') {
-            gemm('N', 'N', mi, nj, ru, cf(-1), Uu, mi, Vu, ru, cf(1), c.D.data(), mi);
+            gemm('N', 'N', mi, nj, ru, Sc(-1), Uu, mi, Vu, ru, Sc(1), c.D.data(), mi);
             return;
         }
         const int rc = c.r, r2 = rc + ru;               // [U_c, -U_u] [V_c; V_u], recompressed
-        std::vector<cf> U2((size_t)mi * r2), V2((size_t)r2 * nj);
+        std::vector<Sc> U2((size_t)mi * r2), V2((size_t)r2 * nj);
         std::copy(c.U.begin(), c.U.end(), U2.begin());
         for (size_t q = 0; q < (size_t)mi * ru; ++q) U2[(size_t)mi * rc + q] = -Uu[q];
         for (int j = 0; j < nj; ++j) {
@@ -1143,21 +1148,21 @@ private:
         const int nb = nb_;
         LU_.resize(nb); piv_.resize(nb);
         for (int k = 0; k < nb; ++k) {
-            Tile &dk = T_[(size_t)k * nb + k];
+            Tile<Sc> &dk = T_[(size_t)k * nb + k];
             dk.dense();
             const int mk = dk.m;
             LU_[k] = std::move(dk.D);
             dk.D.clear(); dk.kind = 'N';
             piv_[k].resize(mk);
             int info = 0, mm = mk;
-            lapack().getrf(&mm, &mm, LU_[k].data(), &mm, piv_[k].data(), &info);
+            lapack<Sc>().getrf(&mm, &mm, LU_[k].data(), &mm, piv_[k].data(), &info);
             if (info > 0) ++singular_;
-            const cf *L = LU_[k].data();
+            const Sc *L = LU_[k].data();
             const int *pv = piv_[k].data();
 #pragma omp parallel for schedule(dynamic, 1)
             for (int j = 0; j < nb; ++j) {              // the row: P, then L^-1 (right of the diagonal)
                 if (j == k) continue;
-                Tile &t = T_[(size_t)k * nb + j];
+                Tile<Sc> &t = T_[(size_t)k * nb + j];
                 if (t.kind == 'D') {
                     swaps(t.D.data(), mk, t.n, pv, mk);
                     if (j > k) trsm('L', 'L', 'N', 'U', mk, t.n, L, mk, t.D.data(), mk);
@@ -1168,7 +1173,7 @@ private:
             }
 #pragma omp parallel for schedule(dynamic, 1)
             for (int i = k + 1; i < nb; ++i) {          // the column: U^-1 from the right
-                Tile &t = T_[(size_t)i * nb + k];
+                Tile<Sc> &t = T_[(size_t)i * nb + k];
                 if (t.kind == 'D') trsm('R', 'U', 'N', 'N', t.m, mk, L, mk, t.D.data(), t.m);
                 else if (t.kind == 'L' && t.r) trsm('R', 'U', 'N', 'N', t.r, mk, L, mk, t.V.data(), t.r);
             }
@@ -1183,8 +1188,8 @@ private:
 
     int N_ = 0, nb_ = 0; double atol_ = 0, t_assemble_ = 0, t_factor_ = 0;
     std::vector<int> order_, start_;
-    std::vector<blrk::Tile> T_;
-    std::vector<std::vector<cf>> LU_;
+    std::vector<blrk::Tile<Sc>> T_;
+    std::vector<std::vector<Sc>> LU_;
     std::vector<std::vector<int>> piv_;
     int dense0_ = 0, lowrank0_ = 0, singular_ = 0; long rank0_ = 0; size_t bytes0_ = 0;
 };
@@ -1398,11 +1403,17 @@ PYBIND11_MODULE(_core, m) {
     m.def("tree_cols", &tree_cols, "X <- X K, the loop/tree basis (looptree.py)");
     m.def("tree_rows", &tree_rows, "X <- K^T X, the loop/tree basis (looptree.py)");
     m.def("charge_into", &charge_into, "the loop/tree basis's charge block into Z[tree, tree]");
-    py::class_<BLRFactor>(m, "BLRFactor", "block low-rank LU of the equilibrated matrix (blr.py's, compiled)")
+    py::class_<BLRFactorT<cf>>(m, "BLRFactor", "block low-rank LU of the equilibrated matrix (blr.py's, compiled), complex64")
         .def(py::init<arr<int>, arr<int>, arr<uint8_t>, py::dict, py::dict, double, arr<i64>, arr<int>, arr<cd>,
                       arr<cd>, arr<cd>, arr<double>, double, int>())
-        .def("solve", &BLRFactor::solve, "the approximate inverse applied to R (N or N x m)")
-        .def("stats", &BLRFactor::stats);
+        .def("solve", &BLRFactorT<cf>::solve, "the approximate inverse applied to R (N or N x m)")
+        .def("stats", &BLRFactorT<cf>::stats);
+    py::class_<BLRFactorT<cd>>(m, "BLRFactor128", "the same in complex128: where the matrix's two parts are too "
+                                                  "far apart for a complex64 factor (low frequency)")
+        .def(py::init<arr<int>, arr<int>, arr<uint8_t>, py::dict, py::dict, double, arr<i64>, arr<int>, arr<cd>,
+                      arr<cd>, arr<cd>, arr<double>, double, int>())
+        .def("solve", &BLRFactorT<cd>::solve, "the approximate inverse applied to R (N or N x m)")
+        .def("stats", &BLRFactorT<cd>::stats);
     m.def("num_threads", &num_threads);
     m.def("near_pairs", &near_pairs, "near triangle pairs (sorted by p, q)");
     m.def("hankel_real", &hankel_real, "sum_k J0(rho kr_k) W[s, k] for real kr");

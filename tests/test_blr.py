@@ -118,3 +118,44 @@ def test_a_factor_too_loose_to_precondition_is_made_again_tighter(monkeypatch):
     assert np.abs(S - ref).max() < 1e-6
     assert any('factored again at 0.003' in n for n in sim.log.notes)
     assert sim.fast._blr_tol < 1e-3
+
+
+def test_low_frequency_goes_to_the_loop_tree_basis_or_a_double_factor(monkeypatch):
+    """Below (k h)^2 = LOOP_TREE_BELOW a complex64 factor of the RWG matrix cannot hold the loops: the block
+    low-rank path hands the frequency to the loop/tree basis's dense solve, and where that has no room factors in
+    double precision, compressed to a hundredth of (k h)^2. Both give the direct solver's answer."""
+    core = pytest.importorskip('mom25d._core')
+    if not hasattr(core, 'BLRFactor128'):
+        pytest.skip('a core without BLRFactor128')
+    from mom25d import fast
+    f = 2e6
+    ref_sim = _sim('direct')
+    ref_sim.loop_tree = 'auto'
+    ref = ref_sim.sparams(f)
+    sim = _sim()
+    sim.loop_tree, sim.blr_tile = 'auto', 128
+    assert sim.fast.kh2(f) < fast.LOOP_TREE_BELOW
+    S = sim.sparams(f)
+    assert sim.fast._basis_name == 'loop/tree' and np.abs(S - ref).max() < 1e-6
+    assert any('in the loop/tree basis, dense' in n for n in sim.log.notes)
+    monkeypatch.setattr(fast.FastOperator, '_loop_tree_at', lambda self, f: False)      # no room for it
+    sim = _sim()
+    sim.loop_tree, sim.blr_tile = 'auto', 128
+    S = sim.sparams(f)
+    assert any('factor in double precision' in n for n in sim.log.notes)
+    assert np.abs(S - ref).max() < 1e-5 and not any('did not converge' in n for n in sim.log.notes)
+
+
+def test_an_unconverged_block_low_rank_solve_is_an_error_not_an_answer(monkeypatch):
+    core = pytest.importorskip('mom25d._core')
+    if not hasattr(core, 'BLRFactor'):
+        pytest.skip('a core without BLRFactor')
+    from mom25d import fast
+    def stalled(self, A, B, M, restart, maxiter, stall=None):
+        self.iters = [30] * B.shape[1]
+        return np.zeros(B.shape, complex), False, 0.7
+    monkeypatch.setattr(fast.FastOperator, '_refine', stalled)
+    sim = _sim()
+    sim.blr_tile = 128
+    with pytest.raises(FloatingPointError, match='did not converge'):
+        sim.sparams(4e9)

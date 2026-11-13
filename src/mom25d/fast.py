@@ -269,6 +269,7 @@ REUSE_KEEP = 4           # complex64 LUs the CPU keeps at most, memory allowing 
 BLR_STALL = (30, 1e-2)   # solve_blr: a compiled BLR factor is given up when the residual is above 1e-2 after 30
                          # GMRES iterations (a good one takes 3-16), and factored again at a hundredth of the tolerance
 BLR_TOL_MIN = 1e-9       # ... down to this
+BLR_GIVE_UP = 1e-2       # a block low-rank solve whose GMRES ends above this residual is an error, not an answer
 LOOP_TREE_BELOW = 1e-5   # sim.loop_tree 'auto': the loop/tree basis where (k h)^2 is below this (k in the densest
                          # dielectric, h the median edge), about the ratio of a cell's two MPIE parts. The RWG basis's
                          # complex64 LU stops preconditioning below ~2e-6 (the via transition: ~100 MHz), its double LU
@@ -1431,6 +1432,17 @@ class FastOperator:
         sim = self.sim
         Ne, Nv = sim.Ne, sim.Nv
         N = Ne + Nv
+        if self._loop_tree_at(f):
+            # low frequency: the RWG matrix's loops are below a complex64 factor's rounding, at any compression
+            # (antenna_vivaldi, 21.9k unknowns, at 50 MHz: the factor made three times, to no compression at all,
+            # GMRES still at a residual of 0.95: 84 s). The loop/tree basis's dense solve, where it fits
+            self.setup(f, mode='direct')
+            if not getattr(self, '_blr_lt_said', False):
+                self._blr_lt_said = True
+                sim.log.note(f"block low-rank solver: frequencies below (k h)^2 = {LOOP_TREE_BELOW:g} "
+                             f"({f / 1e9:.4g} GHz here) in the loop/tree basis, dense")
+            return self._solve_loop_tree(f, E, self.extra_blocks(f), 'mixed' if sim.precision != 'double' else 'double')
+        self._basis('rwg')
         self.setup(f, mode='sparse')
         self.dZ_exact = self.dZ
         Sx = self.extra_blocks(f)
@@ -1443,6 +1455,17 @@ class FastOperator:
         tiles, boxes = cluster_tiles(self._points(), tile)
         raw = self._raw_entry(dZx)
         compiled = hasattr(self.core, 'BLRFactor') and dtype == np.complex64
+        # low frequency, and no room for the loop/tree basis's dense matrix: the factor in double precision, its
+        # compression a hundredth of (k h)^2 (the loops' share of the matrix: what a looser one truncates away)
+        low = compiled and hasattr(self.core, 'BLRFactor128') and getattr(sim, 'loop_tree', 'auto') != 'off' \
+            and self.kh2(f) < LOOP_TREE_BELOW
+        if low:
+            tol = min(tol, 0.01 * self.kh2(f))
+            if not getattr(self, '_blr_double_said', False):
+                self._blr_double_said = True
+                sim.log.note(f"block low-rank solver: below (k h)^2 = {LOOP_TREE_BELOW:g} ({f / 1e9:.4g} GHz here) its "
+                             f"factor in double precision, compressed to {tol:.1e} (the loop/tree basis's dense "
+                             f"matrix does not fit)")
         diag = np.empty(N, complex)
         for t in tiles:
             diag[t] = np.diagonal(raw(t, t))
@@ -1452,7 +1475,7 @@ class FastOperator:
             with sim.log.timer('BLR assemble + factor', f"N={N}, {len(tiles)} tiles, tolerance {tol:g}"
                                + (", compiled" if compiled else '')):
                 if compiled:
-                    self.blr = blr = _CompiledBLR(self, tiles, boxes, dZx, dsc, tol, eta)
+                    self.blr = blr = _CompiledBLR(self, tiles, boxes, dZx, dsc, tol, eta, double=low)
                 else:
                     self.blr = blr = BLRFactor(lambda r, c: raw(r, c) * dsc[r][:, None] * dsc[c][None, :], tiles,
                                                boxes, tol=tol, eta=eta, dtype=dtype, scale=1.0)
@@ -1471,7 +1494,7 @@ class FastOperator:
                                           dsc[:, None] * E, blr.solve, 50, 10, BLR_STALL if compiled else None)
                 self._t_iter = (time.time() - t) / max(1, max(self.iters, default=1))
             sim.log.note(f"BLR: GMRES iterations per port {list(self.iters)}")
-            if ok or not compiled or tol <= BLR_TOL_MIN:
+            if ok or not compiled or tol <= (1e-4 * self.kh2(f) if low else BLR_TOL_MIN):
                 break
             # too loose a compression for this matrix (a fine mesh, a resonance: antenna_cp_patch, 40.8k
             # unknowns, at 1e-3: residual 0.6 after 500 iterations; at 1e-5: 7 iterations): a hundredth of it, here
@@ -1479,8 +1502,14 @@ class FastOperator:
             sim.log.note(f"the BLR factor at tolerance {tol:g} left GMRES at residual {rel:.1e} after "
                          f"{max(self.iters, default=0)} iterations at {f / 1e9:.4g} GHz - factored again at {tol / 100:g}")
             tol = self._blr_tol = tol / 100
+        if not ok and not rel <= BLR_GIVE_UP:
+            # no answer: an unconverged GMRES's currents are not S-parameters to write (antenna_vivaldi at 50 MHz
+            # through a complex64 factor: S11 1.000 where it is 0.978 - 0.193j)
+            raise FloatingPointError(f"mom25d: the block low-rank solve at {f / 1e9:.4g} GHz did not converge "
+                                     f"(residual {rel:.1e} with a factor compressed to {tol:.1e}, N = {N}): "
+                                     f"a coarser mesh (--mom-dmax), or a machine with room for the direct solver")
         if not ok:
-            sim.log.note(f"WARNING BLR: GMRES did not converge at {f / 1e9:.4g} GHz (residual {rel:.1e})")
+            sim.log.note(f"WARNING BLR: GMRES stopped at a residual of {rel:.1e} at {f / 1e9:.4g} GHz")
         else:
             self._kept = [(f, blr.solve, dsc, time.time() - t_fresh)]
         return dsc[:, None] * Y
@@ -1492,7 +1521,7 @@ class _CompiledBLR:
     diameter, as blr.py's), the near correction and extra blocks as CSR, the via rows and columns, the
     equilibration. Its BLAS calls run on OpenMP's threads, so SciPy's are held at one while it factors and solves."""
 
-    def __init__(self, fo, tiles, boxes, dZx, dsc, tol, eta):
+    def __init__(self, fo, tiles, boxes, dZx, dsc, tol, eta, double=False):
         lo, hi = np.array([b[0] for b in boxes]), np.array([b[1] for b in boxes])
         gap = np.linalg.norm(np.maximum(0, np.maximum(lo[:, None] - hi[None], lo[None] - hi[:, None])), axis=2)
         diam = np.linalg.norm(hi - lo, axis=1)
@@ -1505,7 +1534,8 @@ class _CompiledBLR:
         B = c(fo.B, complex) if Nv else np.zeros((sim.Ne, 0), complex)
         C = c(fo.C, complex) if Nv else np.zeros((0, 0), complex)
         with _one_blas_thread():
-            self.f = fo.core.BLRFactor(order, start, far.astype(np.uint8), fo.g, fo.tb, fo.w,
+            make = fo.core.BLRFactor128 if double else fo.core.BLRFactor      # (double: low frequency, solve_blr)
+            self.f = make(order, start, far.astype(np.uint8), fo.g, fo.tb, fo.w,
                                        dZx.indptr.astype(np.int64), dZx.indices.astype(np.int32),
                                        c(dZx.data, complex), B, C, c(dsc, float), float(tol), 0)
         self.stats = self.f.stats()
