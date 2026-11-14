@@ -19,9 +19,11 @@ G = 'mom25d'
 # --solvers auto (docs/architecture.md#choosing-solvers): seconds per EM solve on 24 cores, fitted on the examples
 # run alone: T0 per pair of metal interfaces (the layered-medium tables of each frequency), plus the dense fill
 # (DENSE_N2 N^2, up to 3.5k unknowns) or the direct solver's LU (LU_N3 N^3), plus VIA2 per pair of vias (the
-# via-via kernels, from a table since: sma_launch's 181 vias 2.5 s a solve, 26 s before); a sweep takes about
-# SOLVES solves (11..22 on the examples). demo_transition: 12.1 s a solve measured, 12.4 s estimated.
-T0, DENSE_N2, LU_N3, VIA2, SOLVES, REF_CORES = 1.0, 1.6e-7, 3.7e-12, 7.6e-5, 16, 24
+# via-via kernels, from a table since: sma_launch's 181 vias 2.5 s a solve, 26 s before; halved since 2026-11-14,
+# the chains' kernel in the compiled core, the fans' product sparse and the pairs' geometry made once: 317 vias
+# 1.36 s for 3.43); a sweep takes about SOLVES solves (11..22 on the examples). demo_transition: 12.1 s a solve
+# measured, 12.4 s estimated.
+T0, DENSE_N2, LU_N3, VIA2, SOLVES, REF_CORES = 1.0, 1.6e-7, 3.7e-12, 3.5e-5, 16, 24
 # with a GPU (RX 7800 XT, sma_launch, 16.1k unknowns): the fill, the complex64 LU and the refinement 6.3 s a solve
 # (hybrid), the tiled path 10.5 s (its fill block by block, the symmetric near field)
 LU_GPU_N3, LU_TILED_N3 = 1.5e-12, 2.5e-12

@@ -11,6 +11,9 @@
 //   near_pairs    : the near triangle pairs (a grid search; the KD-tree + np.unique of fast.py, same order)
 //   hankel_real   : sum_k J0(rho_i kr_k) W[s, k] over the real part of a Sommerfeld contour, without the
 //                   (n_rho x n_k) Bessel matrix (the Green tables and the via kernels)
+//   radial_table_sum: sum_q D(|P[t, q] - V[v]|) W[t, q], D a radial table (via.Table1D): each via's smooth kernel
+//                   on the triangles' quadrature points (sim._via_blocks; a Python loop over the vias had been
+//                   1.5 s of a 8 s solve with 888 of them)
 //   scale_c64     : Z <- D Z D (equilibration) and its complex64 copy, one pass (the GPU LU's input)
 //   fan_q         : G_q moments between every triangle and the via fan triangles (centroid rule)
 //   near_q        : the near pairs' G_q moment corrections alone (the loop/tree basis's charge matrix)
@@ -1256,6 +1259,41 @@ py::tuple near_pairs(arr<double> cent, arr<double> size, arr<double> z, double f
 }
 
 // ---------------------------------------------------------------------------------------------
+// out[t, v] = sum_q D(|P[t, q] - V[v]|) W[t, q]: D on a uniform grid of step dr from 0 (via.Table1D, its linear
+// interpolation exactly: u = min(r / dr, n - 1.000001), D[i] (1 - u + i) + D[i + 1] (u - i)), triangle-parallel
+// ---------------------------------------------------------------------------------------------
+py::array_t<cd> radial_table_sum(arr<double> px, arr<double> py_, arr<double> W, arr<double> vx, arr<double> vy,
+                                 arr<cd> table, double dr) {
+    const i64 nt = px.shape(0), nq = px.shape(1), nv = vx.shape(0), n = table.shape(0);
+    if (py_.shape(0) != nt || py_.shape(1) != nq || W.shape(0) != nt || W.shape(1) != nq || vy.shape(0) != nv)
+        throw std::invalid_argument("radial_table_sum: px, py, W must be (nt, nq), vx and vy (nv,)");
+    if (n < 2 || !(dr > 0)) throw std::invalid_argument("radial_table_sum: a table of two points or more, dr > 0");
+    py::array_t<cd> out({nt, nv});
+    cd *o = out.mutable_data();
+    const double *x = px.data(), *y = py_.data(), *w = W.data(), *ax = vx.data(), *ay = vy.data();
+    const cd *d = table.data();
+    const double top = (double)n - 1.000001;
+    {
+        py::gil_scoped_release nogil;
+#pragma omp parallel for schedule(static)
+        for (i64 t = 0; t < nt; ++t) {
+            for (i64 v = 0; v < nv; ++v) {
+                cd acc(0.0, 0.0);
+                for (i64 q = 0; q < nq; ++q) {
+                    const double rx = x[t * nq + q] - ax[v], ry = y[t * nq + q] - ay[v];
+                    const double u = std::min(std::hypot(rx, ry) / dr, top);
+                    const i64 i = (i64)u;
+                    const double f = u - (double)i;
+                    acc += (d[i] * (1.0 - f) + d[i + 1] * f) * w[t * nq + q];
+                }
+                o[t * nv + v] = acc;
+            }
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------------
 // out[s, i] = sum_k J0(rho_i kr_k) W[s, k] for real kr (glibc's j0), rho-parallel
 // ---------------------------------------------------------------------------------------------
 py::array_t<cd> hankel_real(arr<double> rho, arr<double> kr, arr<cd> W) {
@@ -1417,6 +1455,7 @@ PYBIND11_MODULE(_core, m) {
     m.def("num_threads", &num_threads);
     m.def("near_pairs", &near_pairs, "near triangle pairs (sorted by p, q)");
     m.def("hankel_real", &hankel_real, "sum_k J0(rho kr_k) W[s, k] for real kr");
+    m.def("radial_table_sum", &radial_table_sum, "sum_q D(|P[t, q] - V[v]|) W[t, q] of a radial table D");
     m.def("scale_c64", &scale_c64, "Z <- D Z D in place, and its complex64 copy");
     m.def("fan_q", &fan_q, "G_q moments between every triangle and the fan triangles");
     m.def("project", &project_t<cd>, "T^T Z T (quad cells, line functions), complex128, Z overwritten");

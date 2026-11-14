@@ -586,7 +586,8 @@ def test_near_field_of_a_dipole_over_ground():
 
 
 def test_new_core_kernels_match_numpy():
-    """near_pairs, hankel_real (j0_sum), fan_q and scale_c64 of the compiled core against their NumPy versions."""
+    """near_pairs, hankel_real (j0_sum), fan_q, scale_c64 and the via blocks' radial_table_sum of the compiled core
+    against their NumPy versions."""
     core = pytest.importorskip('mom25d._core')
     from shapely.geometry import box, Point
     from scipy.spatial import cKDTree
@@ -629,6 +630,17 @@ def test_new_core_kernels_match_numpy():
     Zr = Z * d[:, None] * d[None, :]
     Z64 = core.scale_c64(Z, d)
     assert np.allclose(Z, Zr) and Z64.dtype == np.complex64 and np.allclose(Z64, Zr, rtol=1e-6)
+    # the via blocks: the chains' kernel on the triangles in the core (a chain at a time in NumPy before), the
+    # same B and C
+    from mom25d import fast
+    Qf = fo._fan_columns()
+    Bc, Cc = sim._via_blocks(4e9, Qf)
+    fast._core, keep = None, fast._core
+    try:
+        Bp, Cp = sim._via_blocks(4e9, Qf)
+    finally:
+        fast._core = keep
+    assert np.abs(Bc - Bp).max() < 1e-12 * np.abs(Bp).max() and np.abs(Cc - Cp).max() < 1e-12 * np.abs(Cp).max()
 
 
 def test_core_choice():

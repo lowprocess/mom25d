@@ -755,6 +755,37 @@ class Simulation:
         return _sym(Z)
 
     VIA_TABLE_PAIRS = 64                 # via pairs of one span pair above which R comes from a table
+    VIA_CHUNK = 4_000_000                # triangles x chains of the via -> strip kernel's block (64 MB)
+
+    def _via_geometry(self):
+        """What the via blocks take of the geometry alone, once (it had been made again at every frequency, in
+        Python loops over the chains and their pairs): each chain's (x, y), the chains of each span, every pair
+        (m <= n) grouped by its two spans with its distance (a chain with itself or another chain of its via: the
+        barrel's radius; else at least the two radii's mean), and the fans' divergence dF as a sparse matrix."""
+        if getattr(self, '_via_geo', None) is not None and self._via_geo[0] == len(self.chains):
+            return self._via_geo[1]
+        ch = self.chains
+        x = np.array([v.x for v, _, _ in ch], float)
+        y = np.array([v.y for v, _, _ in ch], float)
+        a = np.array([v.a for v, _, _ in ch], float)
+        via = {}
+        vid = np.array([via.setdefault(id(v), len(via)) for v, _, _ in ch], int)
+        span_of = [(kb, kt) for _, kb, kt in ch]
+        spans = sorted(set(span_of))
+        si = np.array([spans.index(s) for s in span_of], int)
+        by_span = {s: np.flatnonzero(si == i) for i, s in enumerate(spans)}
+        m, n = np.triu_indices(len(ch))
+        d = np.where(vid[m] == vid[n], a[m], np.maximum(np.hypot(x[m] - x[n], y[m] - y[n]), 0.5 * (a[m] + a[n])))
+        key = si[m] * len(spans) + si[n]
+        order = np.argsort(key, kind='stable')
+        groups = {}
+        for g in np.unique(key):
+            sel = order[np.searchsorted(key[order], g, 'left'):np.searchsorted(key[order], g, 'right')]
+            groups[(spans[g // len(spans)], spans[g % len(spans)])] = (m[sel], n[sel], d[sel])
+        from scipy import sparse
+        geo = dict(x=x, y=y, by_span=by_span, groups=groups, dF=sparse.csc_matrix(self.dF))
+        self._via_geo = (len(ch), geo)
+        return geo
 
     def _via_blocks(self, f, QF, charges=True):
         """Via rows/columns: B (Ne x Nv) strip-via coupling, C (Nv x Nv) via-via (incl. elements in vias); after the
@@ -767,27 +798,38 @@ class Simulation:
         if self.frills:
             self._frill_blocks(f, B, C)
         vk = ViaKernels(f, self.st, [(kb, kt) for _, kb, kt in self.chains], self.layers, self.rho_max)
+        geo = self._via_geometry()
         # fan-distributed end charges (G_q between triangles, same machinery as strips)
-        if len(self.F) and charges:
-            T = QF @ self.dF                                   # (Nt, Nv) potential of fan charges
+        if len(self.F) and charges:                            # (dF: a chain's few fan triangles a column; as a
+            dF = geo['dF']                                     # dense product it was 1.4 s of 317 vias' 3.4 s)
+            T = np.asarray((dF.T @ QF.T).T)                    # (Nt, Nv) potential of fan charges
             B += (r.D.T @ T) / (1j * w)
-            C += (self.dF.T @ T[self.F]) / (1j * w)
-        # smooth via -> strip kernel D(rho), Galerkin-tested with the RWG divergence
-        for n, (v, kb, kt) in enumerate(self.chains):
-            c = np.zeros(len(r.tris), complex)
-            for k in self.layers:
-                idx = self.tri_idx[k]
-                dist = np.hypot(self.P6[idx, :, 0] - v.x, self.P6[idx, :, 1] - v.y)
-                c[idx] = (vk.D[(k, (kb, kt))](dist) * self.W6[idx]).sum(1)
-            B[:, n] += r.D.T @ c
-        # via-via: group all pairs by (span_m, span_n) and evaluate each group's Hankel transform once
-        groups = {}
-        for m, (vm, am, bm) in enumerate(self.chains):
-            for n, (vn, an, bn) in enumerate(self.chains[m:], m):
-                d = vm.a if vm is vn else max(np.hypot(vm.x - vn.x, vm.y - vn.y), 0.5 * (vm.a + vn.a))
-                groups.setdefault(((am, bm), (an, bn)), []).append((m, n, d))
-        for (sm, sn), lst in groups.items():
-            m, n, dd = (np.array(a) for a in zip(*lst))
+            C += (dF.T @ T[self.F]) / (1j * w)
+        # smooth via -> strip kernel D(rho), Galerkin-tested with the RWG divergence: in the compiled core the
+        # chains of a span a block at a time (a chain and a layer at a time, NumPy's, had been 1.5 s of an 8 s
+        # solve with 888 chains), else as before
+        from .fast import _core
+        if _core is not None and hasattr(_core, 'radial_table_sum'):
+            per = max(1, self.VIA_CHUNK // max(len(r.tris), 1))
+            for span, ns in geo['by_span'].items():
+                for s in range(0, len(ns), per):
+                    sel = ns[s:s + per]
+                    c = np.zeros((len(r.tris), len(sel)), complex)
+                    for k in self.layers:
+                        idx, D = self.tri_idx[k], vk.D[(k, span)]
+                        c[idx] = _core.radial_table_sum(self.P6[idx, :, 0], self.P6[idx, :, 1], self.W6[idx],
+                                                        geo['x'][sel], geo['y'][sel], D.v, D._dr)
+                    B[:, sel] += r.D.T @ c
+        else:
+            for n, (v, kb, kt) in enumerate(self.chains):
+                c = np.zeros(len(r.tris), complex)
+                for k in self.layers:
+                    idx = self.tri_idx[k]
+                    dist = np.hypot(self.P6[idx, :, 0] - v.x, self.P6[idx, :, 1] - v.y)
+                    c[idx] = (vk.D[(k, (kb, kt))](dist) * self.W6[idx]).sum(1)
+                B[:, n] += r.D.T @ c
+        # via-via: all pairs grouped by (span_m, span_n), each group's Hankel transform evaluated once
+        for (sm, sn), (m, n, dd) in geo['groups'].items():
             # many pairs: the smooth remainder from a table (the SMA launch's 143k pairs took 24.6 s a solve of
             # 26.8 for its via blocks); a few: exactly
             vals = (vk.R_table(sm, sn)(dd) if len(dd) > self.VIA_TABLE_PAIRS else vk.R(sm, sn, dd)) + vk.homog(sm, sn, dd)
