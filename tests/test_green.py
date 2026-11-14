@@ -44,7 +44,7 @@ def test_stripline_vs_cohn():
     st = LayerStack([Layer(b / 2, er), Layer(b / 2, er)], top='pec')
     g, z = line_char_xs(st, 1, w, [5e9], ncross=6)
     eps_eff = (g[0].imag / (2 * np.pi * 5e9 / C0)) ** 2
-    assert abs(z[0].real / stripline_z0_cohn(w, b, er) - 1) < 0.01      # within 1 %
+    assert abs(z[0].real / stripline_z0_cohn(w, b, er) - 1) < 0.006     # within 0.6 % (0.574 %), as the README says
     assert abs(eps_eff / er - 1) < 0.002                                # TEM: eps_eff = er
     assert abs(g[0].real) < 1e-6                                        # lossless
 
