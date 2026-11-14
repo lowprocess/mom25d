@@ -361,3 +361,27 @@ def test_factorisations_and_reused_solves_from_the_stage_records():
     assert factorisations(log) == (1, 2)
     assert reused(log) == 1                                         # one of the two attempts converged
     assert reused(SimpleNamespace()) == 0
+
+
+def test_mixed_models_the_board_with_mom25d_s_options(monkeypatch):
+    """--mom-planes, --mom-stitching-pads and --diel reach the mixed solver's BoardModel, --mom-coarsen and
+    --mom-quad-tol its mesh: it had taken mom25d's defaults, so --solvers mom,mixed compared two models."""
+    from types import SimpleNamespace as NS
+    import mom25d.board as B
+    from mom25d.kicad2ems import mixed
+    from mom25d.kicad2ems.mom import _model_kw
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def model(data, **kw):
+        seen.update(kw)
+        raise Stop
+    monkeypatch.setattr(B, 'BoardModel', model)
+    monkeypatch.setattr(mixed, '_metal', lambda *a, **k: (None, None))
+    s = NS(mom_planes='holes', mom_stitching_pads='keep', diel='wideband', diel_fref=2.0)
+    board = NS(to_dict=lambda: {}, ports=[])
+    with pytest.raises(Stop):
+        mixed.solve_mixed(board, np.array([1e9, 2e9]), model_kw=_model_kw(s), coarsen=4, quad_tol=20.0)
+    assert seen['planes'] == 'holes' and seen['stitching_pads'] == 'keep' and seen['wideband'] == 2e9

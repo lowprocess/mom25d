@@ -24,7 +24,7 @@ import time
 import numpy as np
 
 from kicad2ems.api.solver import Result, Option
-from .mom import MoM25D, _metal, run_finish, _stack, apertures, aperture_text, ports_below
+from .mom import MoM25D, _metal, _model_kw, run_finish, _stack, apertures, aperture_text, ports_below
 from ..base import C0
 from kicad2ems.api.solver import stop
 
@@ -199,9 +199,11 @@ def line_S(gamma, zc, length, z0):
 
 
 def solve_mixed(m, freq, dmax=0.3, sigma=None, rough=None, finish=None, max_solves=60, cut_min=CUT_MIN, keep_out=None, log=print,
-                progress=None, on_step=None, port='auto', hold=None, **mom_kw):
+                progress=None, on_step=None, port='auto', hold=None, model_kw=None, **mom_kw):
     """S over the board's ports (kicad2ems order, as mom.solve returns them), with the long straight runs cut out of
-    mom25d's model and put back as lines. mom_kw: the mom25d mesh options (quads, zone, lines, signal_vias, ...)."""
+    mom25d's model and put back as lines. mom_kw: the mom25d mesh options (quads, quad_tol, coarsen, zone, lines,
+    signal_vias, ...); model_kw: BoardModel's (planes, stitching_pads, wideband: mom.solve's _model_kw), so the two
+    solvers model one board (mixed had taken mom25d's defaults whatever --mom-planes and the rest said)."""
     from mom25d.board import BoardModel
     from mom25d.geo import LinePort
     from mom25d.run import solve_band
@@ -213,7 +215,7 @@ def solve_mixed(m, freq, dmax=0.3, sigma=None, rough=None, finish=None, max_solv
     fmin, fmax = float(freq[0]), float(freq[-1])
     dm = dmax * 1e-3
     metal, t_mm = _metal(m, sigma, rough, finish)
-    model = BoardModel(data, port='via' if port == 'lumped' else port, log=lambda *a: None)
+    model = BoardModel(data, port='via' if port == 'lumped' else port, log=lambda *a: None, **(model_kw or {}))
     # the board's own ports, from the uncut copper: a cut would shorten their straight feeds (wave ports turned
     # lumped, and so different terminations); the cuts keep out of their feeds
     # (each wave port's feed capped at what its fit needs down to fmin - a port fits over its whole straight feed
@@ -471,7 +473,8 @@ class Mixed(MoM25D):
             max_solves=s.mom_solves,
             cut_min=s.mixed_cut, log=run.log,
             port=s.mom_port, hold=self._held,
-            quads={'off': False, 'on': True}.get(s.mom_quads, s.mom_quads),
+            quads={'off': False, 'on': True}.get(s.mom_quads, s.mom_quads), quad_tol=s.mom_quad_tol,
+            coarsen=s.mom_coarsen or None, model_kw=_model_kw(s),
             zone='auto' if s.mom_zone == 'on' else None, lines=s.mom_lines,
             signal_vias=s.mom_signal_vias, stitching_vias=s.mom_stitching_vias,
             progress=lambda k, n, f: (run.status('mixed', dict(fraction=k / n, solves=k, f_ghz=f / 1e9)), stop.check()))
