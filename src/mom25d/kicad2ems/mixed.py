@@ -304,7 +304,7 @@ def solve_mixed(m, freq, dmax=0.3, sigma=None, rough=None, finish=None, max_solv
     for p in cut_ports:                         # each cut port at its own line's impedance; a pair's: its
         zref[p.name] = float(p.zdiff) / 2 if hasattr(p, 'pos') else float(p.zc)    # differential mode's (run.out_refs)
     f, Sn, info = solve_band(sim, fmin, fmax, points=len(freq), zref=zref, max_solves=max_solves, log=log,
-                             progress=progress, on_step=on_step)
+                             progress=progress, on_step=on_step, freq=freq)
     for jn in joins:
         q, md = jn['port'], jn['mode']
         jn['gamma'] = q.gamma_fn if md is None else q.gd_fn if md == 'd' else q.gc_fn

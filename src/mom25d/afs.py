@@ -68,7 +68,17 @@ def aaa(z, F, tol=1e-10, mmax=80):
     return r
 
 
-def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001, log=print, on_step=None, seed=()):
+def _is_log(grid):
+    """Whether a frequency grid is spaced in log f (a ratio between neighbours rather than a step)."""
+    g = np.asarray(grid, float)
+    if len(g) < 3 or g[0] <= 0 or g[-1] / g[0] < 10:
+        return False
+    d, r = np.diff(g), g[1:] / g[:-1]
+    return np.ptp(r) < 1e-6 * r.mean() * len(g) or np.ptp(d) > 10 * d.min()
+
+
+def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001, log=print, on_step=None, seed=(),
+                   grid=None):
     """
     solve(f) -> S (P x P).  Returns (f_grid, S_grid (ngrid, P, P), f_samples, S_samples, history): one dict per
     model after the first, solves (samples so far), change (max |dS| from the previous model, on the grid) at
@@ -77,7 +87,11 @@ def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001,
     Converged when, twice in a row, the models from the last two iterations agree to `tol` (max |dS|) on the
     grid and the model predicted the newest sample to `tol` before it was solved. (The model change alone can
     be zero while the model is still wrong: a sparse fit that the new sample does not alter.) seed: frequencies
-    (Hz) solved among the first samples, besides the n0 spread over the band (those inside it).
+    (Hz) solved among the first samples, besides the n0 spread over the band (those inside it). grid: the
+    frequencies asked for (Hz), the model checked and returned there (else ngrid spread linearly); a grid in log f
+    (a sweep of decades) has the first samples and the gaps between them in log f too. (A log sweep had been
+    solved on a linear grid and interpolated linearly: below its first step, decades between two samples.) The
+    last history entry's `converged` says whether the models agreed, or the sweep stopped at max_points.
     """
     def checked(f):
         S = solve(f)
@@ -86,14 +100,20 @@ def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001,
                                      f"MOM25D_GPU=off solves on the CPU)")
         return S
 
-    def widest_gap():                                       # the middle of the widest gap between samples
-        fsort = np.sort(fs)
-        i = int(np.argmax(np.diff(fsort)))
-        return fsort[i] + (fsort[i + 1] - fsort[i]) / 2
+    grid = np.linspace(fmin, fmax, ngrid) if grid is None else np.asarray(grid, float)
+    ngrid, logf = len(grid), _is_log(grid)
+    u = np.log if logf else (lambda x: np.asarray(x, float))      # the axis the gaps are measured on
+    iu = np.exp if logf else (lambda x: x)
 
-    fs = sorted(set(np.linspace(fmin, fmax, n0).tolist()) | {float(f) for f in seed if fmin <= f <= fmax})
+    def widest_gap():                                       # the middle of the widest gap between samples
+        us = np.sort(u(np.array(fs)))
+        i = int(np.argmax(np.diff(us)))
+        return float(iu(us[i] + (us[i + 1] - us[i]) / 2))
+
+    first = np.geomspace(fmin, fmax, n0) if logf else np.linspace(fmin, fmax, n0)
+    fs = sorted(set(first.tolist()) | {float(f) for f in seed if fmin <= f <= fmax})
     Ss = [checked(f) for f in fs]
-    P, grid, sc = Ss[0].shape[0], np.linspace(fmin, fmax, ngrid), 1e9
+    P, sc = Ss[0].shape[0], 1e9
     prev, hist, ok, pred_err = None, [], 0, np.inf
     while True:
         o = np.argsort(fs)
@@ -111,12 +131,13 @@ def adaptive_sweep(solve, fmin, fmax, n0=5, tol=2e-3, max_points=40, ngrid=2001,
                 f"prediction error {pred_err:.1e}")
             ok = ok + 1 if dif[k] < tol and pred_err < tol else 0
             if ok >= 2 or len(fs) >= max_points:
+                hist[-1]['converged'] = ok >= 2
                 break
             fnew = grid[k]
         else:
             fnew = widest_gap()
-        if min(abs(np.array(fs) - fnew)) < (fmax - fmin) / (4 * ngrid):     # keep new samples away from existing ones
-            fnew = widest_gap()
+        if min(abs(u(np.array(fs)) - u(fnew))) < (u(fmax) - u(fmin)) / (4 * ngrid):   # keep new samples away from
+            fnew = widest_gap()                                                      # existing ones
         prev = Mg
         if hist:
             hist[-1]['f_new'] = float(fnew)

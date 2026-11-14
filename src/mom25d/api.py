@@ -80,7 +80,8 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
                                  lines=lines, quad_tol=quad_tol, coarsen=coarsen, planes=planes,
                                  stitching_pads=stitching_pads, wideband=wideband, title=name)
         f, S, info = solve_band(sim, fmin, fmax, points=len(freq), zref=model.port_z0, max_solves=max_solves,
-                                afs_tol=afs_tol, log=log, progress=progress, on_step=on_step, keep_at=keep_at)
+                                afs_tol=afs_tol, log=log, progress=progress, on_step=on_step, keep_at=keep_at,
+                                freq=freq)
         core_used = fast._core is not None
     finally:
         fast.set_core(prev)

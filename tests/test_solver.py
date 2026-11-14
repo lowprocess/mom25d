@@ -857,3 +857,35 @@ def test_far_field_both_half_spaces_and_vias():
     up = T < np.pi / 2
     ampg = eta * k0 * 2 * H / (4 * np.pi) * np.sin(T) * np.abs(np.sinc(k0 * 2 * H * np.cos(T) / (2 * np.pi)))
     assert np.allclose(np.abs(Eg[up]), ampg[up], rtol=1e-6) and not Eg[~up].any()
+
+
+def test_a_log_sweep_is_sampled_and_given_in_log_f():
+    """A sweep of decades (10 Hz to 1 GHz, a pole at 100 kHz): its first samples and gaps in log f and the model
+    given at the frequencies asked for. It had been seeded and checked on a linear grid (one solve below 1 MHz) and
+    interpolated linearly onto the log points: |dS| up to 1.8."""
+    import mom25d.afs as afs
+    fc = 100e3
+    truth = lambda f: np.array([[(1 - 1j * f / fc) / (1 + 1j * f / fc)]])
+    freq = np.geomspace(10, 1e9, 201)
+    f, S, fs, _, hist = afs.adaptive_sweep(truth, freq[0], freq[-1], tol=2e-3, ngrid=len(freq), max_points=40,
+                                           log=lambda *a: None, grid=freq)
+    assert np.array_equal(f, freq) and hist[-1]['converged']
+    assert (fs < 1e6).sum() >= 3
+    assert np.abs(S[:, 0, 0] - [truth(x)[0, 0] for x in freq]).max() < 1e-6
+    _, _, _, _, hist = afs.adaptive_sweep(truth, freq[0], freq[-1], tol=1e-12, ngrid=len(freq), max_points=6,
+                                          n0=5, log=lambda *a: None, grid=freq)
+    assert hist[-1]['converged'] is False                           # stopped at its cap: said
+
+
+def test_a_blas_thread_setting_leaves_the_openmp_cap():
+    """OPENBLAS_NUM_THREADS set by the user had switched the compiled core's OpenMP cap off with the BLAS one."""
+    import subprocess, sys
+    pytest.importorskip('threadpoolctl')
+    from mom25d import fast
+    if fast._core is None:
+        pytest.skip('no compiled core')
+    code = "import mom25d.fast as F; F.cap_blas_threads(); print(F._core.num_threads())"
+    run = lambda **env: int(subprocess.check_output([sys.executable, '-c', code], text=True,
+                                                    env={**__import__('os').environ, **env}).split()[-1])
+    assert run(OPENBLAS_NUM_THREADS='8', MOM25D_OMP_THREADS='3') == 3
+    assert run(OPENBLAS_NUM_THREADS='8') == run()

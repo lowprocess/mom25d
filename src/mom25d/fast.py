@@ -82,7 +82,8 @@ def cap_blas_threads():
     if _blas_capped:
         return
     _blas_capped = True
-    env = os.environ.get('MOM25D_BLAS_THREADS')
+    cap_core_threads()                                      # (its own setting: a BLAS one set by the user had
+    env = os.environ.get('MOM25D_BLAS_THREADS')             # returned before it, so OpenMP ran on every thread)
     if not env and (os.environ.get('OPENBLAS_NUM_THREADS') or os.environ.get('MKL_NUM_THREADS')):
         return
     try:
@@ -92,7 +93,6 @@ def cap_blas_threads():
     n = int(env) if env else fast_cores()
     if n:
         threadpool_limits(limits=n, user_api='blas')
-    cap_core_threads()
 
 
 _omp_capped = False
