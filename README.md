@@ -97,7 +97,7 @@ f, S, info = solve_band(sim, 1e9, 6e9, points=101, zref=m.port_z0)
 | `gpu.py`, `ldlt.py` | the GPU backends and the tiled solver |
 | `gpu_vk.py` | the Vulkan backend: a hybrid LU (panels on the CPU, updates on the GPU) and its GPU solves |
 | `blr.py`, `hodlr.py` | the compressed solvers: block low-rank (compiled in `core/`, the large boards' path), hierarchical |
-| `afs.py`, `run.py` | the adaptive frequency sweep |
+| `afs.py`, `run.py` | the adaptive frequency sweep (its fit is emsdev's `emsdev.afs`, which pcbqs shares) |
 | `farfield.py` | far and near fields from the currents |
 | `core/` | the compiled C++ kernels |
 | `kicad2ems/` | kicad2ems's solver plugins, `mom25d` and `mixed` (the `kicad2ems.solvers` entry points; only kicad2ems imports them) |

@@ -402,11 +402,12 @@ def test_afs_does_not_stop_on_a_model_that_ignores_new_samples(monkeypatch):
     it is still wrong (seen on a 10 dB coupler: stopped at 9 solves, -14 dB coupling instead of -11 dB). The
     sweep must also see the model predict each new sample before it stops."""
     import mom25d.afs as afs
-    real, first = afs.aaa, []
+    import emsdev.afs as shared                                     # (the sweep is emsdev's, mom25d's its wrapper)
+    real, first = shared.aaa, []
     def stale(z, F, **kw):                                          # fitted to the first samples, ever after
         first.append(first[0] if first else (z, F))
         return real(*first[-1], **kw)
-    monkeypatch.setattr(afs, 'aaa', stale)
+    monkeypatch.setattr(shared, 'aaa', stale)
     truth = lambda f: np.array([[0.3 + 0.2 * np.sin(f / 4e8)]], complex)
     seen = []
     _, _, fs, _, hist = afs.adaptive_sweep(lambda f: seen.append(f) or truth(f), 1e9, 6e9, n0=5, tol=2e-3,
