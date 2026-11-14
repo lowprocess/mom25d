@@ -344,7 +344,7 @@ def _solid_ground(m):
 
 
 class MoM25D(Solver):
-    api = (2, 3)                    # kicad2ems.api (2.3: the roughness row)
+    api = (2, 9)                    # kicad2ems.api (2.3: the roughness row; 2.9: basic)
     name, aliases, label = 'mom25d', ('mom',), 'mom25d (MoM)'
     consumes, previewed, rank, order = 'board', False, 1, 20     # order: after openEMS in kicad2ems's lists
     basic = ('mom_dmax',)           # what a run is set up with, of its options (kicad2ems 2.9: Solver.basic)
