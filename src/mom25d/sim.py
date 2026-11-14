@@ -196,7 +196,8 @@ class DiffPort:
       zdiff, zcomm : modal reference impedances (2 Z_odd and Z_even / 2 of the pair; see line_char_pair)
     """
     def __init__(self, pos, neg, zdiff=100.0, zcomm=25.0, name='P'):
-        assert np.allclose(pos.d, neg.d), "differential lines must run in the same direction"
+        if not (np.allclose(pos.d, neg.d)):
+            raise ValueError("differential lines must run in the same direction")
         self.pos, self.neg, self.zdiff, self.zcomm, self.name = pos, neg, zdiff, zcomm, name
         self.zd_fn = self.zc_fn = None                # the modes' impedances over frequency (model.characterize)
         self.gd_fn = self.gc_fn = None                # and their propagation constants
@@ -364,11 +365,12 @@ class Simulation:
         self.vias += [p.via for p in self.ports if isinstance(p, ViaPort) and p.via not in self.vias]
         self.frills = list(frills)
         for fr in self.frills:
-            assert fr.k in stack.pec and fr.via in self.vias and fr.via.k_bot < fr.k < fr.via.k_top, \
-                f"a hole is in a PEC plane inside the stack, around a via through it (M{fr.k}, {fr.via.name})"
+            if not (fr.k in stack.pec and fr.via in self.vias and fr.via.k_bot < fr.k < fr.via.k_top):
+                raise ValueError(f"a hole is in a PEC plane inside the stack, around a via through it (M{fr.k}, {fr.via.name})")
         self.layers = sorted(shapes)
         for k in self.layers:
-            assert k in stack.metal_interfaces, f"interface {k} cannot carry metal in this stack"
+            if not (k in stack.metal_interfaces):
+                raise ValueError(f"interface {k} cannot carry metal in this stack")
         geoms = {k: to_geometry(shapes[k]) for k in self.layers}
         self.zone = zone
         if zone is not None and stitching_vias == 'auto':
@@ -381,8 +383,8 @@ class Simulation:
         # vertex; stitching 'auto': square outside the zone
         signal_vias, stitching_vias = (m if m in ('round', 'auto') else 4 if m == 'square' else int(m)
                                        for m in (signal_vias, stitching_vias))
-        assert signal_vias != 'auto' and all(m in ('round', 'auto') or m >= 3 for m in (signal_vias, stitching_vias)), \
-            "a via is 'round', 'square' or n >= 3 sides (stitching vias also 'auto')"
+        if not (signal_vias != 'auto' and all(m in ('round', 'auto') or m >= 3 for m in (signal_vias, stitching_vias))):
+            raise ValueError("a via is 'round', 'square' or n >= 3 sides (stitching vias also 'auto')")
 
         def via_mode(v):
             kind = getattr(v, 'kind', None)                   # None: port vias, vias of hand-built models
@@ -406,8 +408,8 @@ class Simulation:
             on = lambda k: (k in geoms and geoms[k].buffer(1e-9).contains(shapely.Point(v.x, v.y))) or \
                 (k in stack.pec and (id(v), k) not in holes)
             for k in (v.k_bot, v.k_top):
-                assert stack.is_pec(k) or on(k), \
-                    f"via {v.name} ends on M{k} where there is no metal"
+                if not (stack.is_pec(k) or on(k)):
+                    raise ValueError(f"via {v.name} ends on M{k} where there is no metal")
             att = [v.k_bot] + [k for k in range(v.k_bot + 1, v.k_top) if on(k)] + [v.k_top]
             self.via_attach.append([k for k in att if k in geoms])
             self.chains += [(v, a, b) for a, b in zip(att[:-1], att[1:])]
@@ -483,7 +485,8 @@ class Simulation:
                                                  fine=fine, dmax_fine=dm_fine, coarsen=coarsen, grow=grow,
                                                  structured=struct, gap_rings=gap_rings, **zkw)
                 for (i, v), vid in zip(vias_here, vids):
-                    assert vid >= 0, f"via {v.name}: not on the M{k} mesh"
+                    if not (vid >= 0):
+                        raise ValueError(f"via {v.name}: not on the M{k} mesh")
                     via_vertex[(i, k)] = vid + off
                 self.mesher_used[k] = 'tensor' if use_tensor else 'polygon'
                 nodes.append(nd); tris.append(tr + off); tl.append(np.full(len(tr), k)); off += len(nd)
@@ -690,11 +693,14 @@ class Simulation:
                 gap, s = (self._line_edges(p.lp, 0.0) if isinstance(p, GapPort) else None), None
             self.gap.append(gap)
             self.cuts.append(None if s is None else [cut(x) for x in s])
-            assert gap is None or len(gap[0]), f"port {p.name}: no mesh edges on the gap line"
-            assert s is None or all(len(c[0]) for c in self.cuts[-1]), f"port {p.name}: sample cut off the conductor"
+            if not (gap is None or len(gap[0])):
+                raise ValueError(f"port {p.name}: no mesh edges on the gap line")
+            if not (s is None or all(len(c[0]) for c in self.cuts[-1])):
+                raise ValueError(f"port {p.name}: sample cut off the conductor")
         self.lumped_edges = [self._line_edges(el.lp, 0.0) for el in self.lumped]
         for el, e in zip(self.lumped, self.lumped_edges):
-            assert len(e[0]) > 0, f"lumped element {el.name}: no mesh edges on its line"
+            if not (len(e[0]) > 0):
+                raise ValueError(f"lumped element {el.name}: no mesh edges on its line")
 
     def _port_chain(self, p):
         """Index of the lowest chain of the via of a ViaPort."""

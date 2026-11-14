@@ -678,11 +678,20 @@ class FastOperator:
             Y, infos = self._gmres_columns(LinearOperator((N, N), matvec=mv, dtype=complex),
                                            LinearOperator((N, N), matvec=lu.solve, dtype=complex),
                                            dsc[:, None] * E, tol, restart, maxiter)
+        X = dsc[:, None] * Y
+        rel = np.linalg.norm(E - self._bordered(X, self.H.matvec(X[:Ne]) + self.dZ @ X[:Ne] + Sx[:Ne, :Ne] @ X[:Ne]),
+                             axis=0) / np.maximum(np.linalg.norm(E, axis=0), 1e-300)
+        if not np.isfinite(rel).all() or rel.max() > BLR_GIVE_UP:   # as the BLR solve: no answer (it had been
+            raise FloatingPointError(                                # returned with a warning)
+                f"mom25d: the compressed (ACA) solve at {f / 1e9:.4g} GHz did not converge (residual {rel.max():.1e} "
+                f"after {max(self.iters, default=0)} iterations, N = {N}): a coarser mesh (--mom-dmax), or the compiled "
+                f"core (python -m mom25d.core.build) for the direct and block low-rank solvers")
         for j, info in enumerate(infos):
             if info > 0:
-                sim.log.note(f"WARNING GMRES did not converge for port {j + 1} ({self.iters[j]} iterations)")
+                sim.log.note(f"WARNING GMRES did not converge for port {j + 1} ({self.iters[j]} iterations, residual "
+                             f"{rel[j]:.1e})")
         sim.log.note(f"GMRES iterations per port: {self.iters}")
-        return dsc[:, None] * Y
+        return X
 
     def solve_direct(self, f, E, block=1024, precision='double'):
         """Dense LU of the fast-operator entries (centroid far field + exact near correction).
@@ -1422,6 +1431,9 @@ class FastOperator:
             sim.log.note(f"WARNING HODLR refinement did not converge at {f / 1e9:.4g} GHz with tol {tol:g} - "
                          f"factoring again at {tol / 100:g}")
             return self.solve_hodlr(f, E, tol=tol / 100, leaf=leaf, refine=True, symmetric=symmetric)
+        if not ok and not rel <= BLR_GIVE_UP:                       # (as the BLR solve: no answer)
+            raise FloatingPointError(f"mom25d: the HODLR solve at {f / 1e9:.4g} GHz did not converge (residual "
+                                     f"{rel:.1e} at tol {tol:g}): a coarser mesh (--mom-dmax)")
         self._kept = [(f, H.solve, dsc, time.time() - t_fresh)]
         return dsc[:, None] * Y
 

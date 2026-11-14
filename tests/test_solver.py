@@ -293,7 +293,7 @@ def test_pads_joined_by_a_via_through_a_plane_s_hole():
     assert 180e-15 < C < 230e-15
     assert cap(one) == pytest.approx(C, rel=0.015) and cap(holes(2)) == pytest.approx(C, rel=0.01)
     assert cap(holes(1, couple=False)) > 1.3 * C
-    with pytest.raises(AssertionError, match='a hole is in a PEC plane inside the stack'):
+    with pytest.raises(ValueError, match='a hole is in a PEC plane inside the stack'):
         Simulation(LayerStack(layers), {1: pad(), 3: pad()}, port(), vias=[sig()], frills=[Frill(sig(), 2, b)], **kw)
     both = Simulation(LayerStack(layers, pec=(2,)), {1: pad(), 3: pad()}, port(), vias=[v := sig()] + gv(),
                       frills=[Frill(v, 2, b)], **kw)             # the first order too: nothing here drives it much
@@ -889,3 +889,19 @@ def test_a_blas_thread_setting_leaves_the_openmp_cap():
                                                     env={**__import__('os').environ, **env}).split()[-1])
     assert run(OPENBLAS_NUM_THREADS='8', MOM25D_OMP_THREADS='3') == 3
     assert run(OPENBLAS_NUM_THREADS='8') == run()
+
+
+def test_an_unconverged_compressed_solve_is_no_answer(monkeypatch):
+    """ACA's GMRES that ends far from the answer: an error, as the block low-rank solve's (it had been returned with a
+    warning note, its currents written as S-parameters)."""
+    from shapely.geometry import box, Point
+    import mom25d.fast as F
+    w, h, L = 0.35e-3, 0.2e-3, 10e-3
+    st = LayerStack([Layer(h, 4.3, 0.02)])
+    v1, v2 = Via(-L / 2, 0, 0, 1, 0.1e-3), Via(L / 2, 0, 0, 1, 0.1e-3)
+    geo = [box(-L / 2, -w / 2, L / 2, w / 2), Point(-L / 2, 0).buffer(0.25e-3), Point(L / 2, 0).buffer(0.25e-3)]
+    sim = Simulation(st, {1: geo}, [ViaPort(v1, 54.0), ViaPort(v2, 54.0)], dmax=0.3e-3, w_ref=w, solver='aca',
+                     verbose=False)
+    monkeypatch.setattr(F, 'gmres', lambda A, b, **kw: (np.zeros_like(b), 1))
+    with pytest.raises(FloatingPointError, match='did not converge'):
+        sim.sparams(4e9)
