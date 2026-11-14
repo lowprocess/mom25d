@@ -120,3 +120,8 @@ feed line.
 ## Licence
 
 GPL-3.0-or-later.
+
+The mesher is the `triangle` package (LGPL-3.0, by Dzhelil Rufat), which compiles in Jonathan Shewchuk's
+Triangle. It is installed as a separate package; none of its code is in this repository. Triangle keeps its own
+terms, which are not the GPL's: it "may not be sold or included in commercial products without a license" from
+its author ([Triangle's page](https://www.cs.cmu.edu/~quake/triangle.html)).
