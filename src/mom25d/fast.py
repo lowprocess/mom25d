@@ -51,22 +51,14 @@ def set_core(module):
 
 
 def fast_cores():
-    """The physical cores of the fastest class (a hybrid CPU's P-cores; every core of the others), from Linux's
-    /sys or Windows' efficiency classes (emsdev.cpu); None where it cannot tell."""
-    import glob, sys
-    if sys.platform == 'win32':
-        from emsdev.cpu import windows_fast_cores
-        return windows_fast_cores()
-    cores = {}
-    for d in glob.glob('/sys/devices/system/cpu/cpu[0-9]*'):
-        try:
-            f = int(open(d + '/cpufreq/cpuinfo_max_freq', encoding='utf-8').read())
-            key = tuple(open(f'{d}/topology/{k}', encoding='utf-8').read().strip() for k in ('physical_package_id', 'core_id'))
-        except (OSError, ValueError):
-            return None
-        cores[key] = max(cores.get(key, 0), f)
-    top = max(cores.values(), default=0)
-    return sum(f >= 0.9 * top for f in cores.values()) or None
+    """The physical cores of the fastest class (a hybrid CPU's P-cores; every core of the others) among the CPUs this
+    process may use: emsdev's, which the other solvers ask too (mom25d had its own rule, 0.9 of the top clock over
+    every CPU of the machine, affinity ignored); None where emsdev cannot tell."""
+    try:
+        from emsdev.cpu import core_threads
+    except ImportError:
+        return None
+    return core_threads() or None
 
 
 _blas_capped = False
