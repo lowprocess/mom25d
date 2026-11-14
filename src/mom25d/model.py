@@ -218,6 +218,7 @@ class PlanarModel:
         covering the port), solved as a short centre-fed line at n frequencies and interpolated."""
         from .geo import LinePort
         from .sim import line_char_xs, DiffPort, line_char_pair
+        from .linecache import cached
         fs = np.linspace(max(fmin, fmax / 3), fmax, n)    # the fit is well conditioned here; Zc ~ flat
         # the centre-fed line must keep the source's near field (a few widths and heights) out of the fit window:
         # 16 mm for a 3 mm line on 1.6 mm FR4 gave Zc 1.6 / 24 / 33 ohm and beta below k0, 48 mm 48-51 ohm;
@@ -240,9 +241,12 @@ class PlanarModel:
                 length = max(length_for(a.w + b.w + gap), getattr(p, 'char_length', 0.0))
                 key = ('pair', a.layer, round(0.5 * (a.w + b.w) * 1e7), round(gap * 1e7), round(length * 1e5),
                        tuple(sorted((k, round(W * 1e5)) for k, W in planes.items())))
-                if key not in cache:
-                    cache[key] = line_char_pair(self.stack, a.layer, 0.5 * (a.w + b.w), gap, fs, planes=planes,
-                                                dmax=dmax, length=length)
+                kept = False
+                if key not in cache:                        # (and on disk: a board run again, linecache.py)
+                    args = dict(layer=a.layer, w=0.5 * (a.w + b.w), gap=gap, fs=fs, planes=sorted(planes.items()),
+                                dmax=dmax, length=length)
+                    cache[key], kept = cached('pair', self.stack, args, lambda: line_char_pair(
+                        self.stack, a.layer, 0.5 * (a.w + b.w), gap, fs, planes=planes, dmax=dmax, length=length))
                 ge, ze, go, zo = cache[key]
                 zd, zcm = 2 * zo.real, ze.real / 2
                 p.zd_fn, p.zc_fn = _smooth(fs, zd), _smooth(fs, zcm)
@@ -253,7 +257,8 @@ class PlanarModel:
                 p.gc_fn = (lambda f, gf=_smooth(fs, ge / fs): f * gf(f))
                 p.zdiff, p.zcomm = float(zd[len(zd) // 2]), float(zcm[len(zcm) // 2])
                 log(f"  {p.name}: coupled pair on M{a.layer}, w={a.w * 1e3:.3f} mm, gap={gap * 1e3:.3f} mm: "
-                    f"Zdiff = " + ", ".join(f"{v:.1f}" for v in zd) + ", Zcomm = " + ", ".join(f"{v:.1f}" for v in zcm) + " ohm")
+                    f"Zdiff = " + ", ".join(f"{v:.1f}" for v in zd) + ", Zcomm = " + ", ".join(f"{v:.1f}" for v in zcm) + " ohm"
+                    + (" (kept from an earlier run)" if kept else ''))
                 continue
             if not isinstance(p, LinePort):
                 continue
@@ -262,9 +267,11 @@ class PlanarModel:
             cop = self._coplanar_at(p.layer, pt, p.d, p.w)
             key = (p.layer, round(p.w * 1e7), tuple(sorted((k, round(W * 1e5)) for k, W in planes.items())),
                    tuple((round(a * 1e6), round(b * 1e6)) for a, b in cop))
-            if key not in cache:
-                g, z = line_char_xs(self.stack, p.layer, p.w, fs, planes=planes, coplanar=cop, dmax=dmax,
-                                    length=length_for(p.w))
+            if key not in cache:                            # (and on disk: a board run again, linecache.py)
+                args = dict(layer=p.layer, w=p.w, fs=fs, planes=sorted(planes.items()), coplanar=cop, dmax=dmax,
+                            length=length_for(p.w))
+                (g, z), kept = cached('xs', self.stack, args, lambda: line_char_xs(
+                    self.stack, p.layer, p.w, fs, planes=planes, coplanar=cop, dmax=dmax, length=length_for(p.w)))
                 cache[key] = (z.real, g)
                 if np.any(np.abs(g.imag) < 0.95 * 2 * np.pi * fs / C0):       # slower than light: a failed fit
                     self.notes.append(f"WARNING {p.name}: the line characterisation fit failed (beta below k0): "
@@ -273,7 +280,8 @@ class PlanarModel:
                 log(f"  {p.name}: line on M{p.layer}, w={p.w * 1e3:.3f} mm, reference metal "
                     + (", ".join([f"M{k} ({W * 1e3:.1f} mm)" for k, W in planes.items()]
                                  + [f"coplanar GND, gap {gp * 1e3:.3f} mm" for gp in gaps]) or "ground only")
-                    + ": Zc = " + ", ".join(f"{v:.2f}" for v in z.real) + " ohm")
+                    + ": Zc = " + ", ".join(f"{v:.2f}" for v in z.real) + " ohm"
+                    + (" (kept from an earlier run)" if kept else ''))
             zz, gg = cache[key]
             p.zc_fn, p.zc = _smooth(fs, zz), float(zz[len(zz) // 2])
             # gamma / f is nearly flat; the wave fit takes it at every frequency (sim.sparams)

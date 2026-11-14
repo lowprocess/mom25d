@@ -49,6 +49,10 @@ hybrid CPU's E-cores and hyperthreads held them back (an i7-13700K's fill took 1
 0.87 s on 8). `MOM25D_OMP_THREADS` and `MOM25D_BLAS_THREADS` (or `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`) set
 them instead.
 
+A wave port's line, characterised as a short line of its own, is kept on disk by its cross-section and the code
+that solved it (`linecache.py`), so a board run again does not solve it again (the launch board's set-up: 0.5 s for
+14.5). `MOM25D_CACHE` names the folder (default `~/.cache/mom25d`); `MOM25D_CACHE=off` keeps nothing.
+
 ## Use
 
 ```python
