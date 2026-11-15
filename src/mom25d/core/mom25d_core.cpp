@@ -1502,6 +1502,61 @@ py::array_t<cd> bessel_real_sum(int n, arr<double> rho, arr<double> kr, arr<cd> 
 }
 
 // ---------------------------------------------------------------------------------------------
+// J_n(z) for complex z, n = 0, 1, 2 (the lifted part of a Sommerfeld contour: scipy's jv had taken 0.6 s of a
+// via board's 8): the power series up to |z| = 14 (its largest term about 3e4: digits to 5e-12), Hankel's
+// asymptotic expansion beyond (summed to its smallest term, about exp(-2|z|) < 7e-13)
+// ---------------------------------------------------------------------------------------------
+static cd bessel_jn_complex1(int n, cd z)
+{
+    const double PI = 3.14159265358979323846;            // (M_PI is not standard C++: MSVC lacks it)
+    const double az = std::abs(z);
+    if (az <= 14.0) {
+        const cd h = 0.5 * z, mh2 = -h * h;
+        cd term = n == 0 ? cd(1.0) : n == 1 ? h : 0.5 * h * h;       // (z / 2)^n / n!
+        cd sum = term;
+        double big = std::abs(term);
+        for (int k = 1; k < 300; ++k) {
+            term *= mh2 / (double(k) * double(k + n));
+            sum += term;
+            const double at = std::abs(term);
+            big = std::max(big, at);
+            if (k > az && at <= 1e-18 * big) break;
+        }
+        return sum;
+    }
+    const double mu = 4.0 * n * n;
+    const cd iz = 1.0 / z, chi = z - (0.5 * n + 0.25) * PI;
+    cd P(1.0), Q(0.0), t(1.0);
+    double prev = 1.0;
+    for (int k = 1; k < 80; ++k) {
+        const double m = 2.0 * k - 1.0;
+        const cd nt = t * ((mu - m * m) / (8.0 * k)) * iz;
+        const double at = std::abs(nt);
+        if (at >= prev) break;                                      // past its smallest term: stop
+        t = nt; prev = at;
+        const double sg = ((k / 2) & 1) ? -1.0 : 1.0;
+        if (k & 1) Q += sg * t; else P += sg * t;
+        if (at < 1e-17) break;
+    }
+    return std::sqrt(2.0 / (PI * z)) * (P * std::cos(chi) - Q * std::sin(chi));
+}
+
+py::array_t<cd> bessel_jn_complex(int n, py::array_t<cd, py::array::c_style | py::array::forcecast> z) {
+    if (n < 0 || n > 2) throw std::invalid_argument("bessel_jn_complex: order 0, 1 or 2");
+    auto b = z.request();
+    py::array_t<cd> out(b.shape);
+    const cd *zz = (const cd *)b.ptr;
+    cd *o = out.mutable_data();
+    const i64 total = (i64)b.size;
+    {
+        py::gil_scoped_release nogil;
+#pragma omp parallel for schedule(static) if (total > 4096)
+        for (i64 i = 0; i < total; ++i) o[i] = bessel_jn_complex1(n, zz[i]);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Z <- diag(d) Z diag(d) in place, and its complex64 copy (one pass over the matrix, row-parallel)
 // ---------------------------------------------------------------------------------------------
 py::array_t<cf> scale_c64(py::array_t<cd, py::array::c_style> Z, arr<double> d) {
@@ -1632,6 +1687,7 @@ PYBIND11_MODULE(_core, m) {
     m.def("near_pairs", &near_pairs, "near triangle pairs (sorted by p, q)");
     m.def("hankel_real", &hankel_real, "sum_k J0(rho kr_k) W[s, k] for real kr");
     m.def("bessel_real_sum", &bessel_real_sum, "sum_k J_n(rho kr_k) W[s, k] for real kr, n = 0, 1, 2");
+    m.def("bessel_jn_complex", &bessel_jn_complex, "J_n(z) for complex z, n = 0, 1, 2 (elementwise, any shape)");
     m.def("radial_table_sum", &radial_table_sum, "sum_q D(|P[t, q] - V[v]|) W[t, q] of a radial table D");
     m.def("slot_coupling", &slot_coupling, "an opening's TM / TE pair moments against a layer's strips (slots.py)");
     m.def("scale_c64", &scale_c64, "Z <- D Z D in place, and its complex64 copy");

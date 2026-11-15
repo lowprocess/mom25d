@@ -73,7 +73,7 @@ import os
 import numpy as np
 from scipy.special import jv, j0, j1
 
-from .via import sommerfeld_contour, hankel, Table1D, _layers
+from .via import sommerfeld_contour, hankel, Table1D, _layers, jn
 
 
 MODES = 2               # axisymmetric field shapes a hole carries (Frill.modes): each one more unknown
@@ -134,7 +134,7 @@ def bessel_matrices(rho, kr, orders=(0, 1, 2)):
         else:
             out[n][:, real] = J0 if n == 0 else J1
         if (~real).any():
-            out[n][:, ~real] = jv(n, rho[:, None] * kr[None, ~real])
+            out[n][:, ~real] = jn(n, rho[:, None] * kr[None, ~real])
     return out
 
 
@@ -296,7 +296,7 @@ class FrillKernels:
         kr, dk, Ye = self.kr, self.dk, self._Y[su[0]]
         sep = u[0].xy - v[0].xy
         d, be = (0.0, 0.0) if same else (float(np.hypot(*sep)), float(np.arctan2(sep[1], sep[0])))
-        J = lambda n: jv(n, kr * d) if d else (np.ones_like(kr) if n == 0 else np.zeros_like(kr))
+        J = lambda n: jn(n, kr * d) if d else (np.ones_like(kr) if n == 0 else np.zeros_like(kr))
         tot = lambda spec: complex(np.sum(spec * kr * dk))
         if not du and not dv:
             return 2 * np.pi * tot(Ye * self.e[su] * self.e[sv] * J(0))
