@@ -12,6 +12,7 @@ mom25d.fast - large problems: hierarchical (H-matrix / ACA) far field + sparse n
 Memory ~ O(N log N) instead of O(N^2); the dense path stays the reference for validation.
 """
 import os
+import threading
 import time
 
 import numpy as np
@@ -71,11 +72,11 @@ def cap_blas_threads():
     run 10.8 s against 3.3 s), as fast at 5k unknowns. MOM25D_BLAS_THREADS (or OPENBLAS_NUM_THREADS / MKL_NUM_THREADS)
     sets it instead; without threadpoolctl nothing is changed."""
     global _blas_capped
-    if _blas_capped:
-        return
-    _blas_capped = True
     cap_core_threads()                                      # (its own setting: a BLAS one set by the user had
-    env = os.environ.get('MOM25D_BLAS_THREADS')             # returned before it, so OpenMP ran on every thread)
+    if _blas_capped:                                        # returned before it, so OpenMP ran on every thread;
+        return                                              # and per thread, below)
+    _blas_capped = True
+    env = os.environ.get('MOM25D_BLAS_THREADS')
     if not env and (os.environ.get('OPENBLAS_NUM_THREADS') or os.environ.get('MKL_NUM_THREADS')):
         return
     try:
@@ -87,19 +88,20 @@ def cap_blas_threads():
         threadpool_limits(limits=n, user_api='blas')
 
 
-_omp_capped = False
+_omp_capped = threading.local()
 
 
 def cap_core_threads():
-    """Once: the compiled core's OpenMP (the matrix fill, the near-field correction) on the fast physical cores
-    only, as the BLAS. Its schedule splits the rows over every thread, and on an i7-13700K the E-cores and the
-    hyperthreads held the fill back: antenna_vivaldi's (21.9k unknowns) took 1.5-3.1 s a frequency on 24 threads,
-    0.87 s on 8 and 0.79 s on 16, the whole fresh solve 8.5 s against 6.9-7.1 s. MOM25D_OMP_THREADS (or
-    OMP_NUM_THREADS) sets it instead; without threadpoolctl nothing is changed."""
-    global _omp_capped
-    if _omp_capped:
+    """Once in each thread: the compiled core's OpenMP (the matrix fill, the near-field correction) on the fast
+    physical cores only, as the BLAS. Its schedule splits the rows over every thread, and on an i7-13700K the E-cores
+    and the hyperthreads held the fill back: antenna_vivaldi's (21.9k unknowns) took 1.5-3.1 s a frequency on 24
+    threads, 0.87 s on 8 and 0.79 s on 16, the whole fresh solve 8.5 s against 6.9-7.1 s. Per thread: libgomp keeps
+    omp_set_num_threads as the calling thread's own, so a cap set once in the main thread left a solve in another
+    (kicad2ems's --solver-jobs, a window's worker) on all 24 CPUs. MOM25D_OMP_THREADS (or OMP_NUM_THREADS) sets it
+    instead; without threadpoolctl nothing is changed."""
+    if getattr(_omp_capped, 'done', False):
         return
-    _omp_capped = True
+    _omp_capped.done = True
     env = os.environ.get('MOM25D_OMP_THREADS')
     if not env and os.environ.get('OMP_NUM_THREADS'):
         return

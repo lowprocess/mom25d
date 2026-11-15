@@ -899,6 +899,21 @@ def test_a_blas_thread_setting_leaves_the_openmp_cap():
     assert run(OPENBLAS_NUM_THREADS='8') == run()
 
 
+def test_the_openmp_cap_holds_in_every_thread():
+    """libgomp keeps omp_set_num_threads per calling thread: a solve in another thread than the one the cap was set
+    in (kicad2ems's --solver-jobs, a window's worker) is capped in its own (it ran on every CPU)."""
+    import subprocess, sys
+    from mom25d import fast
+    if fast._core is None:
+        pytest.skip('no compiled core')
+    code = ("import threading, mom25d.fast as F; F.cap_blas_threads(); out = []\n"
+            "t = threading.Thread(target=lambda: (F.cap_blas_threads(), out.append(F._core.num_threads())))\n"
+            "t.start(); t.join(); print(F._core.num_threads(), out[0])")
+    got = subprocess.check_output([sys.executable, '-c', code], text=True,
+                                  env={**__import__('os').environ, 'MOM25D_OMP_THREADS': '3'}).split()
+    assert got[-2:] == ['3', '3']
+
+
 def test_an_unconverged_compressed_solve_is_no_answer(monkeypatch):
     """ACA's GMRES that ends far from the answer: an error, as the block low-rank solve's (it had been returned with a
     warning note, its currents written as S-parameters)."""
