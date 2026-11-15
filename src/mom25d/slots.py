@@ -46,9 +46,7 @@ field leaves the plane at zero, while another field's TM part has a potential on
 (T = 1), whose gradient cancels its TE part's field on the metal. The via is charged it at that end, as its fans
 are at their ends (+ at its top, - at its bottom). Without it a port via's potential at its pad stood alone, and a
 slot's effect on the line came out about doubled (S21 -12 dB at 8 GHz where the ground meshed gives -5.1 dB; 2026-
-11-15). frill.py's first-order shapes leave such a potential too, and its chains do not see it: added there, it
-moved demo_transition from 0.003 to 0.011 at 8 GHz against the finely meshed plane, so it is left out of frill
-until that is understood (kicad2ems ROADMAP).
+11-15). frill.py's first-order shapes leave such a potential too, and its chains see it since then.
 """
 import numpy as np
 

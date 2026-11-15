@@ -916,6 +916,16 @@ class Simulation:
                 if dip:                                       # (the via on the hole's own axis: none)
                     off = np.hypot(dx, dy) > 1e-9
                     rem = np.where(off, rem * (dx if dip == 'c' else dy) / np.where(off, np.hypot(dx, dy), 1.0), 0.0)
+                    if fr.k in span:
+                        # a chain ending on the plane: a first-order shape leaves a potential on the plane outside
+                        # the hole, -e1(0) cos(phi) / rho (a 2D dipole: the field is inside the hole), whose gradient
+                        # its TE part cancels; the chain is charged it at that end, + at its top, - at its bottom (the
+                        # fans' sign; frill.py). Without it a via ending on the plane did not excite the dipoles:
+                        # two via ports either side of a hole had Z21 0.287 ohm, the hole's own 0.246, now 0.241
+                        sgn = 1.0 if span[1] == fr.k else -1.0
+                        e10 = float(np.real(fk.e1[s][0]))
+                        d2 = np.maximum(dx * dx + dy * dy, np.array([self.chains[n][0].a for n in ns]) ** 2)
+                        rem = rem + sgn * (-e10) * (dx if dip == 'c' else dy) / d2
                 c[ns] += rem
             C[:Nc, col] = C[col, :Nc] = c
             for g, other in enumerate(fk.unknowns[:m + 1]):

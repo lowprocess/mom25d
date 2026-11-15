@@ -160,3 +160,29 @@ def test_slot_under_a_line():
     for s, (f, (s11, s21, ph)) in zip(got, ref.items()):
         r21 = 10 ** (s21 / 20) * np.exp(1j * np.radians(ph))
         assert abs(abs(s[0, 0]) - 10 ** (s11 / 20)) < 0.03 and abs(s[1, 0] - r21) < 0.04, (f, s)
+
+
+def test_frill_dipoles_couple_to_vias_ending_on_the_plane():
+    """Two via ports between the ground and an inner plane, either side of a 0.6 mm hole round a floating via (no
+    traces: only the vias' coupling to the hole's first-order shapes and the hole's own admittance count). The hole
+    lowers Z21; with the plane's potential at the vias' feet (frill.py, 2026-11-15) the hole model gives the
+    plane meshed at 0.15 mm's Z21 to 3 % (0.246 / 0.683 / 2.091 ohm at 2 / 5 / 10 GHz; no hole 0.289 / 0.804 /
+    2.491). Without it the dipoles did nothing here (0.287 / 0.792 / 2.354)."""
+    from shapely.geometry import Point
+    from mom25d.sim import Simulation, ViaPort
+    from mom25d.frill import Frill
+    mm = 1e-3
+    H, ER, TD, A, B, D = 0.2 * mm, 4.3, 0.02, 0.125 * mm, 0.6 * mm, 1.3 * mm
+    layers = [Layer(H, ER, TD) for _ in range(3)]
+    pads = [Point(0, 0).buffer(0.2 * mm)]
+    sig = Via(0, 0, 1, 3, A, name='sig')
+    ports = [ViaPort(Via(-D, 0, 0, 2, 0.125 * mm), name='P1'), ViaPort(Via(D, 0, 0, 2, 0.125 * mm), name='P2')]
+    gv = [Via(x * mm, s * 2.0 * mm, 0, 2, 0.125 * mm) for x in np.arange(-4.8, 4.81, 1.2) for s in (1, -1)]
+    gv += [Via(sx * 4.8 * mm, y * mm, 0, 2, 0.125 * mm) for sx in (1, -1) for y in (-1, 0, 1)]
+    sim = Simulation(LayerStack(layers, pec=(2,)), {1: pads, 3: pads}, ports, vias=[sig] + gv,
+                     frills=[Frill(sig, 2, B, dipoles=2)], dmax=0.3 * mm, solver='direct', precision='double',
+                     gpu='off', verbose=False)
+    for f, ref in ((2e9, 0.246), (5e9, 0.683), (10e9, 2.091)):
+        S = sim.sparams(f)
+        Z = 50 * (np.eye(2) + S) @ np.linalg.inv(np.eye(2) - S)
+        assert abs(Z[1, 0].imag - ref) < 0.03 * ref, (f, Z[1, 0])

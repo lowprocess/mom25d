@@ -36,8 +36,11 @@ stays symmetric:
     [ c^T -Y ] [V] = [0]              ends on pads the same, by their fans' charge), plus the chains' remainder
                                 Y_fg = 2 pi int (Yu + Yd) e_f e_g J0(kr d_fg) kr dkr     (holes of one plane)
 
-A chain's potential terms at the plane itself cancel between its two sides (a via through the hole), or are zero
-(a via onto the plane, outside every hole), so only its ends on pads and the remainder count. Statically this is
+A chain's potential terms at the plane itself cancel between its two sides (a via through the hole). A via onto
+the plane, outside every hole, is at zero potential there from the axisymmetric shapes (their TE part is none), but
+not from a first-order shape: it leaves -e1(0) cos(phi) / rho on the plane outside the hole (a 2D dipole: the field
+is inside the hole), whose gradient its TE part cancels, and the chain is charged it at that end (sim._frill_blocks;
+since 2026-11-15, found with the slot planes, slots.py). Its ends on pads and the remainder count as well. Statically this is
 the hole's capacitance into both sides, charged by what the pads' charges induce where the hole is: the current
 through the hole alone makes no voltage across it.
 
