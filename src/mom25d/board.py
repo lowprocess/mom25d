@@ -204,6 +204,7 @@ class BoardModel(PlanarModel):
         one mixed-mode port. wall_pitch (m): via spacing along edge walls. planes: 'pec' (default: solid planes
         as the ground and a PEC cover) | 'mesh'. stitching_pads: 'drop' (default: lone pads of ground vias left out)
         | 'keep'. wideband: None (default: each dielectric's er and tand constant over frequency) or a frequency
+        (a layer's own fref first: the frequency kicad2ems's material library quotes its laminate at)
         (Hz) at which they hold, the Djordjevic-Sarkar model elsewhere (multilayer.djordjevic_sarkar). planes
         'holes' (experimental): as 'pec', and a plane between the copper layers whose only holes are those of
         vias through it (plane_holes) is a PEC plane inside the stack, not meshed, each hole a few unknowns
@@ -244,7 +245,8 @@ class BoardModel(PlanarModel):
         ztop = cu_z[self.cover] if self.cover else max(cu_z.values())
         diels = sorted([l for l in st['layers'] if l['z0'] >= zg - 1e-9
                         and (not (self.whole or self.cover) or l['z1'] <= ztop + 1e-9)], key=lambda l: l['z0'])
-        self.stack = LayerStack([Layer((l['z1'] - l['z0']) * MM, l['er'], l['tand'], l['name'], fref=wideband) for l in diels],
+        self.stack = LayerStack([Layer((l['z1'] - l['z0']) * MM, l['er'], l['tand'], l['name'],     # (a known
+                                       fref=(l.get('fref') or wideband) if wideband else None) for l in diels],
                                 top='pec' if self.cover else 'open', bottom='open' if self.whole else 'pec')
         if self.whole:
             self.notes.append(f"whole stack: no infinite ground, {len(cu_z)} copper layers meshed (planes too), "
