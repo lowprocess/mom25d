@@ -420,6 +420,8 @@ class BoardModel(PlanarModel):
                                  f"{self.ground}")
             d = np.zeros(2)
             d[int(p['axis'])] = p['sgn']
+            if p.get('d') is not None:                                    # a trace at an angle (kicad2ems R-E1)
+                d = np.asarray(p['d'], float) / np.linalg.norm(p['d'])
             if self.whole:
                 kref, kind = self._reference(p, k), 'via'                 # wave ports assume the ground plane
             else:
