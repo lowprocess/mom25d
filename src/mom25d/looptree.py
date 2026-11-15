@@ -52,6 +52,8 @@ class LoopTree:
     def __init__(self, sim):
         if sim.frills:
             raise ValueError("the loop/tree basis does not take the holes of PEC planes (frills)")
+        if getattr(sim, 'slots', None):
+            raise ValueError("the loop/tree basis does not take the openings of PEC planes (slots)")
         r = sim.rwg
         Ne, Nv, Nt = sim.Ne, sim.Nv, len(r.tris)
         self.Ne, self.Nv, self.N, self.Nt, self.G = Ne, Nv, Ne + Nv, Nt, Nt         # G: the ground's node

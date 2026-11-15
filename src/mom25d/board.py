@@ -123,6 +123,43 @@ def plane_holes(data, lay, gnets, outline):
     return u, holes
 
 
+SLOT_PLANE = 0.9       # planes='slots': the ground's copper covers this much of the outline (its pullback allowed)
+SLOT_MIN = 0.01         # mm2: a smaller hole of the ground is filled in
+
+
+def slot_plane(data, lay, gnets, outline):
+    """planes='slots': copper layer `lay` (the ground) as a PEC plane of the stack, infinite, its openings meshed
+    (mom25d.slots). Its ground-net copper must be one piece over SLOT_PLANE of the outline with no other net's copper
+    on the layer, no port or part on it, and no via in an opening. Returns (the plane's polygon, [openings]) in mm;
+    ValueError saying why not."""
+    ps = data.get('copper', {}).get(lay) or []
+    z = next(c['z'] for c in data['stack']['copper'] if c['name'] == lay)
+    why = None
+    if not ps:
+        why = 'no copper on it'
+    elif not gnets:
+        why = 'the board names no ground net'
+    elif any(p['layer'] == lay for p in data.get('ports', []) + data.get('parts', [])):
+        why = 'a port or a part is on it'
+    elif any(p.get('net') not in gnets for p in ps):
+        why = "another net's copper is on it"
+    if why is None:
+        u = unary_union([shape(p['polygon']) for p in ps]).buffer(0)
+        if u.geom_type != 'Polygon' or shape({'type': 'Polygon', 'coordinates': [list(u.exterior.coords)]}).area \
+                < SLOT_PLANE * outline.area:
+            why = f"its copper is not one piece over {SLOT_PLANE:.0%} of the board"
+    if why is not None:
+        raise ValueError(f"planes 'slots': the ground {lay} is no slot plane: {why}")
+    holes = [shape({'type': 'Polygon', 'coordinates': [list(r.coords)]}) for r in u.interiors]
+    holes = [h for h in holes if h.area >= SLOT_MIN]
+    for v in data.get('vias', []):
+        if v['z0'] - 1e-9 <= z <= v['z1'] + 1e-9 and any(h.contains(Point(v['x'], v['y'])) for h in holes):
+            raise ValueError(f"planes 'slots': a via ({v.get('net', '')} at {v['x']:.2f}, {-v['y']:.2f} mm) is in an "
+                             f"opening of {lay}: not modelled (--mom-stack whole meshes the plane)")
+    plane = shape({'type': 'Polygon', 'coordinates': [list(u.exterior.coords)] + [list(h.exterior.coords) for h in holes]})
+    return plane, holes
+
+
 def ground_apertures(data, ground):
     """Where the copper of layer `ground` is missing under the signal copper above it (every net but the ground
     nets): a slot, a defected ground, a patterned or partial ground, which mom25d's infinite ground plane fills in.
@@ -209,8 +246,11 @@ class BoardModel(PlanarModel):
         'holes' (experimental): as 'pec', and a plane between the copper layers whose only holes are those of
         vias through it (plane_holes) is a PEC plane inside the stack, not meshed, each hole a few unknowns
         (mom25d.frill): its axisymmetric field and its first azimuthal order, which a trace over the hole
-        drives."""
-        assert planes in ('pec', 'mesh', 'holes'), f"planes: pec, mesh or holes, not {planes!r}"
+        drives. planes 'slots' (experimental): every copper layer as the whole stack has them (air above and
+        below), but the ground (`ground`, else the board's) a PEC plane, infinite, its openings - slots, apertures,
+        a defected ground - meshed on their own (slot_plane, mom25d.slots): its unknowns their field, so it costs
+        its openings' area, not its own."""
+        assert planes in ('pec', 'mesh', 'holes', 'slots'), f"planes: pec, mesh, holes or slots, not {planes!r}"
         from .multilayer import Layer, LayerStack
         if data.get('format') != FORMAT:
             raise ValueError(f"not a {FORMAT} file (format {data.get('format')!r})")
@@ -224,6 +264,15 @@ class BoardModel(PlanarModel):
         self.outline_area = outline.area * MM * MM
         # ---- the ground: z = 0 of the solver (whole stack: the lowest copper layer, meshed) ----
         self.whole = isinstance(ground, str) and ground.lower() == 'none'     # not None: the board's own ground
+        slot_layer = None
+        if planes == 'slots':                       # the whole stack's layers, the ground among them a slot plane
+            slot_layer = (ground if ground and not self.whole else None) or data.get('ground')
+            if slot_layer is None:
+                solid = [l for l in sorted(cu_z, key=cu_z.get) if sum(p.area for p in copper.get(l, [])) >= 0.5 * outline.area]
+                if not solid:
+                    raise ValueError("planes 'slots': no ground layer named and no solid copper layer")
+                slot_layer = solid[0]
+            self.whole = True
         name = min(cu_z, key=cu_z.get) if self.whole else ground or data.get('ground')
         if name is None:
             solid = [l for l in sorted(cu_z, key=cu_z.get) if sum(p.area for p in copper.get(l, [])) >= 0.5 * outline.area]
@@ -290,6 +339,19 @@ class BoardModel(PlanarModel):
                 self.notes.append(f"{lay}: a PEC plane inside the stack, not meshed; {len(got[1])} via hole(s) as "
                                   f"unknowns (planes 'holes')")
             self.stack.pec = tuple(sorted(self._pec_geom))
+        # planes='slots': the ground as a PEC plane of the stack, its openings meshed (mom25d.slots)
+        self.slots = []
+        if slot_layer is not None:
+            from .slots import Slot
+            k = self.iface.get(slot_layer)
+            if k is None:
+                raise ValueError(f"planes 'slots': the ground {slot_layer} is not on a dielectric interface")
+            plane, holes = slot_plane(data, slot_layer, set(data.get('ground_nets') or []), outline)
+            self._pec_geom[k] = S(plane)
+            self.stack.pec = tuple(sorted(set(self.stack.pec) | {k}))
+            self.slots = [Slot(k, S(h), name=f"{slot_layer} opening {i + 1}") for i, h in enumerate(holes)]
+            self.notes.append(f"{slot_layer}: a PEC plane of the stack, infinite (its edge, the board's, not modelled), "
+                              f"{len(holes)} opening(s) meshed ({sum(h.area for h in holes):.1f} mm2; planes 'slots')")
         self.shapes = {k: [S(unary_union(copper[lay])).buffer(0)] for lay, k in self.iface.items()
                        if copper.get(lay) and k not in self._pec_geom}
         # the signal copper (every net but the ground nets), all layers projected: where the current crowds and
@@ -380,6 +442,7 @@ class BoardModel(PlanarModel):
             return self.iface[p['ref_layer']]
         pt = Point(p['c'][0] * MM, p['c'][1] * MM)
         cover = [j for j, gs in self.shapes.items() if j != k and gs and gs[0].buffer(1e-9).contains(pt)]
+        cover += [j for j, g in self._pec_geom.items() if j != k and g.buffer(1e-9).contains(pt)]   # (a slot plane)
         if not cover:
             raise ValueError(f"{p['name']}: no copper under or over the port on another layer to reference it to "
                              f"(whole stack: name its ref_layer)")

@@ -299,6 +299,8 @@ class PlanarModel:
         kw.setdefault('lumped', list(self.lumped))
         if getattr(self, 'frills', None):
             kw.setdefault('frills', list(self.frills))         # the holes of the PEC planes inside the stack
+        if getattr(self, 'slots', None):
+            kw.setdefault('slots', list(self.slots))           # the openings of a slot plane (planes='slots')
         if getattr(self, 'signal', None) is not None:
             kw.setdefault('signal', self.signal)
         zone = kw.pop('zone', None)

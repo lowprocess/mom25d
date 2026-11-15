@@ -879,7 +879,8 @@ class FastOperator:
             return False
         why = ('no compiled core with the loop/tree kernels (python -m mom25d.core.build)' if self.core is None
                or not hasattr(self.core, 'charge_into') else 'quad cells or line functions' if sim.qT is not None
-               else 'holes of PEC planes (frills)' if sim.frills else None)
+               else 'holes of PEC planes (frills)' if sim.frills
+               else 'openings of PEC planes (slots)' if getattr(sim, 'slots', None) else None)
         if why is None:
             from .sim import available_memory
             N, Nt = sim.Ne + sim.Nv, len(sim.rwg.tris)
@@ -1279,7 +1280,8 @@ class FastOperator:
         """Every unknown's place: the edges' midpoints, the via chains' axes, the PEC planes' holes'."""
         sim = self.sim
         border = [[v.x, v.y] for v, _, _ in sim.chains] + \
-            [list(fr.xy) for fr in getattr(sim, 'frills', ()) for _ in range(fr.count)]
+            [list(fr.xy) for fr in getattr(sim, 'frills', ()) for _ in range(fr.count)] + \
+            [list(m) for sl in getattr(sim, 'slots', ()) for m in sl.rwg.mid]
         return np.vstack([sim.rwg.mid] + ([np.array(border)] if border else []))
 
     def _raw_entry(self, dZx):

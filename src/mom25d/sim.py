@@ -63,6 +63,7 @@ MIXED_MIN_N = 3500       # above this, 'auto' precision is mixed whenever the co
 # from 1.4k to 3.4k unknowns against double on 8 P-cores (RX 7800 XT), but its start-up costs ~1.5 s a run - the
 # break-even of a 15-20 solve sweep (rf_gcpw, 3.4k: 7.0 s against 8.7 s; rf_stubnotch coarsened, 1.5k: 4.5 against 3.4)
 GPU_MIN_N = int(os.environ.get('MOM25D_GPU_MIN_N', 3000))
+SLOT_FACTOR = 3.0                   # an opening's cells (slots.py) in dmax away from the copper, as a plane's
 # the hybrid (the double Z on the host for the refinement's products, several complex64 LUs kept on the GPU) up to
 # this many unknowns; past it the GPU path with the complex64 Z (the refinement matrix-free, one LU kept): the double
 # Z's memory traffic (24 N^2 bytes, 20 GB at 28.7k) outgrew what its products save. RX 7800 XT, i7-13700K: rf_siw
@@ -333,8 +334,9 @@ class Simulation:
                  mesh_only=False, core='auto', quads=False, quad_tol=35.0, zone=None, dmax_out=None,
                  signal_vias='round', stitching_vias='auto', signal=None, via_barrel=True, line_basis=None,
                  line_w_max=2.0e-3, line_step=2.0, coarsen=None, grow=0.5, structured='auto', gap_rings=(1/4, 1/8, 1/16),
-                 frills=()):
+                 frills=(), slots=(), dmax_slot=None):
         # frills (frill.Frill): the holes of the stack's internal PEC planes (stack.pec) that a via runs through
+        # slots (slots.Slot): openings of the stack's PEC planes, each meshed, its field the unknowns (slot planes)
         # mesh_only: stop once the mesh and the unknowns (Ne, Nv) are known (a cost estimate; nothing to solve with)
         # coarsen (experimental): cells grow from dmax at the features (corners, vias, ports) to coarsen x dmax away
         # from them, by grow x the distance (geo.mesh_polygons): straight runs and plane interiors in larger cells.
@@ -358,6 +360,16 @@ class Simulation:
         self.vias, self.lumped = list(vias), list(lumped)
         self.vias += [p.via for p in self.ports if isinstance(p, ViaPort) and p.via not in self.vias]
         self.frills = list(frills)
+        self.slots = sorted(slots, key=lambda s: s.k)       # (one plane's openings together: one Y block each)
+        for sl in self.slots:
+            if not stack.is_pec(sl.k) or sl.k not in stack.pec:
+                raise ValueError(f"an opening is in a PEC plane of the stack (M{sl.k} is not one)")
+            for v in self.vias:
+                if v.k_bot <= sl.k <= v.k_top and sl.poly.buffer(1e-9).contains(shapely.Point(v.x, v.y)):
+                    raise ValueError(f"via {v.name} is in an opening of the plane M{sl.k}: not modelled with slot "
+                                     f"planes (the whole stack meshes the plane)")
+        if self.slots and self.frills:
+            raise ValueError("openings of PEC planes (slots) and via holes in them (frills) together: not modelled yet")
         for fr in self.frills:
             if not (fr.k in stack.pec and fr.via in self.vias and fr.via.k_bot < fr.k < fr.via.k_top):
                 raise ValueError(f"a hole is in a PEC plane inside the stack, around a via through it (M{fr.k}, {fr.via.name})")
@@ -487,8 +499,19 @@ class Simulation:
             self.rwg, self.tri_layer = RWG(np.vstack(nodes), np.vstack(tris)), np.concatenate(tl)
             self.edge_layer = self.tri_layer[self.rwg.tp]
         r = self.rwg
-        # Nv: the chains, then the holes' unknowns (their field shapes' amplitudes: frill.py)
-        self.Ne, self.Nv = r.Ne, len(self.chains) + sum(fr.count for fr in self.frills)
+        # Nv: the chains, then the holes' unknowns (their field shapes' amplitudes: frill.py), then the openings'
+        # (their field in RWG functions: slots.py)
+        for sl in self.slots:
+            # an opening as a meshed plane is: cells of dmax_slot (default SLOT_FACTOR x dmax), refined to 2 dmax
+            # where copper on another layer is near it (3 heights + 2 dmax round it); its rim's rings as a trace's
+            dz = {k: abs(stack.z[k] - stack.z[sl.k]) for k in self.layers}
+            near = [geoms[k].buffer(3 * dz[k] + 2 * dmax) for k in self.layers if dz[k] < refine]
+            fine = shapely.unary_union(near).intersection(sl.poly) if near else None
+            ds = dmax_slot or SLOT_FACTOR * dmax
+            sl.mesh(ds, ncross, grade, fine=fine if fine is not None and not fine.is_empty and ds > 2.4 * dmax
+                    else None, dmax_fine=2 * dmax, w_max=4 * dmax)
+        self.Ne = r.Ne
+        self.Nv = len(self.chains) + sum(fr.count for fr in self.frills) + sum(sl.count for sl in self.slots)
         if mesh_only:
             return
         self.tri_idx = {k: np.nonzero(self.tri_layer == k)[0] for k in self.layers}
@@ -506,7 +529,9 @@ class Simulation:
                     ts = self.fan[(i, k)]
                     self.dF[[fpos[t] for t in ts], n] += div / r.area[ts].sum()
         self.log.note(f"mesh: {Nt} triangles, {r.Ne} edge + {len(self.chains)} via unknowns"
-                      + (f" + {len(self.frills)} holes in PEC planes" if self.frills else '') + "  ("
+                      + (f" + {len(self.frills)} holes in PEC planes" if self.frills else '')
+                      + (f" + {sum(sl.count for sl in self.slots)} in {len(self.slots)} opening(s) of PEC planes"
+                         if self.slots else '') + "  ("
                       + ", ".join(f"M{k}: {len(self.tri_idx[k])} tri ({self.mesher_used[k]})"
                                   for k in self.layers) + ")")
 
@@ -514,7 +539,9 @@ class Simulation:
         self.tri_size = np.linalg.norm(V - np.roll(V, 1, axis=1), axis=2).max(1)
         self.P3, self.W3 = quad_pts(r, _BAR3), r.area[:, None] * _W3[None, :]
         self.P6, self.W6 = quad_pts(r, _BAR6), r.area[:, None] * _W6[None, :]
-        self.rho_max = 1.05 * np.hypot(*(r.nodes.max(0) - r.nodes.min(0))) + 1e-4
+        ext = np.vstack([r.nodes] + [sl.rwg.nodes for sl in self.slots])
+        self.rho_max = 1.05 * np.hypot(*(ext.max(0) - ext.min(0))) + 1e-4
+        self._slot_cache = {}
         self._gram, self._xcache, self.qT = None, {}, None
         self._edge_sets()
         # port gaps, sample cuts and lumped elements keep their edges as unknowns (line functions, quad cells)
@@ -791,6 +818,8 @@ class Simulation:
         B, C = np.zeros((self.Ne, self.Nv), complex), np.zeros((self.Nv, self.Nv), complex)
         if self.frills:
             self._frill_blocks(f, B, C)
+        if self.slots:
+            self._slot_blocks(f, B, C)
         vk = ViaKernels(f, self.st, [(kb, kt) for _, kb, kt in self.chains], self.layers, self.rho_max)
         geo = self._via_geometry()
         # fan-distributed end charges (G_q between triangles, same machinery as strips)
@@ -891,6 +920,23 @@ class Simulation:
             C[:Nc, col] = C[col, :Nc] = c
             for g, other in enumerate(fk.unknowns[:m + 1]):
                 C[Nc + g, col] = C[col, Nc + g] = -fk.Y(other, (fr, mode))
+
+    def _slot_blocks(self, f, B, C):
+        """The columns and rows of the openings' unknowns (slots.py: c and -Y), after the chains' and the holes'."""
+        from .slots import SlotKernels, coupling, self_block
+        w = 2 * np.pi * f
+        with self.log.timer('slot kernels', f"{len(self.slots)} opening(s)"):
+            kern = SlotKernels(f, self.st, self.slots, self.layers, self.rho_max)
+            col0 = len(self.chains) + sum(fr.count for fr in self.frills)
+            coupling(self, self.slots, kern, B, C, col0)
+            for p in sorted({sl.k for sl in self.slots}):
+                on = [sl for sl in self.slots if sl.k == p]
+                i0 = col0 + sum(sl.count for sl in self.slots if sl.k < p)
+                n = sum(sl.count for sl in on)
+                C[i0:i0 + n, i0:i0 + n] = -self_block(on, kern.table[p], w, self.near_fac, self._slot_cache)
+            # the chain rows hold the chains' coupling (coupling's), the columns the same: symmetric
+            Nc = len(self.chains)
+            C[col0:, :Nc] = C[:Nc, col0:].T
 
     def _block(self, ia, ib, a, b, gt):
         r, st = self.rwg, self.st

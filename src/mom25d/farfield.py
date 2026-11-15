@@ -15,6 +15,9 @@ Vertical currents (the via chains: one unknown each, a +z current through its la
 network too: a unit current through layer j gives E_t = grad_t S on interface o, S~ = sum_j [V(z_j | z_o) -
 V(z_{j-1} | z_o)] / kz_j^2 (mom25d.via), so E_u = -j k_rho S~ e^{j k.rho_via} and nothing in E_v.
 
+The openings of a PEC plane in the stack (slots.py) radiate their field E~ on the plane, carried to the top (or
+bottom) interface by the network driven there (LayerStack.transfer): E_u = T^e E~_u, E_v = T^h E~_v.
+
 Over the PEC ground nothing radiates below it (theta > 90 deg: zero). A whole stack (LayerStack bottom='open':
 no infinite ground, the planes meshed) radiates below as well: mirrored in z, the lower half-space's far field
 comes from the tangential E on interface 0, k_bot the half-space's wavenumber (cos(theta) < 0):
@@ -75,6 +78,20 @@ def _tangential(sim, I, w, o, kr, cphi, sphi):
             xy, rows = np.array([(x, y) for x, y, _ in vs]), [c for _, _, c in vs]
             Eu = Eu + _via_Eu(st, kr, w, o, range(a + 1, b + 1))[:, None] * (
                 np.exp(1j * (np.outer(kx, xy[:, 0]) + np.outer(ky, xy[:, 1]))) @ Iv[rows])
+    slots = getattr(sim, 'slots', None) or []
+    if slots and ne is not None:                                        # the openings of PEC planes: their field
+        from .slots import spectrum                                     # on the plane, carried to interface o
+        Iall = np.asarray(I).reshape(np.shape(I)[0], -1)
+        col = ne + len(chains) + sum(fr.count for fr in getattr(sim, 'frills', ()))
+        for p in sorted({sl.k for sl in slots}):
+            on = [sl for sl in slots if sl.k == p]
+            n = sum(sl.count for sl in on)
+            if st.reaches(p, o) or o == p:
+                ex, ey = spectrum(on, Iall[col:col + n], kx, ky)
+                c_, s_ = cphi[:, None], sphi[:, None]
+                Eu = Eu + st.transfer(kr, w, p, o, 'e')[:, None] * (ex * c_ + ey * s_)
+                Ev = Ev + st.transfer(kr, w, p, o, 'h')[:, None] * (-ex * s_ + ey * c_)
+            col += n
     return (Eu[:, 0], Ev[:, 0]) if one else (Eu, Ev)
 
 

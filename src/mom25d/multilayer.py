@@ -97,7 +97,8 @@ class LayerStack:
     bottom='open': a half-space of permittivity bottom_er below layer 1, metal allowed on interface 0 too
     pec          : interfaces (1..N-1) that are PEC planes inside the stack: no metal on them, and what is above
                    one is decoupled from what is below it (two stacks in one: each sees the plane as its ground
-                   or its cover). A via through such a plane couples them (frill.py).
+                   or its cover). A via through such a plane couples them (frill.py), and so do its openings
+                   (slots.py); 0 or N too where the stack is open there (a ground with air beyond it).
     """
     def __init__(self, layers, top='open', top_er=1.0, bottom='pec', bottom_er=1.0, pec=()):
         assert top in ('open', 'pec') and bottom in ('open', 'pec')
@@ -105,7 +106,10 @@ class LayerStack:
         self.bottom, self.bottom_er = bottom, bottom_er
         self.N = len(self.layers)
         self.pec = tuple(sorted({int(k) for k in pec}))
-        assert all(0 < k < self.N for k in self.pec), "an internal PEC plane is on an interface between two layers"
+        # (a plane on the stack's bottom or top interface too, where a half-space is beyond it: the openings of a
+        # ground with air below, slots.py)
+        assert all(0 < k < self.N or (k == 0 and bottom == 'open') or (k == self.N and top == 'open')
+                   for k in self.pec), "a PEC plane of the stack is on an interface between two media"
         self.z = np.concatenate([[0.0], np.cumsum([l.h for l in self.layers])])
         for i, l in enumerate(self.layers):
             if l.name is None:
