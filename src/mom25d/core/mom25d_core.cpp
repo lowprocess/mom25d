@@ -10,7 +10,8 @@
 //   offplane_pairs: analytic 1/sqrt(rho^2+d^2) moments for pair lists (validation / reuse)
 //   near_pairs    : the near triangle pairs (a grid search; the KD-tree + np.unique of fast.py, same order)
 //   hankel_real   : sum_k J0(rho_i kr_k) W[s, k] over the real part of a Sommerfeld contour, without the
-//                   (n_rho x n_k) Bessel matrix (the Green tables and the via kernels)
+//                   (n_rho x n_k) Bessel matrix (the Green tables and the via kernels); bessel_real_sum the
+//                   same of J0, J1 or J2 (the holes' kernels, frill.py)
 //   radial_table_sum: sum_q D(|P[t, q] - V[v]|) W[t, q], D a radial table (via.Table1D): each via's smooth kernel
 //                   on the triangles' quadrature points (sim._via_blocks; a Python loop over the vias had been
 //                   1.5 s of a 8 s solve with 888 of them)
@@ -1323,6 +1324,55 @@ py::array_t<cd> hankel_real(arr<double> rho, arr<double> kr, arr<cd> W) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// out[s, i] = sum_k J_n(rho_i kr_k) W[s, k] for real kr, n = 0, 1 or 2 (J2 = 2 J1 / x - J0, its series near 0),
+// rho-parallel: the holes' kernels (frill.py) without their (n_rho x n_k) Bessel matrices
+// ---------------------------------------------------------------------------------------------
+static inline double bessel_j1(double x)
+{
+#ifdef _WIN32
+    return _j1(x);
+#else
+    return ::j1(x);
+#endif
+}
+
+static inline double bessel_jn(int n, double x)
+{
+    if (n == 0) return bessel_j0(x);
+    if (n == 1) return bessel_j1(x);
+    if (x > 0.05) return 2.0 * bessel_j1(x) / x - bessel_j0(x);   // (it loses its digits at small x)
+    const double x2 = x * x;
+    return x2 / 8.0 * (1.0 - x2 / 12.0 * (1.0 - x2 / 32.0));
+}
+
+py::array_t<cd> bessel_real_sum(int n, arr<double> rho, arr<double> kr, arr<cd> W) {
+    if (n < 0 || n > 2) throw std::invalid_argument("bessel_real_sum: order 0, 1 or 2");
+    const int nr = (int)rho.shape(0), nk = (int)kr.shape(0), ns = (int)W.shape(0);
+    if ((int)W.shape(1) != nk) throw std::invalid_argument("bessel_real_sum: W must be (nspec, len(kr))");
+    py::array_t<cd> out({ns, nr});
+    cd *o = out.mutable_data();
+    const double *r = rho.data(), *k = kr.data();
+    const cd *w = W.data();
+    {
+        py::gil_scoped_release nogil;
+#pragma omp parallel
+        {
+            std::vector<cd> acc(ns);
+#pragma omp for schedule(static)
+            for (int i = 0; i < nr; ++i) {
+                std::fill(acc.begin(), acc.end(), cd(0));
+                for (int m = 0; m < nk; ++m) {
+                    double j = bessel_jn(n, r[i] * k[m]);
+                    for (int s = 0; s < ns; ++s) acc[s] += j * w[(size_t)s * nk + m];
+                }
+                for (int s = 0; s < ns; ++s) o[(size_t)s * nr + i] = acc[s];
+            }
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Z <- diag(d) Z diag(d) in place, and its complex64 copy (one pass over the matrix, row-parallel)
 // ---------------------------------------------------------------------------------------------
 py::array_t<cf> scale_c64(py::array_t<cd, py::array::c_style> Z, arr<double> d) {
@@ -1455,6 +1505,7 @@ PYBIND11_MODULE(_core, m) {
     m.def("num_threads", &num_threads);
     m.def("near_pairs", &near_pairs, "near triangle pairs (sorted by p, q)");
     m.def("hankel_real", &hankel_real, "sum_k J0(rho kr_k) W[s, k] for real kr");
+    m.def("bessel_real_sum", &bessel_real_sum, "sum_k J_n(rho kr_k) W[s, k] for real kr, n = 0, 1, 2");
     m.def("radial_table_sum", &radial_table_sum, "sum_q D(|P[t, q] - V[v]|) W[t, q] of a radial table D");
     m.def("scale_c64", &scale_c64, "Z <- D Z D in place, and its complex64 copy");
     m.def("fan_q", &fan_q, "G_q moments between every triangle and the fan triangles");

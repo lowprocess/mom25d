@@ -64,6 +64,20 @@ def j0_matrix(rho, kr):
     return J
 
 
+def bessel_sum(n, rho, kr, W):
+    """sum_k J_n(rho_i kr_k) W[s, k] (n = 0, 1, 2): (nspec, len(rho)), as j0_sum: the real part of the contour in
+    the compiled core without the Bessel matrix, the lifted part NumPy's. None where the core cannot."""
+    from .fast import _core
+    if _core is None or not hasattr(_core, 'bessel_real_sum'):
+        return None
+    rho, W = np.atleast_1d(np.asarray(rho, float)), np.atleast_2d(np.asarray(W, complex))
+    real = np.abs(kr.imag) < 1e-300
+    out = _core.bessel_real_sum(int(n), rho, np.ascontiguousarray(kr.real[real]), np.ascontiguousarray(W[:, real]))
+    if (~real).any():
+        out = out + (jv(n, rho[:, None] * kr[None, ~real]) @ W[:, ~real].T).T
+    return out
+
+
 def j0_sum(rho, kr, W):
     """sum_k J0(rho_i kr_k) W[s, k]: (nspec, len(rho)). The compiled core sums the real part of the contour
     without the Bessel matrix (OpenMP); the lifted part, complex kr, is NumPy's (j0_matrix)."""

@@ -854,6 +854,7 @@ class Simulation:
         spans = {}
         for n, (v, kb, kt) in enumerate(self.chains):
             spans.setdefault((kb, kt), []).append(n)
+        rems = {}
         for m, (fr, mode) in enumerate(fk.unknowns):
             s, col = fk.shape(fr, mode), Nc + m
             dip = mode[0] if isinstance(mode, tuple) else None    # 'c' or 's'
@@ -885,7 +886,10 @@ class Simulation:
                 dx = np.array([self.chains[n][0].x - fr.via.x for n in ns])
                 dy = np.array([self.chains[n][0].y - fr.via.y for n in ns])
                 d = np.maximum(np.hypot(dx, dy), [self.chains[n][0].a for n in ns])
-                rem = fk.rem(s, span, d)
+                key = (id(fr), s, span)                       # (a dipole's cos and sin share it)
+                if key not in rems:
+                    rems[key] = fk.rem(s, span, d)
+                rem = rems[key]
                 if dip:                                       # (the via on the hole's own axis: none)
                     off = np.hypot(dx, dy) > 1e-9
                     rem = np.where(off, rem * (dx if dip == 'c' else dy) / np.where(off, np.hypot(dx, dy), 1.0), 0.0)
