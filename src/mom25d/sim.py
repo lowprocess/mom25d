@@ -487,8 +487,13 @@ class Simulation:
                         if not zf.is_empty and zf.area < 0.99 * geoms[k].area:      # else: all of it is signal
                             fine = zf if fine is None else shapely.unary_union([fine, zf])
                             dm_mesh, dm_fine = dmax_out, min(dm, dm_fine or dm)
+                    # a meshed plane is coarsened outside its fine regions only (under the copper of the layers near
+                    # it, where the return current runs): with Triangle those never were in effect (its two passes
+                    # left them at their size), and coarsened they cost S 0.03-0.08 at 6-10 GHz (rf_msvia,
+                    # sma_launch, demo_transition against openEMS; 2026-11-15)
                     nd, tr, vids = mesh_polygons(geoms[k], dm_mesh, wr, ncross, grade, lines=seg, vias=vpts,
                                                  fine=fine, dmax_fine=dm_fine, coarsen=coarsen, grow=grow,
+                                                 coarsen_fine=not (dm > 1.2 * dmax),
                                                  structured=struct, gap_rings=gap_rings, **zkw)
                 for (i, v), vid in zip(vias_here, vids):
                     if not (vid >= 0):

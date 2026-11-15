@@ -7,7 +7,7 @@ from kicad2ems.solvers import registry
 from kicad2ems.parity import check
 from k2e_fixtures import prepared_job
 
-pytest.importorskip('triangle')
+pytest.importorskip('mom25d._core')   # (the mesher)
 
 CASES = dict(transition=('demo', ['--nets', 'RF,GND', '--ground', 'B.Cu']),
              lowpass=('lowpass', []),

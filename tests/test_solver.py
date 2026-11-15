@@ -222,7 +222,7 @@ def test_a_trace_over_a_plane_s_hole():
     """What the axisymmetric hole lacked: a trace that crosses the hole's rim on its way to the via's pad (a
     microstrip above the plane, a stripline below it). With the plane meshed and with the plane as PEC and the
     hole's unknowns, S agrees to the meshes' own difference with the first azimuthal order (frill.dipoles), and
-    is three times as far without it."""
+    is three times as far without it (0.006 and 0.05)."""
     pytest.importorskip('mom25d._core')
     from shapely.geometry import box, Point
     from mom25d.frill import Frill
@@ -237,8 +237,9 @@ def test_a_trace_over_a_plane_s_hole():
     fs = (5e9, 10e9)
     sig = Via(0, 0, 1, 3, a, name='sig')
     plane = box(-6 * mm, -3 * mm, 6 * mm, 3 * mm).difference(Point(0, 0).buffer(b, 32))
+    # the meshed plane at 0.3 mm: a coarser one is itself 0.03 off (0.6 mm, CDT's mesh; 2026-11-15)
     meshed = Simulation(LayerStack(layers), {1: bot(), 2: [plane], 3: top()}, ports(), vias=[sig] + gv(),
-                        dmax_layer={2: 0.6 * mm}, **kw)
+                        dmax_layer={2: 0.3 * mm}, **kw)
     ref = np.array([meshed.sparams(f) for f in fs])
     err = {}
     for dip in (0, 2):

@@ -22,9 +22,9 @@ its ports, the mesh, antenna mode, the GPU paths and its speed against openEMS.
 ## Install
 
 ```bash
-pip install .                       # numpy, scipy, shapely, triangle, emsdev (the GPU and memory probes)
+pip install .                       # numpy, scipy, shapely, emsdev (the GPU and memory probes)
 pip install '.[core]'               # pybind11, then build the compiled core (g++ with OpenMP; Windows: MSVC or MinGW):
-python -m mom25d.core.build         # mom25d/_core*.so (.pyd on Windows), about five times faster
+python -m mom25d.core.build         # mom25d/_core*.so (.pyd on Windows): the mesher, and kernels ~5x faster
 pip install '.[gpu-vulkan]'         # the GPU LU through Vulkan: slangpy (any GPU)
 pip install '.[gpu-cuda12]'         # optional: the CuPy wheel for your stack (gpu-cuda12, gpu-cuda13, gpu-rocm7)
 ```
@@ -32,14 +32,8 @@ pip install '.[gpu-cuda12]'         # optional: the CuPy wheel for your stack (g
 On Windows the core builds with Visual Studio 2022 or its Build Tools, or MinGW-w64's g++ (see
 [emsdev](https://github.com/lowprocess/emsdev)); CuPy has no ROCm wheel there.
 
-PyPI has no triangle 20230923 or later for every Python (none for 3.14). Where `pip install .` cannot find one,
-build it from its repository first (kicad2ems's installer does this). Fused multiply-adds break triangle's exact
-arithmetic and the mesher then never finishes, hence `-ffp-contract=off`:
-
-```bash
-CFLAGS="-O2 -ffp-contract=off" pip install --no-cache-dir \
-    "triangle @ git+https://github.com/drufat/triangle.git@595b43eb6682992a0b1012b9671bf860c0e6ae56"
-```
+The compiled core is needed: the mesher's triangulation is in it (CDT, vendored in `src/mom25d/core/CDT`). The
+kernels keep NumPy fallbacks (`MOM25D_NO_CORE`); the mesher has none.
 
 `MOM25D_GPU=off` turns the GPU off; `MOM25D_GPU=vulkan|cupy` picks a backend (`auto` tries Vulkan first, and CuPy
 first only where it runs on CUDA). Consumer AMD cards outside ROCm's support list may need
@@ -95,7 +89,7 @@ f, S, info = solve_band(sim, 1e9, 6e9, points=101, zref=m.port_z0)
 | `base.py` | RWG basis functions, the 1/R moment integrals, the port wave fits |
 | `via.py` | via kernels |
 | `frill.py` | a via through a hole in a PEC plane inside the stack: the hole's field as a few unknowns, axisymmetric and of the first azimuthal order (`planes='holes'`) |
-| `geo.py` | the mesher (Triangle, with offset rings along the copper edges) |
+| `geo.py`, `cdtmesh.py` | the mesher (offset rings along the copper edges; CDT in the core triangulates) |
 | `line.py`, `quads.py` | line basis functions on straight runs; quad cells |
 | `fast.py` | the matrix fill and the solvers |
 | `looptree.py` | the loop/tree basis the direct solver takes at low frequency (pcbqs's) |
@@ -124,7 +118,6 @@ feed line.
 
 GPL-3.0-or-later.
 
-The mesher is the `triangle` package (LGPL-3.0, by Dzhelil Rufat), which compiles in Jonathan Shewchuk's
-Triangle. It is installed as a separate package; none of its code is in this repository. Triangle keeps its own
-terms, which are not the GPL's: it "may not be sold or included in commercial products without a license" from
-its author ([Triangle's page](https://www.cs.cmu.edu/~quake/triangle.html)).
+The mesher's triangulation is CDT 2.0.1 by Artem Amirkhanov, vendored unmodified in `src/mom25d/core/CDT` under its
+MPL-2.0 (its `predicates.h` BSD-3-Clause, `portable_nth_element.hpp` Apache-2.0 with LLVM exceptions;
+`src/mom25d/core/CDT/README.md`), all compatible with the GPL.

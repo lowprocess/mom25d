@@ -47,18 +47,19 @@ def _far_field_seeds(run):
 
 def mom25d_status():
     """(usable, one-line description) of mom25d for --check and the solver checks before a run: where it
-    comes from, its version and whether its compiled core is built (the NumPy fallback is ~5x slower)."""
+    comes from, its version and whether its compiled core is built (it meshes: not usable without it)."""
     try:
         import mom25d
-        import triangle                                             # noqa: F401  (mom25d's default mesher)
     except Exception as e:                                          # a missing or broken dependency
         return False, f"{type(e).__name__}: {e}"
     try:
-        from mom25d import _core                                    # noqa: F401
-        core = 'compiled core'
+        from mom25d import _core
     except ImportError:
-        core = "no compiled core (NumPy, ~5x slower: python -m mom25d.core.build)"
-    return True, f"{mom25d.__version__} ({os.path.dirname(mom25d.__file__)}), {core}"
+        return False, ("no compiled core: mom25d meshes with it (python -m mom25d.core.build; a C++17 compiler and "
+                       "pybind11)")
+    if not hasattr(_core, 'cdt_triangulate'):
+        return False, "its compiled core is older than its mesher: build it again (python -m mom25d.core.build)"
+    return True, f"{mom25d.__version__} ({os.path.dirname(mom25d.__file__)}), compiled core"
 
 
 def run_finish(run):

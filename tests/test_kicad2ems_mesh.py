@@ -6,7 +6,7 @@ import pytest
 from kicad2ems import meshes
 from k2e_fixtures import ROOT
 
-pytest.importorskip('triangle')
+pytest.importorskip('mom25d._core')   # (the mesher)
 
 
 def test_preview_writes_the_triangles(run_cli, tmp_path):

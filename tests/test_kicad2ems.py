@@ -27,7 +27,7 @@ def test_preview_solves_no_full_wave_solver(tmp_path, run_cli):
 def test_mom_run(tmp_path, run_cli, no_csxcad):
     """--solvers mom25d end to end with no openEMS (MoM reads the board), and the line model the config's
     fast = "auto" picks compared against it."""
-    pytest.importorskip('triangle')
+    pytest.importorskip('mom25d._core')   # (the mesher)
     out = tmp_path / 'out'
     code, so, se = run_cli(FILTER, '--solvers', 'mom25d', '--mom-dmax', '1.6', '--mom-solves', '8', '--points', '41',
                            '--out', str(out))
@@ -72,7 +72,7 @@ def test_current_dumps(boards, run_cli, tmp_path, monkeypatch):
     """--mom-dump: mom25d's surface currents at the frequencies asked, a |J| map each, with --dump-animate one
     period of Re(J e^j phase), and the dumps where the GUI's Fields tab finds them. The sweep solves at the dump
     frequencies among its samples and the dumps reuse those currents: no solve of their own."""
-    pytest.importorskip('triangle')
+    pytest.importorskip('mom25d._core')   # (the mesher)
     from kicad2ems.fields import frames as F
     from mom25d.sim import Simulation
     save = F.save_fd_outputs
@@ -103,7 +103,7 @@ def test_current_dumps(boards, run_cli, tmp_path, monkeypatch):
 def test_antenna_mode(run_cli, tmp_path):
     """mom25d in antenna mode on the patch example: the resonance, efficiency below 1, and openEMS's antenna
     outputs (JSON, plots, the sphere the GUI reads)."""
-    pytest.importorskip('triangle')
+    pytest.importorskip('mom25d._core')   # (the mesher)
     import subprocess, sys
     ex = os.path.join(os.path.dirname(FILTER), 'make_antennas.py')
     subprocess.check_call([sys.executable, ex, 'patch', str(tmp_path / 'patch')], stdout=subprocess.DEVNULL)
@@ -127,7 +127,7 @@ def test_phased_array(run_cli, tmp_path):
     the GUI's Reset (the grid in its short form, 1x2), the per-port
     fields kept, and recombining them (phased.combine) gives the run's result back and broadside for the drive
     in phase."""
-    pytest.importorskip('triangle')
+    pytest.importorskip('mom25d._core')   # (the mesher)
     import subprocess, sys
     from kicad2ems import phased
     ex = os.path.join(os.path.dirname(FILTER), 'make_antennas.py')
@@ -156,7 +156,7 @@ def test_phased_array(run_cli, tmp_path):
 def test_stop_ends_mom25d_after_its_current_solve(run_cli, tmp_path, monkeypatch):
     """The GUI's Stop (a STOP file, kicad2ems.stop): mom25d ends after the frequency it is solving, with no
     result; the line model (the --fast reference) still gives its. ABORT alone had left mom25d running."""
-    pytest.importorskip('triangle')
+    pytest.importorskip('mom25d._core')   # (the mesher)
     from kicad2ems import pipeline
     from kicad2ems.runs import stop_runs
     out = tmp_path / 'out'
@@ -242,7 +242,7 @@ def test_mixed_plans_a_pair_s_stretch_as_one_cut():
     """mixed.plan_pair_cuts: two traces of one width side by side are cut together where both run straight, less
     the feed each face's mixed-mode port needs; not where a third trace runs beside them, not two of different
     widths, and not two far enough apart to be lone lines (each then a cut of its own)."""
-    pytest.importorskip('triangle')
+    pytest.importorskip('mom25d._core')   # (the mesher)
     from mom25d.board import BoardModel
     from mom25d.kicad2ems import mixed
     quiet = lambda *a, **k: None
@@ -272,7 +272,7 @@ def test_mixed_cuts_a_coupled_pair_as_two_modal_lines(monkeypatch):
     mixed-mode wave port, the stretch two lines: its differential and its common mode) and agrees with mom25d on
     every term (0.007 in |S|), the near- and far-end coupling among them, with under two thirds of the unknowns
     (a 30 mm pair: the faces' feeds are half of it)."""
-    pytest.importorskip('triangle')
+    pytest.importorskip('mom25d._core')   # (the mesher)
     pytest.importorskip('mom25d._core')
     from types import SimpleNamespace as NS
     import kicad2ems.api.solver as ks
@@ -303,7 +303,7 @@ def test_whole_stack_ports_below_the_ground(run_cli, tmp_path):
     """--mom-stack whole on rf_msvia (F.Cu microstrip through a via to B.Cu, two inner planes): the B.Cu port that
     no ground plane allows, lumped ports to the nearest plane, and S21 as gfdtd gives it (-0.38 dB at 5 GHz);
     with the board's own ground (the default) that port cannot be."""
-    pytest.importorskip('triangle')
+    pytest.importorskip('mom25d._core')   # (the mesher)
     import subprocess, sys
     from mom25d.board import BoardModel
     ex = os.path.join(os.path.dirname(FILTER), 'make_rf_examples.py')
@@ -331,7 +331,7 @@ def test_whole_stack_antenna_radiates_behind_its_ground(run_cli, tmp_path):
     """The patch over its own 80 mm ground meshed (--mom-stack whole): a back lobe (gfdtd, the finite board: -13
     dBi), which the infinite ground cannot have, and gain near gfdtd's 3.1 dBi (the infinite ground's 1.9). No
     ground named is the board's own ground, not the whole stack (ground=None once read as 'none')."""
-    pytest.importorskip('triangle')
+    pytest.importorskip('mom25d._core')   # (the mesher)
     import subprocess, sys
     ex = os.path.join(os.path.dirname(FILTER), 'make_antennas.py')
     subprocess.check_call([sys.executable, ex, 'patch', str(tmp_path / 'patch')], stdout=subprocess.DEVNULL)
@@ -409,7 +409,7 @@ def test_part_ports_are_delta_gaps_closing_to_the_parts(tmp_path, run_cli, no_cs
     """kicad2ems R-E5: a part port is a delta gap across the part's strip (the strip and its pads kept: a shunt
     part's ground pad with its vias is not a lone stitching pad), and closed by the parts' values it is the board
     with its parts."""
-    pytest.importorskip('triangle')
+    pytest.importorskip('mom25d._core')   # (the mesher)
     from kicad2ems.config import build_settings
     from kicad2ems.pipeline import board_from_settings
     from kicad2ems.touchstone import read_touchstone

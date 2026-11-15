@@ -13,7 +13,6 @@ import numpy as np
 import shapely
 from shapely.geometry import (Polygon, LineString, Point, box)
 from shapely.ops import unary_union
-import triangle as tr
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
@@ -291,9 +290,10 @@ def gap_zones(geom, gmax, step, tol=1e-9):
 # ---- Mesher -----------------------------------------------------------------
 def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), amax=None,
                   max_offset_frac=0.45, tol=1e-9, fine=None, dmax_fine=None, edge_zone=None, split_chains=False,
-                  coarsen=None, grow=0.5, structured=False, struct_w_max=20e-3, gap_rings=None):
+                  coarsen=None, grow=0.5, structured=False, struct_w_max=20e-3, gap_rings=None, area_scale=1.0,
+                  coarsen_fine=True):
     """
-    geom   : shapely (Multi)Polygon of one metal layer
+    geom   : shapely (Multi)Polygon of one metal layer (triangulated by CDT in the compiled core: cdtmesh.py)
     dmax   : max edge length along conductors / in open regions
     w_ref  : reference strip width for the edge grading (narrowest trace on the layer)
     lines  : [(p0, p1), ...] constraint segments (port gap and cut lines), clipped to geom
@@ -304,6 +304,8 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
              8.4k, S within 0.006 of the full rings (2.4x faster a solve); Simulation(zone=) passes it
     split_chains : each outline at the spacing of the region it runs through (zone=; the default spaces a whole
              chain by where its centroid falls, which a closed outline's centroid can get wrong)
+    coarsen_fine : with coarsen, the fine regions coarsened too (True); False: they keep dmax_fine (sim.py: a
+             meshed plane's, under the copper of the layers near it)
     coarsen : (experimental) cells grow away from the features (corners and bends of the copper outline, vias, port
              and cut lines; _features) up to coarsen x dmax: dmax + grow x the distance to the nearest one, along the
              outline and the edge rings (their spacing across the edge is kept) and over the area inside them
@@ -378,7 +380,7 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
     chains = []
 
     def spaced(q, d_):
-        if hfield is None:
+        if hfield is None or (not coarsen_fine and fine_parts and d_ == dmax_fine):
             return np.asarray(shapely.segmentize(q, d_).coords)[:, :2]
         return _spaced(np.asarray(q.coords)[:, :2], lambda P: hfield(P, d_), d_)
     for pc in pieces:
@@ -411,47 +413,11 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
         segs |= {(min(a, b), max(a, b)) for a, b in zip(ids[:-1], ids[1:]) if a != b}
     via_ids = list(inv[off:off + len(vpts)])
     segs = np.array(sorted(segs))
-    # Triangle's switch parser cannot read exponents ('e' is a switch), so work in units of dmax
+    # in units of dmax about the vertices' middle (the triangulation's numbers near 1)
     org = verts.mean(0)
-    A = dict(vertices=(verts - org) / dmax, segments=segs)
     amax = (amax or 0.5 * dmax ** 2) / dmax ** 2
-    if hfield is not None:
-        # coarse first (the largest cells the field allows), then each triangle refined to the field's area at its
-        # centroid (fine regions: their own dmax). No quality switch (q), as below: it would split the thin
-        # strips between the edge rings, now long, into fans of small triangles (rf_gcpw: twice the unknowns)
-        afine = 0.5 * (dmax_fine / dmax) ** 2 if fine_parts else None
-        if fine_parts:
-            rest = geom.difference(unary_union(fine_parts)).buffer(-2 * tol)
-            reg = [(q.representative_point(), afine) for q in fine_parts]
-            reg += [(q.representative_point(), amax * coarsen ** 2) for q in getattr(rest, 'geoms', [rest])
-                    if q.geom_type == 'Polygon' and not q.is_empty]
-            A['regions'] = np.array([[(pt.x - org[0]) / dmax, (pt.y - org[1]) / dmax, i + 1, a]
-                                     for i, (pt, a) in enumerate(reg)])
-            T = tr.triangulate(A, "pQAa")
-        else:
-            T = tr.triangulate(A, f"pQa{amax * coarsen ** 2:.8f}")
-        for _ in range(2):
-            c = T['vertices'][T['triangles']].mean(1) * dmax + org
-            infine = np.zeros(len(c), bool)
-            if fine_parts:
-                infine = np.isin(T['triangle_attributes'][:, 0], np.arange(1, len(fine_parts) + 1))
-            h = np.where(infine, hfield(c, dmax_fine or dmax), hfield(c, dmax))
-            amax_t = 0.5 * (h / dmax) ** 2
-            if runs_u is not None:                     # the runs' grid cells as they are (no limit: -1)
-                amax_t[shapely.contains_xy(runs_u, c[:, 0], c[:, 1])] = -1.0
-            T = tr.triangulate(dict(T, triangle_max_area=amax_t), "rpQa" + ("A" if fine_parts else ""))
-    elif fine_parts:
-        # regional area limits: fine inside the projection of nearby metal, coarse elsewhere
-        afine = 0.5 * (dmax_fine / dmax) ** 2
-        rest = geom.difference(unary_union(fine_parts)).buffer(-2 * tol)
-        reg = [(q.representative_point(), afine) for q in fine_parts]
-        reg += [(q.representative_point(), amax) for q in getattr(rest, 'geoms', [rest])
-                if q.geom_type == 'Polygon' and not q.is_empty]
-        A['regions'] = np.array([[(pt.x - org[0]) / dmax, (pt.y - org[1]) / dmax, i + 1, a]
-                                 for i, (pt, a) in enumerate(reg)])
-        T = tr.triangulate(A, "pQa")
-    else:
-        T = tr.triangulate(A, f"pQa{amax:.8f}")
+    T = _cdt((verts - org) / dmax, segs, geom, tol, dmax, org, amax, hfield, fine_parts, fine_u, dmax_fine, runs_u,
+             area_scale, coarsen_fine)
     nodes, tris = T['vertices'] * dmax + org, T['triangles']
     cent = nodes[tris].mean(1)
     tris = tris[shapely.contains_xy(geom.buffer(tol), cent[:, 0], cent[:, 1])]
@@ -464,4 +430,47 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
     V = nodes[tris]
     ar = (V[:, 1, 0] - V[:, 0, 0]) * (V[:, 2, 1] - V[:, 0, 1]) - (V[:, 1, 1] - V[:, 0, 1]) * (V[:, 2, 0] - V[:, 0, 0])
     tris[ar < 0] = tris[ar < 0][:, [0, 2, 1]]
-    return nodes, tris[np.abs(ar) > 1e-30], via_ids
+    return nodes, tris[np.abs(ar) > 1e-10 * dmax ** 2], via_ids          # (a degenerate triangle: none)
+
+
+def _core():
+    """mom25d's compiled core (it triangulates: cdt_triangulate), built or not set aside (MOM25D_NO_CORE sets the
+    kernels aside, not the mesher)."""
+    from . import fast
+    core = fast._built
+    if core is None or not hasattr(core, 'cdt_triangulate'):
+        raise RuntimeError("mom25d meshes with its compiled core, which is not built (or is older than its mesher): "
+                           "python -m mom25d.core.build (needs a C++17 compiler and pybind11)")
+    return core
+
+
+def _cdt(V, segs, geom, tol, dmax, org, amax, hfield, fine_parts, fine_u, dmax_fine, runs_u, area_scale=1.0,
+         coarsen_fine=True):
+    """mesh_polygons' triangulation (cdtmesh: CDT and the points inside), the area limits: amax, afine in the fine
+    regions, with coarsen the field's 0.5 h^2 (none in the structured runs' cells; the fine regions kept at afine
+    unless coarsen_fine); all of them x area_scale."""
+    from .cdtmesh import mesh as cdt_mesh
+    g_in = geom.buffer(tol)
+    to_m = lambda c: np.asarray(c) * dmax + org
+    afine = 0.5 * (dmax_fine / dmax) ** 2 if fine_parts else None
+
+    def inside(c):
+        P = to_m(c)
+        return shapely.contains_xy(g_in, P[:, 0], P[:, 1])
+
+    def limit(c):
+        P = to_m(c)
+        infine = shapely.contains_xy(fine_u, P[:, 0], P[:, 1]) if fine_parts else np.zeros(len(P), bool)
+        if hfield is None:
+            lim = np.where(infine, afine, amax) if fine_parts else np.full(len(P), amax)
+        else:
+            h = np.where(infine, hfield(P, dmax_fine or dmax) if coarsen_fine else dmax_fine, hfield(P, dmax))
+            lim = 0.5 * (h / dmax) ** 2
+            if runs_u is not None:
+                lim[shapely.contains_xy(runs_u, P[:, 0], P[:, 1])] = -1.0
+        return np.where(lim > 0, area_scale * lim, lim)
+    frozen = None
+    if runs_u is not None:
+        frozen = lambda c: shapely.contains_xy(runs_u, *to_m(c).T)
+    sizes = (1.0,) + ((dmax_fine / dmax,) if fine_parts else ())       # each region's cell size (dmax)
+    return cdt_mesh(V, segs, limit, inside, _core(), frozen=frozen, sizes=sizes)
