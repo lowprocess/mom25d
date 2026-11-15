@@ -47,7 +47,7 @@ ZONE_OUT = 5.0     # zone=: cells up to this x dmax outside the zone around the 
 
 
 def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=False, mesher='auto', metal=None,
-                ground=None, max_solves=60, afs_tol=5e-3, log=print, progress=None, tiled='auto', on_step=None,
+                ground=None, max_solves=60, afs_tol=5e-3, log=print, progress=None, on_step=None,
                 core='auto', quads=False, zone=None, signal_vias='round', stitching_vias='auto', lines=None,
                 keep_at=(), quad_tol=35.0, coarsen=None, planes='pec', stitching_pads='drop', wideband=None):
     """S-parameters of a board (a <name>_board.json path, or its content) on `freq` (Hz).
@@ -57,7 +57,7 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     the straight feed spans enough for the fit down to the lowest frequency, else lumped), 'wave' or 'via'
     (lumped). pairs: P<n>+ / P<n>- ports as one mixed-mode port. metal: a sim.Metal (conductor loss), or None
     (lossless). log: lines of progress (the adaptive sweep's); progress(solves, max_solves, f): after each
-    EM solve. tiled: 'auto' | 'on' | 'off', the tiled GPU solver (sim.memory_plan). on_step(entry): after each
+    EM solve. on_step(entry): after each
     model of the adaptive sweep (its change and prediction error, afs.adaptive_sweep). core: 'auto' (the
     compiled core where built, NumPy's dense solver without it), 'compiled' (the core for every size) or
     'python' (NumPy only), fast.use_core. quads: near-rectangular triangle pairs as quad cells (True, or 'centre'),
@@ -75,7 +75,7 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
     t0, prev = time.time(), fast.use_core(core)
     try:
         model, sim = build_board(board, fmin, fmax, dmax=dmax, plane_factor=plane_factor, port=port, pairs=pairs,
-                                 mesher=mesher, metal=metal, ground=ground, log=log, tiled=tiled, core=core,
+                                 mesher=mesher, metal=metal, ground=ground, log=log, core=core,
                                  quads=quads, zone=zone, signal_vias=signal_vias, stitching_vias=stitching_vias,
                                  lines=lines, quad_tol=quad_tol, coarsen=coarsen, planes=planes,
                                  stitching_pads=stitching_pads, wideband=wideband, title=name)
@@ -99,7 +99,7 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
 
 
 def build_board(board, fmin, fmax, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=False, mesher='auto',
-                metal=None, ground=None, log=print, tiled='auto', core='auto', quads=False, zone=None,
+                metal=None, ground=None, log=print, core='auto', quads=False, zone=None,
                 signal_vias='round', stitching_vias='auto', lines=None, quad_tol=35.0, coarsen=None, planes='pec',
                 stitching_pads='drop', wideband=None, title=None, mesh_only=False, characterize=True):
     """(BoardModel, Simulation) of a board as solve_board builds them, with its options (solve_board's). mesh_only:
@@ -120,7 +120,7 @@ def build_board(board, fmin, fmax, dmax=0.3e-3, plane_factor=3.0, port='auto', p
     layer_dmax = {k: plane_factor * dmax for k, gs in model.shapes.items()
                   if sum(g.area for g in gs) > 0.5 * model.outline_area}
     sim = model.simulation(dmax=dmax, dmax_layer=layer_dmax, fmin=fmin, fmax=fmax, solver='auto', verbose=False,
-                           wave_down_to=fmin, mesher=mesher, title=title or 'board', metal=metal, tiled=tiled,
+                           wave_down_to=fmin, mesher=mesher, title=title or 'board', metal=metal,
                            core=core, quads=quads, quad_tol=quad_tol, coarsen=coarsen, signal_vias=signal_vias,
                            stitching_vias=stitching_vias, mesh_only=mesh_only,
                            characterize=characterize,

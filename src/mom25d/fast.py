@@ -363,10 +363,9 @@ class FastOperator:
         r = sim.rwg
         self.sim, self.trace, self.mixed_tol, self.atol_rel, self.max_rank = sim, False, 1e-6, atol_rel, max_rank
         self.near_fac, self.tol, self.leaf, self.eta = near_fac or sim.near_fac, tol, leaf, eta
-        self.tiled, self.tiled_block = None, 1024          # None: sim.tiled
         self._mixed_failed = self._hybrid_failed = 0.0      # the highest frequency the complex64 LU failed at
         self._gpu_solve_bad = 0.0                           # ... the GPU's triangular solves with it (not the LU)
-        self._tiled_failed = self._gpu_logged = False
+        self._gpu_logged = False
         self._kept = []                                     # [(f, preconditioner, scales, seconds a fresh one took)]
         self._t_iter = None                                 # seconds a refinement iteration takes
         self._reach = np.log(2.0)                           # |ln(f / f0)| a reused LU is tried within (learnt)
@@ -724,14 +723,6 @@ class FastOperator:
         if precision == 'mixed' and not hybrid and f <= MIXED_RETRY * self._mixed_failed:
             # the same for the complex64 LU (CPU or GPU): a failure costs the mixed solve and a double one
             precision = 'double'
-        tiled = self.tiled or sim.tiled
-        if precision == 'mixed' and tiled != 'off' and not self._tiled_failed and (tiled == 'on' or not hybrid) \
-                and gpu is not None and hasattr(gpu, 'cp') and not quads \
-                and 0.9 * gpu.mem_free() >= self._tiled_work(N, self.tiled_block):
-            # no dense Z: the GPU holds half a complex64 matrix (or streams it), the host a block column
-            X = self._solve_tiled(f, E, Sx, gpu, self.tiled_block)
-            if X is not None:
-                return X
         if precision == 'mixed' and gpu_fits and not quads and hasattr(gpu, 'factor_rows') and (sim.stream == 'on' or (
                 sim.stream != 'off' and not hybrid and 10.0 * N * N + 0.9e9 > 0.8 * available_memory())):
             # the GPU holds the complex64 LU, the host not even a complex64 Z: Z filled in row blocks straight into
@@ -1076,7 +1067,7 @@ class FastOperator:
 
     def _solve_reused(self, f, E, Sx, ready=False):
         """A solve without a new factorisation: GMRES on the exact operator at f, preconditioned with the one kept
-        from an earlier frequency f0 (the complex64 LU of the mixed direct solver, BLR's or HODLR's, and its
+        from an earlier frequency f0 (the complex64 LU of the mixed direct solver, BLR's, and its
         equilibration). Z changes smoothly with f, so the LU of one frequency preconditions the band: on the via
         transition (13.5k unknowns) the 5 GHz LU took 6-30 iterations from 1 to 10 GHz, 4-11 s a solve against 13 s
         with its own fill and LU; the hairpin 5-28. The iterations are capped at what a fresh solve costs
@@ -1214,82 +1205,6 @@ class FastOperator:
         self._mixed_failed = max(self._mixed_failed, f)
         return self.solve_direct(f, E, precision='double')
 
-    def _solve_tiled(self, f, E, Sx, gpu, block=1024):
-        """Mixed precision without a dense Z anywhere: the symmetric part of the equilibrated Z factored as
-        L L^T in complex64 tiles on the GPU (ldlt.SymFactor: block columns filled on the host one at a time,
-        4 N^2 bytes on the device, streamed from the host past its memory), GMRES on the matrix-free double
-        operator of that symmetric part with the factor as the preconditioner. The near-field correction is not
-        quite symmetric (its singular parts are integrated analytically over one triangle of a pair and by
-        quadrature over the other: up to 0.07 of the unit diagonal between a plane triangle and a strip one), the
-        exact Galerkin Z is: this path solves (Z + Z^T) / 2, |dS| <= 1.2e-3 on the SMA launch (1-6 GHz) against
-        Z itself. Preconditioning Z with the factor of its symmetric part did not converge (300 iterations)."""
-        from .ldlt import SymFactor
-        sim, core = self.sim, self.core
-        Ne, Nv = sim.Ne, sim.Nv
-        N = Ne + Nv
-        with sim.log.timer('near-field correction'):
-            self.dZ_exact = self._near_exact()
-        self._vias(f)
-        M = (sparse.bmat([[self.dZ_exact, None], [None, sparse.csr_matrix((Nv, Nv))]]) if Nv else self.dZ_exact) + Sx
-        Ms = ((M + M.T) * 0.5).tocsc()
-        # the operator of the refinement: the same symmetric part
-        self.dZ_exact = (0.5 * (self.dZ_exact + self.dZ_exact.T)).tocsr()
-        Sx = (0.5 * (Sx + Sx.T)).tocsr()
-        if Nv:
-            self.C = Cs = 0.5 * (self.C + self.C.T)
-        diag = Ms.diagonal().astype(complex)
-        for c0 in range(0, Ne, block):
-            idx = np.arange(c0, min(c0 + block, Ne), dtype=np.int32)
-            diag[idx] += np.diagonal(core.far_block(idx, idx, self.g, self.tb, self.w))
-        if Nv:
-            diag[Ne:] += np.diagonal(Cs)
-        dsc = 1.0 / np.sqrt(np.abs(diag) + 1e-300)
-
-        def fill(j0, j1):
-            out = np.zeros((N - j0, j1 - j0), complex)
-            c1 = min(j1, Ne)
-            if j0 < c1:
-                out[:Ne - j0, :c1 - j0] = core.far_block(np.arange(j0, Ne, dtype=np.int32),
-                                                         np.arange(j0, c1, dtype=np.int32), self.g, self.tb, self.w)
-                if Nv:
-                    out[Ne - j0:, :c1 - j0] = self.B[j0:c1].T
-            if j1 > Ne:
-                v0, off = max(j0, Ne) - Ne, max(j0, Ne) - j0
-                if j0 < Ne:
-                    out[:Ne - j0, off:] = self.B[j0:Ne, v0:j1 - Ne]
-                out[off:, off:] = Cs[v0:, v0:j1 - Ne]
-            out += Ms[j0:, j0:j1].toarray()
-            out *= dsc[j0:, None]
-            out *= dsc[None, j0:j1]
-            return out
-        cp = gpu.cp
-        fac = SymFactor(N, fill, xp=cp, block=block, budget=max(0.0, 0.9 * gpu.mem_free() - self._tiled_work(N, block)),
-                        log=sim.log.note)
-        with sim.log.timer('LDLT factor (GPU, tiled)', f"N={N}, block {block}"):
-            fac.factor()
-            cp.cuda.Device().synchronize()
-        streamed = fac.on_device.count(False)
-        sim.log.note(f"tiled LDL^T: {fac.held / 1e9:.1f} GB of panels on the GPU"
-                     + (f", {streamed} of {len(fac.panels)} streamed from the host" if streamed else '')
-                     + f", smallest pivot {fac.small_pivot:.1e}")
-        with sim.log.timer('refinement (GMRES, exact matvec)'):
-            Y, ok, rel = self._refine(lambda V: dsc[:, None] * self.matvec_exact(dsc[:, None] * V, Sx), dsc[:, None] * E,
-                                      fac.solve, 30, 10)
-        fac.release()
-        sim.log.note(f"tiled mixed precision: GMRES iterations per port {self.iters}")
-        if not ok:
-            sim.log.note(f"WARNING tiled mixed precision did not converge at {f / 1e9:.4g} GHz (residual "
-                         f"{rel:.1e}): the pivoted LU from here on")
-            self._tiled_failed = True
-            return None
-        return dsc[:, None] * Y
-
-    @staticmethod
-    def _tiled_work(N, block=1024):
-        """GPU bytes the tiled factor needs besides its panels: the column being updated, a streamed panel, the
-        right-hand sides of a solve."""
-        return 3 * 8.0 * N * block + 0.5e9
-
     def _backend(self):
         """The GPU backend sim.gpu asks for, when it is available (None for 'off')."""
         if self.sim.gpu == 'off':
@@ -1371,68 +1286,12 @@ class FastOperator:
             return M
         return raw
 
-    def solve_hodlr(self, f, E, tol=1e-6, leaf=256, refine=False, symmetric=False):
-        """The hierarchical direct solver (hodlr.HODLR): Z compressed from its entries, factored recursively; no
-        dense Z. refine: GMRES on the exact matrix-free operator, the HODLR solve its preconditioner."""
-        from .hodlr import HODLR
-        assert self.core is not None, "solver='hodlr' needs the compiled core (python -m mom25d.core.build)"
-        sim = self.sim
-        Ne, Nv = sim.Ne, sim.Nv
-        N = Ne + Nv
-        self.setup(f, mode='sparse')
-        self.dZ_exact = self.dZ
-        Sx = self.extra_blocks(f)
-        if self._reusable(f):
-            X = self._solve_reused(f, E, Sx, ready=True)
-            if X is not None:
-                return X
-        self._kept, t_fresh = [], time.time()
-        dZx = (self.dZ + Sx[:Ne, :Ne]).tocsr()
-        raw = self._raw_entry(dZx)
-        pts = self._points()
-        # equilibration from the diagonal (via rows are ~1e6 x the strip rows)
-        d = np.empty(N, complex)
-        for s0 in range(0, N, 512):
-            idx = np.arange(s0, min(N, s0 + 512))
-            d[idx] = np.diagonal(raw(idx, idx))
-        dsc = 1.0 / np.sqrt(np.abs(d) + 1e-300)
-        # the near-field entries that matter at tol mark ACA's hot rows (hodlr.aca_checked): the correction's pattern
-        # reaches 5 cells, 15 mm under 3 mm plane cells, but beyond ~3 mm it is under 5e-4 of its largest
-        sig = sparse.diags(dsc[:Ne]) @ dZx @ sparse.diags(dsc[:Ne])
-        sig.data[np.abs(sig.data) < 0.1 * tol] = 0
-        sig.eliminate_zeros()
-        with sim.log.timer('HODLR compress + factor', f"N={N}, tol {tol:g}"):
-            self.hodlr = H = HODLR(lambda r, c: raw(r, c) * dsc[r][:, None] * dsc[c][None, :], pts, leaf=leaf, tol=tol,
-                                   near=sig, log=sim.log.note, symmetric=symmetric)
-        sim.log.note(f"HODLR: {H.stats()}")
-        B = dsc[:, None] * E
-        if not refine:
-            with sim.log.timer('HODLR solve'):
-                X = dsc[:, None] * H.solve(B)
-            self._kept = [(f, H.solve, dsc, time.time() - t_fresh)]
-            return X
-        with sim.log.timer('refinement (GMRES, exact matvec)'):
-            t = time.time()
-            Y, ok, rel = self._refine(lambda V: dsc[:, None] * self.matvec_exact(dsc[:, None] * V, Sx), B, H.solve,
-                                      MIXED_MAX_ITER, 1)
-            self._t_iter = (time.time() - t) / max(1, max(self.iters, default=1))
-        sim.log.note(f"HODLR: GMRES iterations per port {self.iters}" + ('' if ok else f", NOT converged ({rel:.1e})"))
-        if not ok and tol > 1e-9:
-            # too loose a factorisation for this matrix (fine meshes at low frequency are ill-conditioned): again at
-            # 100 x tighter, rather than an unconverged answer
-            sim.log.note(f"WARNING HODLR refinement did not converge at {f / 1e9:.4g} GHz with tol {tol:g} - "
-                         f"factoring again at {tol / 100:g}")
-            return self.solve_hodlr(f, E, tol=tol / 100, leaf=leaf, refine=True, symmetric=symmetric)
-        if not ok and not rel <= BLR_GIVE_UP:                       # (as the BLR solve: no answer)
-            raise FloatingPointError(f"mom25d: the HODLR solve at {f / 1e9:.4g} GHz did not converge (residual "
-                                     f"{rel:.1e} at tol {tol:g}): a coarser mesh (--mom-dmax)")
-        self._kept = [(f, H.solve, dsc, time.time() - t_fresh)]
-        return dsc[:, None] * Y
-
     def solve_blr(self, f, E, tol=1e-4, tile=256, eta=1.0, dtype=np.complex64):
         """Block low-rank LU preconditioner + GMRES with the exact matrix-free operator (no stored Z)."""
-        from .blr import BLRFactor, cluster_tiles
-        assert self.core is not None, "solver='blr' needs the compiled core (python -m mom25d.core.build)"
+        from .blr import cluster_tiles
+        if self.core is None or not hasattr(self.core, 'BLRFactor'):     # (its Python factor retired: R-F3)
+            raise RuntimeError("solver='blr' needs the compiled core with its block low-rank factor "
+                               "(python -m mom25d.core.build)")
         sim = self.sim
         Ne, Nv = sim.Ne, sim.Nv
         N = Ne + Nv
@@ -1458,7 +1317,7 @@ class FastOperator:
         dZx = (self.dZ + Sx[:Ne, :Ne]).tocsr()
         tiles, boxes = cluster_tiles(self._points(), tile)
         raw = self._raw_entry(dZx)
-        compiled = hasattr(self.core, 'BLRFactor') and dtype == np.complex64
+        compiled = True
         # low frequency, and no room for the loop/tree basis's dense matrix: the factor in double precision, its
         # compression a hundredth of (k h)^2 (the loops' share of the matrix: what a looser one truncates away)
         low = compiled and hasattr(self.core, 'BLRFactor128') and getattr(sim, 'loop_tree', 'auto') != 'off' \
@@ -1478,11 +1337,7 @@ class FastOperator:
         while True:
             with sim.log.timer('BLR assemble + factor', f"N={N}, {len(tiles)} tiles, tolerance {tol:g}"
                                + (", compiled" if compiled else '')):
-                if compiled:
-                    self.blr = blr = _CompiledBLR(self, tiles, boxes, dZx, dsc, tol, eta, double=low)
-                else:
-                    self.blr = blr = BLRFactor(lambda r, c: raw(r, c) * dsc[r][:, None] * dsc[c][None, :], tiles,
-                                               boxes, tol=tol, eta=eta, dtype=dtype, scale=1.0)
+                self.blr = blr = _CompiledBLR(self, tiles, boxes, dZx, dsc, tol, eta, double=low)
             sim.log.note(f"BLR: {blr.memory / 2 ** 20:.0f} MB ({100 * blr.memory / (8 * N * N):.0f}% of complex64 "
                          f"dense, {100 * blr.memory / (16 * N * N):.0f}% of complex128), {blr.stats['lowrank']} "
                          f"low-rank tiles, mean rank {blr.stats['rank_sum'] / max(1, blr.stats['lowrank']):.0f}"

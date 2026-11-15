@@ -32,26 +32,26 @@ def _without_compiled_blr(sim):
                                              if not k.startswith('_') and k != 'BLRFactor'})
 
 
-def test_the_compiled_blr_solves_as_blr_py_and_the_direct_solver():
+def test_the_compiled_blr_solves_as_the_direct_solver():
+    """The compiled block low-rank factor (its Python one retired, R-F3) gives the direct solver's S; without it
+    the run says what it needs rather than falling back to a slow copy."""
     core = pytest.importorskip('mom25d._core')
     if not hasattr(core, 'BLRFactor'):
         pytest.skip('a core without BLRFactor')
     f = 4e9
     ref = _sim('direct').sparams(f)
-    S, stats = {}, {}
-    for compiled in (True, False):
-        sim = _sim()
-        sim.blr_tile, sim.blr_tol, sim.blr_eta = 128, 1e-3, 0.7
-        if not compiled:
-            _without_compiled_blr(sim)
-        S[compiled] = sim.sparams(f)
-        stats[compiled] = sim.fast.blr.stats
-        assert not any('did not converge' in n for n in sim.log.notes), sim.log.notes
-    assert np.abs(S[True] - ref).max() < 1e-6 and np.abs(S[False] - ref).max() < 1e-6
-    st, N = stats[True], ref.shape and _sim().Ne + _sim().Nv
+    sim = _sim()
+    sim.blr_tile, sim.blr_tol, sim.blr_eta = 128, 1e-3, 0.7
+    S = sim.sparams(f)
+    assert not any('did not converge' in n for n in sim.log.notes), sim.log.notes
+    assert np.abs(S - ref).max() < 1e-6
+    st, N = sim.fast.blr.stats, _sim().Ne + _sim().Nv
     assert st['lowrank'] > 0 and st['singular'] == 0
-    assert st['lowrank'] == stats[False]['lowrank']                 # the same tiles compressed
     assert st['bytes'] < 8.0 * N * N                                # less than a complex64 matrix
+    sim = _sim()
+    _without_compiled_blr(sim)
+    with pytest.raises(RuntimeError, match='compiled core'):
+        sim.sparams(f)
 
 
 def test_a_smaller_eta_compresses_more_tiles_to_the_same_answer():

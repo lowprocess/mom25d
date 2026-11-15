@@ -25,8 +25,8 @@ G = 'mom25d'
 # measured, 12.4 s estimated.
 T0, DENSE_N2, LU_N3, VIA2, SOLVES, REF_CORES = 1.0, 1.6e-7, 3.7e-12, 3.5e-5, 16, 24
 # with a GPU (RX 7800 XT, sma_launch, 16.1k unknowns): the fill, the complex64 LU and the refinement 6.3 s a solve
-# (hybrid), the tiled path 10.5 s (its fill block by block, the symmetric near field)
-LU_GPU_N3, LU_TILED_N3 = 1.5e-12, 2.5e-12
+# (hybrid)
+LU_GPU_N3 = 1.5e-12
 # the compiled block low-rank LU (from 20k unknowns where the hybrid does not fit: sim.BLR_MIN_N), seconds per solve
 # over N^2 on 16 cores, the reused factors with the fresh: rf_siw 9.7 s (28.7k), antenna_vivaldi 8.1 s (21.9k)
 BLR_N2, BLR_CORES = 1.4e-8, 16
@@ -102,7 +102,7 @@ def factorisations(runlog):
     """(on the GPU, on the CPU): the matrix factorisations of a sweep, from mom25d's stage timings. A solve whose
     complex64 LU failed to precondition counts on both (it is factored again in double on the CPU)."""
     names = [(stage, detail) for stage, _, detail in getattr(runlog, "records", ())]
-    gpu = sum(st in ('LU factor (GPU)', 'LDLT factor (GPU, tiled)') for st, _ in names)
+    gpu = sum(st == 'LU factor (GPU)' for st, _ in names)
     cpu = sum(st in ('LU factor', 'BLR assemble + factor') or (st == 'LU solve' and detail.startswith('N='))
               for st, detail in names)
     return gpu, cpu
@@ -115,7 +115,7 @@ def reused(runlog):
 
 
 def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, rough=None, finish=None, log=print, progress=None,
-          hold=None, tiled='auto', on_step=None, core='auto', quads=False, zone=None,
+          hold=None, on_step=None, core='auto', quads=False, zone=None,
           signal_vias='round', stitching_vias='auto', lines=None, keep_at=(), stack='ground', quad_tol=35.0,
           coarsen=None, planes='pec', stitching_pads='drop', wideband=None):
     """S-parameters of the board m on `freq` (Hz) from mom25d, as kicad2ems reports them: (S (nf, n, n) in
@@ -145,7 +145,7 @@ def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, rough=None,
             (f", {rough:g} um RMS rough (Hammerstad)" if rough else "") +
             (f", {finish.name} on {', '.join(sorted(metal.on))}" if metal.on else ""))
     kw.update(metal=metal, max_solves=max_solves, log=lambda t: log(f"  mom25d:{t}") if 'AFS' in t else None,
-              progress=progress, tiled=tiled, on_step=on_step, core=core, keep_at=keep_at)
+              progress=progress, on_step=on_step, core=core, keep_at=keep_at)
     try:
         res = solve_board(m.to_dict(), freq, pairs=pairs, **kw)
     except ValueError as e:
@@ -239,18 +239,18 @@ def save_mesh(run, sim, model, solver='mom25d'):
 
 
 HOW = {'dense': 'dense, NumPy', 'double': 'direct LU in double on the CPU',
-       'hybrid': 'complex64 LU on the GPU, double refinement on the host', 'tiled': 'tiled L L^T on the GPU',
+       'hybrid': 'complex64 LU on the GPU, double refinement on the host',
        'gpu-lu': 'complex64 LU on the GPU, matrix-free refinement', 'cpu-mixed': 'complex64 LU on the CPU',
        'blr': 'block low-rank LU (compiled), no dense matrix', 'aca': 'H-matrix and GMRES, no dense matrix'}
 
 
-def memory_plan_for(n, tiled='auto'):
+def memory_plan_for(n):
     """mom25d.sim.memory_plan of n unknowns on this machine: the memory available now, the GPU mom25d would use."""
     from mom25d.sim import memory_plan, gpu_info
     from mom25d.fast import _core
     from mom25d.gpu import get_backend
     g = get_backend('auto') if _core is not None else None
-    return memory_plan(n, _core is not None, None, gpu_info(g, n) if g is not None else None, tiled=tiled)
+    return memory_plan(n, _core is not None, None, gpu_info(g, n) if g is not None else None)
 
 
 def _model_kw(s):
@@ -440,10 +440,6 @@ class MoM25D(Solver):
                "auto (default: square outside --mom-zone, else round), round, square or N sides", str,
                conv=lambda v: _via_sides(v, ('auto', 'round', 'square')),
                name='stitching_vias', gui='MoM stitching vias', group=G, cli=dict(metavar='auto|round|square|N')),
-        Option('mom_tiled', 'auto', "mixed precision as complex64 L L^T tiles on the GPU, no dense matrix anywhere "
-               "(half the GPU memory of an LU, streamed from the host past it): auto (default) where the dense "
-               "GPU solver does not fit (it is faster where it fits: 9.9 s against 14.3 s a solve on the SMA "
-               "launch), on, off", choices=('auto', 'on', 'off'), name='tiled', gui='MoM tiled GPU solver', group=G),
         Option('mom_core', 'auto', "mom25d's kernels: auto (default: the compiled core where it is built, NumPy's "
                "dense solver for boards up to 3,500 unknowns), compiled (the core for every board: 4-8x faster on "
                "small ones, |S| within about 0.005 of the dense solver's; stops if the core is not built) or python "
@@ -596,9 +592,9 @@ class MoM25D(Solver):
         sim = bm.simulation(dmax=dmax, dmax_layer=planes, fmin=run.fmin, fmax=run.fmax, characterize=False,
                             verbose=False, wave_down_to=run.fmin, mesh_only=True)
         n, solves, layers = int(sim.Ne + sim.Nv), min(s.mom_solves, SOLVES), len(bm.shapes)
-        plan = memory_plan_for(n, s.mom_tiled)
+        plan = memory_plan_for(n)
         lu = LU_N3 * REF_CORES / (os.cpu_count() or 1)                 # the CPU LU scales with the cores, a GPU's not
-        lu = dict(hybrid=LU_GPU_N3, tiled=LU_TILED_N3).get(plan['path'], lu)
+        lu = dict(hybrid=LU_GPU_N3).get(plan['path'], lu)
         factor = BLR_N2 * n ** 2 * BLR_CORES / (os.cpu_count() or 1) if plan['path'] == 'blr' else \
             (lu * n ** 3 if n > 3500 else 0)
         per = (T0 * layers * (layers + 1) / 2 + VIA2 * len(bm.vias) ** 2 + (DENSE_N2 * n ** 2 if n <= 3500 else 0)) \
@@ -632,7 +628,7 @@ class MoM25D(Solver):
         def one(dmax, finest=True):
             return solve(run.m, run.freq, dmax=dmax, port=port,
                          max_solves=s.mom_solves, sigma=s.sigma, rough=getattr(s, 'rough', None), finish=run_finish(run),
-                         log=run.log, hold=self._held if finest else {}, tiled=s.mom_tiled,
+                         log=run.log, hold=self._held if finest else {},
                          core=s.mom_core, **_mesh_kw(s, run.m),
                          keep_at=([f * 1e9 for f in s.mom_dump or []] + _far_field_seeds(run)) if finest else [],
                          progress=lambda k, n, f: (run.status('mom25d', dict(fraction=k / n, solves=k,

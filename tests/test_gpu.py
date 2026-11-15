@@ -169,58 +169,6 @@ def test_gpu_refinement_that_breaks_down_falls_back_to_double(clean, S_cpu):
     assert np.isfinite(S).all() and np.abs(S - S_cpu).max() < 1e-6 and sim.fast._hybrid_failed
 
 
-def _S_symmetric():
-    """The CPU double solve of (Z + Z^T) / 2: what the tiled path solves (its near field symmetrised)."""
-    sim = make_sim('off')
-    sim.precision = 'double'
-    orig = sla.lu_factor
-
-    def lu(A, **kw):
-        A[...] = 0.5 * (A + A.T)
-        return orig(A, **kw)
-    sla.lu_factor = lu
-    try:
-        return sim.sparams(4e9)
-    finally:
-        sla.lu_factor = orig
-
-
-def test_tiled_symmetric_factor_matches_cpu(clean, S_cpu):
-    """The tiled L L^T (no dense Z: block columns filled one at a time, half of them streamed from the host as
-    when the GPU is full) preconditions the refinement to the CPU answer of the symmetric part of Z, close
-    to Z's own."""
-    mods, _ = fake_cupy()
-    cla = mods['cupyx.scipy.linalg']
-    cla.solve_triangular = lambda a, b, lower=False, trans='N', check_finite=True: \
-        sla.solve_triangular(a, b, lower=lower, trans=trans, check_finite=False)
-    for k, v in mods.items():
-        clean.setitem(sys.modules, k, v)
-    sim = make_sim('cupy')
-    sim.fast.tiled, sim.fast.tiled_block = 'on', 64
-    N = sim.Ne + sim.Nv
-    gpu = mom25d_gpu.get_backend('cupy')
-    clean.setattr(type(gpu), 'mem_free', lambda self: (sim.fast._tiled_work(N, 64) + 2.0 * N * N) / 0.9)
-    S = sim.sparams(4e9)
-    assert any(r[0] == 'LDLT factor (GPU, tiled)' for r in sim.log.records), "tiled path not taken"
-    assert not any(r[0] == 'LU factor (GPU)' for r in sim.log.records)
-    assert any('streamed from the host' in n for n in sim.log.notes)
-    assert np.abs(S - _S_symmetric()).max() < 1e-6 and np.abs(S - S_cpu).max() < 1e-2
-
-
-def test_symmetric_factor_of_a_random_matrix():
-    from mom25d.ldlt import SymFactor, chol_sym
-    rng = np.random.default_rng(1)
-    N = 300
-    A = rng.standard_normal((N, N)) + 1j * rng.standard_normal((N, N))
-    Z = 0.3 * (A + A.T) / np.sqrt(N) + (1 + 0.5j) * np.eye(N)
-    L = chol_sym(Z.copy(), base=16)
-    assert np.abs(L @ L.T - Z).max() < 1e-12 and not np.triu(L, 1).any()
-    fac = SymFactor(N, lambda j0, j1: Z[j0:, j0:j1], block=64, budget=0.5 * 4 * N * N).factor()
-    assert fac.on_device.count(False) > 0
-    R = rng.standard_normal((N, 2)) + 0j
-    assert np.linalg.norm(Z @ fac.solve(R) - R) / np.linalg.norm(R) < 1e-5
-
-
 def test_a_nan_gpu_factor_falls_back(clean, S_cpu):
     """A GPU LU that comes back NaN: the refinement breaks down and the solve is redone in double on the CPU."""
     clean.setattr(mom25d_gpu.EmulatedBackend, 'download', bad_factor(np.nan))
@@ -321,7 +269,7 @@ def test_memory_plan_takes_the_backends_own_estimate():
     p = memory_plan(n, has_core=True, avail=30e9, gpu=('vulkan', 15.7e9, need, True), solver='auto', has_blr=False)
     assert p['path'] == 'gpu-lu'
     p = memory_plan(n, has_core=True, avail=8e9, gpu=('vulkan', 15.7e9), solver='auto', has_blr=False)
-    assert p['solver'] == 'blr'
+    assert p['solver'] == 'aca'                                   # no compiled BLR: the H-matrix (Python BLR retired)
     # the compiled block low-rank LU there instead, from sim.BLR_MIN_N unknowns; the hybrid where it holds Z
     p = memory_plan(n, has_core=True, avail=30e9, gpu=('vulkan', 15.7e9, need, True), solver='auto', has_blr=True)
     assert p['solver'] == 'blr' and p['host'] < 8.0 * n * n

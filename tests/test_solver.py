@@ -485,15 +485,10 @@ def test_core_matches_numpy_and_solvers_agree(monkeypatch):
     assert np.abs(ref - ref.T).max() < 1e-6                     # through a via, cells of two sizes: reciprocal
     for k, v in S.items():
         assert np.abs(v - ref).max() < 1e-6, k
-    for tol, refine, err in ((1e-8, False, 1e-5), (1e-4, True, 1e-5)):     # hodlr.py: direct, or GMRES's preconditioner
-        sim = mk('hodlr')
-        sim.hodlr_tol, sim.hodlr_leaf, sim.hodlr_refine = tol, 64, refine
-        assert np.abs(sim.sparams(4e9) - ref).max() < err, (tol, refine)
-        assert len(sim.fast.hodlr.ranks) >= 2                     # the tree has levels
     # a factorisation kept from 4 GHz preconditions 4.4 GHz (fast._solve_kept: dense, several kept; _solve_reused:
     # matrix-free, one): the same S as a fresh one
     from mom25d import fast
-    for k, keep in ((('direct', 'mixed'), 4), (('direct', 'mixed'), 0), (('blr', 'double'), 4), (('hodlr', 'double'), 4)):
+    for k, keep in ((('direct', 'mixed'), 4), (('direct', 'mixed'), 0), (('blr', 'double'), 4)):
         S1 = {}
         monkeypatch.setattr(fast, 'REUSE_KEEP', keep)
         for reuse in ('off', 'auto'):

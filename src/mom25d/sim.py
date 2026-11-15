@@ -81,16 +81,14 @@ def gpu_info(b, n):
     return (b.name, b.mem_free(), b.vram_needed(n), b.fits(n))
 
 
-def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver='auto', tiled='auto', block=1024,
-                n_lu=None, has_blr=None):
+def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver='auto', n_lu=None, has_blr=None):
     """How the solver of n unknowns runs and the memory it needs: dict(solver, precision, path, host, gpu)
     (bytes). gpu: None, or (backend name, free bytes), or gpu_info's (name, free, the LU's bytes, fits): the
     backend's own estimate (the Vulkan LU factors in place: 8 N^2, not the 16 N^2 the 2-tuple assumes). path: 'dense' (NumPy, small n), 'double' (LU on the
     CPU), 'hybrid' (complex64 LU on the GPU, the double Z on the host for the refinement), 'gpu-stream' (the Vulkan
-    GPU's complex64 LU filled by row blocks, no Z on the host, the refinement matrix-free), 'tiled' (the
-    symmetric part as L L^T tiles on the GPU, no dense Z: fast.FastOperator._solve_tiled), 'gpu-lu' (complex64
-    Z on the host and the GPU), 'cpu-mixed' (complex64 LU on the CPU), 'blr' / 'aca' (compressed, no dense Z).
-    tiled: 'auto' (where the hybrid does not fit), 'on' (whenever a CuPy GPU is there) or 'off'. n_lu: the unknowns
+    GPU's complex64 LU filled by row blocks, no Z on the host, the refinement matrix-free), 'gpu-lu' (complex64
+    Z on the host and the GPU), 'cpu-mixed' (complex64 LU on the CPU), 'blr' / 'aca' (compressed, no dense Z;
+    the tiled L L^T on the GPU is retired, BLR taking its boards: R-F3). n_lu: the unknowns
     the LU factors (fewer with quads; default n), which the thresholds GPU_MIN_N and MIXED_MIN_N compare. has_blr:
     whether the compiled core has the block low-rank LU (None: look), which 'auto' takes from BLR_MIN_N unknowns
     where the hybrid does not fit."""
@@ -101,8 +99,6 @@ def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver
     else:
         gpu_lu = (1 if name in ('cupy', 'emulate') else 2) * 8.0 * n * n + 0.4e9  # gpu._Backend.vram_needed
         gpu_fits = name is not None and gpu_lu <= 0.9 * free
-    work = 3 * 8.0 * n * block + 0.5e9                                          # fast.FastOperator._tiled_work
-    can_tile = tiled != 'off' and has_core and name in ('cupy', 'emulate') and work <= 0.9 * free
     if precision == 'auto':
         # mixed where double does not fit, and above MIXED_MIN_N (GPU_MIN_N with a GPU): complex64 LU + GMRES refinement,
         # half the LU flops and 10 N^2 bytes instead of 18 (demo transition cropped, 8.4k unknowns, 2 cores: 14.0 s
@@ -116,10 +112,6 @@ def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver
     hybrid = precision == 'mixed' and gpu_fits and 24.0 * n * n + 0.9e9 <= 0.8 * avail and (n_lu or n) <= HYBRID_MAX_N
     if precision == 'double':
         path, host, dev = 'double', 18.0 * n * n + 0.9e9, 0.0
-    elif can_tile and (tiled == 'on' or not hybrid):
-        budget = max(0.0, 0.9 * free - work)
-        path, dev = 'tiled', min(4.0 * n * n, budget) + work
-        host = max(0.0, 4.0 * n * n - budget) + 2 * 16.0 * n * block + 1e4 * n + 0.9e9
     elif hybrid:
         path, host, dev = 'hybrid', 24.0 * n * n + 0.9e9, gpu_lu
     elif gpu_fits and name == 'vulkan' and 10.0 * n * n + 0.9e9 > 0.8 * avail:
@@ -139,16 +131,21 @@ def memory_plan(n, has_core=True, avail=None, gpu=None, precision='auto', solver
         if has_blr is None:
             from .fast import _core
             has_blr = hasattr(_core, 'BLRFactor')
-        if solver == 'direct' and has_blr and path in ('tiled', 'gpu-lu', 'gpu-stream', 'cpu-mixed') \
+        if solver == 'direct' and has_blr and path in ('gpu-lu', 'gpu-stream', 'cpu-mixed') \
                 and n >= BLR_MIN_N and (n_lu is None or n_lu >= n):     # (quad cells: the direct solver's alone)
             solver = 'blr'
+    if solver == 'blr':                                         # the factor is the compiled core's: without it, ACA
+        if has_blr is None:
+            from .fast import _core
+            has_blr = hasattr(_core, 'BLRFactor')
+        solver = 'blr' if has_blr else 'aca'
     if solver == 'dense':
         path, host, dev = 'dense', 18.0 * n * n + 0.9e9, 0.0
-    elif solver == 'blr' and (has_blr if has_blr is not None else True):
+    elif solver == 'blr':
         # the compiled factor: measured 18-30 % of a complex64 matrix at 22-41k unknowns, with the sparse near
         # field: antenna_cp_patch's run peaked at 5 GB
         path, host, dev = solver, 3.0 * n * n + 2e4 * n + 0.9e9, 0.0
-    elif solver in ('blr', 'aca', 'hodlr'):
+    elif solver == 'aca':
         path, host, dev = solver, 2e4 * n + 0.9e9, 0.0
     return dict(solver=solver, precision=precision, path=path, host=host, gpu=dev, fits=fits)
 
@@ -333,7 +330,7 @@ class Simulation:
     def __init__(self, stack, shapes, ports=(), vias=(), lumped=(), dmax=0.3e-3, dmax_layer=None,
                  w_ref=None, ncross=6, grade=1.0, near_fac=5.0, mesher='auto', metal=None,
                  solver='dense', aca_tol=1e-4, refine=1.0e-3, precision='auto', gpu='auto', verbose=True, title='',
-                 mesh_only=False, tiled='auto', core='auto', quads=False, quad_tol=35.0, zone=None, dmax_out=None,
+                 mesh_only=False, core='auto', quads=False, quad_tol=35.0, zone=None, dmax_out=None,
                  signal_vias='round', stitching_vias='auto', signal=None, via_barrel=True, line_basis=None,
                  line_w_max=2.0e-3, line_step=2.0, coarsen=None, grow=0.5, structured='auto', gap_rings=(1/4, 1/8, 1/16),
                  frills=()):
@@ -345,13 +342,10 @@ class Simulation:
         self.st, self.title, self.metal, self.solver, self.log = stack, title, metal, solver, RunLog(verbose)
         self.gpu = gpu                      # 'auto' | 'vulkan' | 'cupy' | 'off' (mixed direct solver LU)
         self.precision = precision          # 'auto' | 'double' | 'mixed' (direct: complex64 Z + refinement)
-        self.tiled = tiled                  # 'auto' | 'on' | 'off': mixed precision as L L^T tiles on the GPU (memory_plan)
         self.core_mode = core               # 'compiled': the compiled core's direct solver for small boards too
         # solver='blr' preconditioner settings: 1e-3 left antenna_cp_patch (40.8k unknowns) unsolved (GMRES 500
         # iterations), 1e-5 solves it in 7; eta 0.3 against 0.7: less memory, as fast (fast.solve_blr)
         self.blr_tol, self.blr_tile, self.blr_eta = 1e-5, 512, 0.3
-        self.hodlr_tol, self.hodlr_leaf, self.hodlr_refine = 1e-6, 256, False   # solver='hodlr'
-        self.hodlr_symmetric = False        # Z^T = Z: half the compression (the near correction is not quite)
         self.reuse = 'auto'                 # 'auto' | 'off': the CPU's complex64 LU kept for the next frequencies
         self.loop_tree = os.environ.get('MOM25D_LOOP_TREE', 'auto')     # 'auto' | 'on' | 'off': the direct
                                             # solver in the loop/tree basis (looptree.py) at low frequency (auto: below
@@ -596,7 +590,7 @@ class Simulation:
         b = get_backend(gpu) if want_gpu else None
         g = gpu_info(b, n_lu) if b is not None else None
         avail = available_memory()
-        plan = memory_plan(n, has_core, avail, g, precision, solver, self.tiled, n_lu=n_lu)
+        plan = memory_plan(n, has_core, avail, g, precision, solver, n_lu=n_lu)
         self.plan, self.precision, precision = plan, plan['precision'], plan['precision']
         if solver in ('auto', 'direct'):
             if plan['path'] == 'blr':
@@ -610,7 +604,7 @@ class Simulation:
             if solver == 'auto':
                 solver = plan['solver']
                 if solver == 'dense' and self.core_mode == 'compiled' and has_core:   # the core, not NumPy's
-                    plan = memory_plan(n, has_core, avail, g, precision, 'direct', self.tiled, n_lu=n_lu)
+                    plan = memory_plan(n, has_core, avail, g, precision, 'direct', n_lu=n_lu)
                     self.precision, self.plan, solver = plan['precision'], plan, plan['solver']
             elif not plan['fits']:
                 solver = 'blr' if has_core else 'aca'
@@ -622,7 +616,7 @@ class Simulation:
                 self.log.note(f"quads: not with solver {solver} yet - ignored")
                 self.qT = None
             self.log.note(f"solver: {solver} (N = {n})")
-        if solver in ('aca', 'direct', 'blr', 'hodlr'):
+        if solver in ('aca', 'direct', 'blr'):
             from .fast import FastOperator
             self.fast = FastOperator(self, tol=aca_tol)
             return
@@ -982,9 +976,6 @@ class Simulation:
             return self.fast.solve_direct(f, E, precision=self.precision)
         if self.solver == 'blr':
             return self.fast.solve_blr(f, E, tol=self.blr_tol, tile=self.blr_tile, eta=self.blr_eta)
-        if self.solver == 'hodlr':
-            return self.fast.solve_hodlr(f, E, tol=self.hodlr_tol, leaf=self.hodlr_leaf, refine=self.hodlr_refine,
-                                         symmetric=self.hodlr_symmetric)
         if self.qT is not None:
             T = self.qT
             return T @ self.solve(np.asarray(T.T @ (T.T @ self.impedance(f).T).T), np.asarray(T.T @ E))

@@ -72,7 +72,7 @@ DC/PDN, quasistatic fields and operational circuits now live in
 MoM's RF API, shared numerical implementation and native core are unchanged.
 
 `solve_board` builds the model, meshes it and runs an adaptive frequency sweep; its docstring lists the options
-(cell size, port kind, mixed-mode pairs, conductor loss, the GPU's tiled solver, the compiled core). The steps it
+(cell size, port kind, mixed-mode pairs, conductor loss, the compiled core). The steps it
 wraps are public too:
 
 ```python
@@ -99,9 +99,9 @@ f, S, info = solve_band(sim, 1e9, 6e9, points=101, zref=m.port_z0)
 | `line.py`, `quads.py` | line basis functions on straight runs; quad cells |
 | `fast.py` | the matrix fill and the solvers |
 | `looptree.py` | the loop/tree basis the direct solver takes at low frequency (pcbqs's) |
-| `gpu.py`, `ldlt.py` | the GPU backends and the tiled solver |
+| `gpu.py` | the GPU backends |
 | `gpu_vk.py` | the Vulkan backend: a hybrid LU (panels on the CPU, updates on the GPU) and its GPU solves |
-| `blr.py`, `hodlr.py` | the compressed solvers: block low-rank (compiled in `core/`, the large boards' path), hierarchical |
+| `blr.py` | the block low-rank solver's tiling (its factor is compiled in `core/`: the large boards' path) |
 | `afs.py`, `run.py` | the adaptive frequency sweep (its fit is emsdev's `emsdev.afs`, which pcbqs shares) |
 | `farfield.py` | far and near fields from the currents |
 | `core/` | the compiled C++ kernels |
@@ -115,7 +115,7 @@ stripline impedance to 0.6 % (Cohn's), coupled striplines' even and odd modes to
 to 0.7 % of the cavity model (Hammerstad's fringing), and the 10 dB coupler to 0.1 dB of openEMS (S21, S31), with
 stored S-parameters of two boards beside them (`tests/test_validation.py`). The board
 files they read (`tests/boards`) are kicad2ems's example boards. `tools/` holds the GPU self-check and the studies
-behind kicad2ems's mom25d page (mesher, zone, quad cells, the HODLR solver).
+behind kicad2ems's mom25d page (mesher, zone, quad cells).
 
 **Limits**: copper is zero-thickness (`Metal(rough=)` scales its loss by Hammerstad's roughness factor), and wave ports need a straight
 feed line.
