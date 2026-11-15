@@ -345,6 +345,33 @@ def _solid_ground(m):
     return next((l for l in m.cu_order if sum(p.area for p in m.copper.get(l, [])) >= half), None)
 
 
+CONVERGE_TOL = (0.1, 2.0)        # dB, deg: --mom-converge's levels agree within these (as the FDTD layer's default)
+
+
+def mesh_convergence(Sa, Sb, names=None, floor=0.01):
+    """dict(db, deg, worst, converged): the largest change between two levels' S (nf x n x n) in dB and degrees,
+    over the points where |S| reaches floor (-40 dB, as the FDTD layer's check: the phase of what is not there is
+    noise), and the term it is on."""
+    import numpy as np
+    Sa, Sb = np.asarray(Sa), np.asarray(Sb)
+    n = Sa.shape[1]
+    names = names or [f"P{k + 1}" for k in range(n)]
+    db = deg = 0.0
+    worst = None
+    for i in range(n):
+        for j in range(n):
+            a, b = Sa[:, i, j], Sb[:, i, j]
+            ok = np.isfinite(a) & np.isfinite(b) & (np.abs(a) >= floor) & (np.abs(b) >= floor)
+            if not ok.any():
+                continue
+            d1 = float(np.max(np.abs(20 * np.log10(np.abs(a[ok]) / np.abs(b[ok])))))
+            d2 = float(np.max(np.abs(np.degrees(np.angle(a[ok] / b[ok])))))
+            if d1 > db:
+                worst = f"S({names[i]},{names[j]})"
+            db, deg = max(db, d1), max(deg, d2)
+    return dict(db=db, deg=deg, worst=worst, converged=db <= CONVERGE_TOL[0] and deg <= CONVERGE_TOL[1])
+
+
 class MoM25D(Solver):
     api = (2, 9)                    # kicad2ems.api (2.3: the roughness row; 2.9: basic)
     name, aliases, label = 'mom25d', ('mom',), 'mom25d (MoM)'
@@ -424,6 +451,10 @@ class MoM25D(Solver):
                gui='Core (compiled / python)', group=G),
         Option('mom_solves', 60, "most EM solves of the adaptive sweep (default {default})", int, name='solves', gui='Most EM solves of the sweep',
                group=G, cli=dict(metavar='N')),
+        Option('mom_converge', [], "mesh convergence check: solved with cells of --mom-dmax / f for each factor f (e.g. "
+               "1,1.5); the finest gives the result and the second-finest is compared with it (converged within 0.1 dB "
+               "and 2 deg)", list, conv=floatlist, name='converge', gui='Convergence levels (e.g. 1,1.5)',
+               group=G, cli=dict(metavar='F1,F2,...')),
         Option('mom_dump', [], "surface-current dumps at these frequencies (GHz): |J| maps of each signal layer, and "
                "with --dump-animate one period of Re(J e^jphi), the standing waves; the ports driven: --dump-port "
                "(default: the first)", list, conv=floatlist, name='dump', gui='Current dumps (GHz, comma-separated)',
@@ -598,16 +629,32 @@ class MoM25D(Solver):
         if run.antenna and port == 'auto':                          # the gap source the antenna's power is taken from
             port = 'lumped'
             run.log("mom25d: antenna mode: lumped ports (--mom-port wave for de-embedded ones)")
-        S, names, zref, info = solve(run.m, run.freq, dmax=s.mom_dmax, port=port,
-                                     max_solves=s.mom_solves, sigma=s.sigma, rough=getattr(s, 'rough', None), finish=run_finish(run),
-                                     log=run.log, hold=self._held, tiled=s.mom_tiled,
-                                     core=s.mom_core, **_mesh_kw(s, run.m),
-                                     keep_at=[f * 1e9 for f in s.mom_dump or []] + _far_field_seeds(run),
-                                     progress=lambda k, n, f: (run.status('mom25d', dict(fraction=k / n, solves=k,
-                                                                                         f_ghz=f / 1e9)), stop.check()),
-                                     on_step=lambda h: run.status('mom25d', dict(afs_solves=h['solves'],
-                                                                                 change=h['change'], pred=h['pred'],
-                                                                                 tol=h['tol'])))
+        def one(dmax, finest=True):
+            return solve(run.m, run.freq, dmax=dmax, port=port,
+                         max_solves=s.mom_solves, sigma=s.sigma, rough=getattr(s, 'rough', None), finish=run_finish(run),
+                         log=run.log, hold=self._held if finest else {}, tiled=s.mom_tiled,
+                         core=s.mom_core, **_mesh_kw(s, run.m),
+                         keep_at=([f * 1e9 for f in s.mom_dump or []] + _far_field_seeds(run)) if finest else [],
+                         progress=lambda k, n, f: (run.status('mom25d', dict(fraction=k / n, solves=k,
+                                                                             f_ghz=f / 1e9)), stop.check()),
+                         on_step=lambda h: run.status('mom25d', dict(afs_solves=h['solves'],
+                                                                     change=h['change'], pred=h['pred'],
+                                                                     tol=h['tol'])))
+        levels = sorted({float(f) for f in (getattr(s, 'mom_converge', None) or []) if float(f) > 0})
+        if len(levels) >= 2:                                        # (R-E3: mom25d had no convergence check)
+            solved = []
+            for f in levels:
+                run.log(f"mom25d: mesh level x{f:g} (cells up to {s.mom_dmax / f:g} mm)")
+                solved.append((f, one(s.mom_dmax / f, finest=f == levels[-1])))
+            S, names, zref, info = solved[-1][1]
+            conv = mesh_convergence(solved[-2][1][0], S, names)
+            conv.update(levels=levels, unknowns=[r[3]['unknowns'] for _, r in solved])
+            info['converge'] = conv
+            run.log(f"mom25d mesh convergence: x{levels[-2]:g} against x{levels[-1]:g}: {conv['db']:.3f} dB, "
+                    f"{conv['deg']:.2f} deg at most (worst {conv['worst']}; {'converged' if conv['converged'] else 'NOT converged'}: within "
+                    f"{CONVERGE_TOL[0]:g} dB and {CONVERGE_TOL[1]:g} deg)")
+        else:
+            S, names, zref, info = one(s.mom_dmax)
         kinds = ", ".join(f"{p['name']} {p['kind']}" for p in info['ports'])
         info.update(kpi=f"{info['unknowns']:,} unknowns, {info['seconds']:.0f} s",
                     about=f"mom25d, a 2.5D Method-of-Moments solver: {info['unknowns']:,} unknowns ({info['triangles']:,} "

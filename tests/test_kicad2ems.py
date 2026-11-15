@@ -385,3 +385,21 @@ def test_mixed_models_the_board_with_mom25d_s_options(monkeypatch):
     with pytest.raises(Stop):
         mixed.solve_mixed(board, np.array([1e9, 2e9]), model_kw=_model_kw(s), coarsen=4, quad_tol=20.0)
     assert seen['planes'] == 'holes' and seen['stitching_pads'] == 'keep' and seen['wideband'] == 2e9
+
+
+def test_mesh_convergence_of_two_levels():
+    """--mom-converge's comparison (R-E3): the largest change in dB and degrees over the points above -40 dB, the
+    term it is on, and the verdict against 0.1 dB / 2 deg, as the FDTD layer's check."""
+    import numpy as np
+    from mom25d.kicad2ems.mom import mesh_convergence
+    S = np.zeros((3, 2, 2), complex)
+    S[:, 0, 1] = S[:, 1, 0] = 0.9
+    S[:, 0, 0] = 0.2
+    T = S.copy()
+    T[:, 0, 1] *= 10 ** (0.05 / 20)                                 # 0.05 dB on S21
+    c = mesh_convergence(T, S, ['P1', 'P2'])
+    assert c['converged'] and c['db'] == pytest.approx(0.05) and c['worst'] == 'S(P1,P2)'
+    T[:, 0, 0] *= np.exp(1j * np.radians(5))                        # 5 degrees on S11
+    assert not mesh_convergence(T, S)['converged'] and mesh_convergence(T, S)['deg'] == pytest.approx(5)
+    T[:, 1, 1] = 1e-4                                               # below -40 dB: not compared
+    assert mesh_convergence(T, S)['db'] == pytest.approx(0.05)
