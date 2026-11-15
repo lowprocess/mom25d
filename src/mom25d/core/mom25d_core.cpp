@@ -15,6 +15,7 @@
 //   radial_table_sum: sum_q D(|P[t, q] - V[v]|) W[t, q], D a radial table (via.Table1D): each via's smooth kernel
 //                   on the triangles' quadrature points (sim._via_blocks; a Python loop over the vias had been
 //                   1.5 s of a 8 s solve with 888 of them)
+//   slot_coupling : an opening's TM potential and TE field moments against a layer's strip triangles (slots.py)
 //   scale_c64     : Z <- D Z D (equilibration) and its complex64 copy, one pass (the GPU LU's input)
 //   fan_q         : G_q moments between every triangle and the via fan triangles (centroid rule)
 //   near_q        : the near pairs' G_q moment corrections alone (the loop/tree basis's charge matrix)
@@ -35,6 +36,7 @@
 #include <cstdint>
 #include <chrono>
 #include <string>
+#include <array>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -1295,6 +1297,133 @@ py::array_t<cd> radial_table_sum(arr<double> px, arr<double> py_, arr<double> W,
 }
 
 // ---------------------------------------------------------------------------------------------
+// slot_coupling: the triangle-pair moments of an opening's kernels between every strip triangle t (on one metal
+// interface, dz from the plane) and every triangle u of an opening (slots.coupling's, which this mirrors): the TM
+// potential's  M1 = int g_x, M2 = int g_y, M3 = int g_y x' - g_x y'  (g = P(rho) rho^), and the TE tensor's
+// T0 = int T (xx, xy, yy), Ro = int r . T (x, y), Ws = int T . w' (x, y), RW = int r . T . w'  (T = U0 I + U2 R2,
+// w' = (-y', x')). A pair at least near x (the larger triangle's size) apart, the height counted, takes one point
+// each (centroids); a nearer one the 6-point rule on both triangles, each subdivided 4^L times, L from its size
+// against the closer of the pair's distance and the height (at most sub_max). out: (11, nt, nu), strip-parallel.
+// ---------------------------------------------------------------------------------------------
+static void sub_rule(int level, std::vector<double> &bar, std::vector<double> &w)
+{
+    static const double a1 = 0.445948490915965, a2 = 0.091576213509771;
+    static const double B6[6][3] = {{1 - 2 * a1, a1, a1}, {a1, 1 - 2 * a1, a1}, {a1, a1, 1 - 2 * a1},
+                                    {1 - 2 * a2, a2, a2}, {a2, 1 - 2 * a2, a2}, {a2, a2, 1 - 2 * a2}};
+    static const double W6[6] = {0.223381589678011, 0.223381589678011, 0.223381589678011,
+                                 0.109951743655322, 0.109951743655322, 0.109951743655322};
+    std::vector<std::array<double, 9>> tri{{1, 0, 0, 0, 1, 0, 0, 0, 1}};
+    for (int l = 0; l < level; ++l) {
+        std::vector<std::array<double, 9>> nxt;
+        for (auto &t : tri) {
+            double v[3][3], m01[3], m12[3], m20[3];
+            for (int i = 0; i < 3; ++i) for (int k = 0; k < 3; ++k) v[i][k] = t[i * 3 + k];
+            for (int k = 0; k < 3; ++k) {
+                m01[k] = 0.5 * (v[0][k] + v[1][k]); m12[k] = 0.5 * (v[1][k] + v[2][k]); m20[k] = 0.5 * (v[2][k] + v[0][k]);
+            }
+            auto mk = [](const double *a, const double *b, const double *c) {
+                return std::array<double, 9>{a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]};
+            };
+            nxt.push_back(mk(v[0], m01, m20)); nxt.push_back(mk(m01, v[1], m12));
+            nxt.push_back(mk(m20, m12, v[2])); nxt.push_back(mk(m01, m12, m20));
+        }
+        tri.swap(nxt);
+    }
+    bar.clear(); w.clear();
+    for (auto &t : tri)
+        for (int q = 0; q < 6; ++q) {
+            for (int k = 0; k < 3; ++k)
+                bar.push_back(B6[q][0] * t[0 + k] + B6[q][1] * t[3 + k] + B6[q][2] * t[6 + k]);
+            w.push_back(W6[q] / (double)tri.size());
+        }
+}
+
+py::array_t<cd> slot_coupling(arr<double> Vt, arr<double> At, arr<double> St, arr<double> Vu, arr<double> Au,
+                              arr<double> Su, double dz, arr<cd> tabP, arr<cd> tabU, double dr, double near,
+                              int sub_max) {
+    const i64 nt = Vt.shape(0), nu = Vu.shape(0), n = tabP.shape(0);
+    if (Vt.ndim() != 3 || Vt.shape(1) != 3 || Vt.shape(2) != 2 || Vu.ndim() != 3 || Vu.shape(1) != 3 || Vu.shape(2) != 2)
+        throw std::invalid_argument("slot_coupling: Vt, Vu must be (n, 3, 2)");
+    if (tabU.ndim() != 2 || tabU.shape(0) != n || tabU.shape(1) != 2 || n < 2 || !(dr > 0))
+        throw std::invalid_argument("slot_coupling: tabP (n,), tabU (n, 2) on one grid of step dr > 0");
+    sub_max = std::max(0, std::min(sub_max, 4));
+    std::vector<std::vector<double>> rb(sub_max + 1), rw(sub_max + 1);
+    for (int l = 0; l <= sub_max; ++l) sub_rule(l, rb[l], rw[l]);
+    py::array_t<cd> out({(i64)11, nt, nu});
+    cd *o = out.mutable_data();
+    const double *vt = Vt.data(), *at = At.data(), *st = St.data(), *vu = Vu.data(), *au = Au.data(), *su = Su.data();
+    const cd *P = tabP.data(), *U = tabU.data();
+    const double top = (double)n - 1.000001;
+    const size_t plane = (size_t)nt * nu;
+    {
+        py::gil_scoped_release nogil;
+#pragma omp parallel
+        {
+            std::vector<double> pt, pu, wt, wu;
+#pragma omp for schedule(dynamic, 8)
+            for (i64 t = 0; t < nt; ++t) {
+                const double *T = vt + t * 6;
+                const double ctx = (T[0] + T[2] + T[4]) / 3, cty = (T[1] + T[3] + T[5]) / 3;
+                for (i64 u = 0; u < nu; ++u) {
+                    const double *Q = vu + u * 6;
+                    const double cux = (Q[0] + Q[2] + Q[4]) / 3, cuy = (Q[1] + Q[3] + Q[5]) / 3;
+                    const double ddx = ctx - cux, ddy = cty - cuy, d2 = ddx * ddx + ddy * ddy;
+                    const double size = std::max(st[t], su[u]);
+                    cd m[11];
+                    for (int k = 0; k < 11; ++k) m[k] = cd(0.0, 0.0);
+                    auto acc = [&](double ox, double oy, double sx, double sy, double w) {
+                        const double dx = ox - sx, dy = oy - sy, rho = std::hypot(dx, dy);
+                        const double cs = rho > 0 ? dx / rho : 0.0, sn = rho > 0 ? dy / rho : 0.0;
+                        const double uu = std::min(rho / dr, top);
+                        const i64 i = (i64)uu;
+                        const double f = uu - (double)i;
+                        const cd p = (P[i] * (1.0 - f) + P[i + 1] * f) * w;
+                        const cd u0 = (U[2 * i] * (1.0 - f) + U[2 * i + 2] * f) * w;
+                        const cd u2 = (U[2 * i + 1] * (1.0 - f) + U[2 * i + 3] * f) * w;
+                        const cd gx = p * cs, gy = p * sn;
+                        m[0] += gx; m[1] += gy; m[2] += gy * sx - gx * sy;
+                        const double c2 = cs * cs - sn * sn, s2 = 2.0 * sn * cs;
+                        const cd txx = u0 + u2 * c2, txy = u2 * s2, tyy = u0 - u2 * c2;
+                        m[3] += txx; m[4] += txy; m[5] += tyy;
+                        m[6] += ox * txx + oy * txy; m[7] += ox * txy + oy * tyy;
+                        const double wx = -sy, wy = sx;
+                        const cd wsx = txx * wx + txy * wy, wsy = txy * wx + tyy * wy;
+                        m[8] += wsx; m[9] += wsy; m[10] += ox * wsx + oy * wsy;
+                    };
+                    if (d2 + dz * dz >= (near * size) * (near * size)) {
+                        acc(ctx, cty, cux, cuy, at[t] * au[u]);
+                    } else {
+                        const double deff = std::max(std::sqrt(d2) - 0.5 * (st[t] + su[u]), dz);
+                        auto lev = [&](double sz) {
+                            double l = std::ceil(std::log2(std::max(sz, 1e-12) / std::max(0.5 * deff, 1e-12)));
+                            return (int)std::max(0.0, std::min((double)sub_max, l));
+                        };
+                        const int lt = lev(st[t]), lu = lev(su[u]);
+                        const std::vector<double> &bt = rb[lt], &bu = rb[lu], &qt = rw[lt], &qu = rw[lu];
+                        const size_t mt = qt.size(), mu = qu.size();
+                        pt.resize(2 * mt); pu.resize(2 * mu);
+                        for (size_t a = 0; a < mt; ++a) {
+                            pt[2 * a] = bt[3 * a] * T[0] + bt[3 * a + 1] * T[2] + bt[3 * a + 2] * T[4];
+                            pt[2 * a + 1] = bt[3 * a] * T[1] + bt[3 * a + 1] * T[3] + bt[3 * a + 2] * T[5];
+                        }
+                        for (size_t b = 0; b < mu; ++b) {
+                            pu[2 * b] = bu[3 * b] * Q[0] + bu[3 * b + 1] * Q[2] + bu[3 * b + 2] * Q[4];
+                            pu[2 * b + 1] = bu[3 * b] * Q[1] + bu[3 * b + 1] * Q[3] + bu[3 * b + 2] * Q[5];
+                        }
+                        const double aa = at[t] * au[u];
+                        for (size_t a = 0; a < mt; ++a)
+                            for (size_t b = 0; b < mu; ++b)
+                                acc(pt[2 * a], pt[2 * a + 1], pu[2 * b], pu[2 * b + 1], aa * qt[a] * qu[b]);
+                    }
+                    for (int k = 0; k < 11; ++k) o[k * plane + (size_t)t * nu + u] = m[k];
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------------
 // out[s, i] = sum_k J0(rho_i kr_k) W[s, k] for real kr (glibc's j0), rho-parallel
 // ---------------------------------------------------------------------------------------------
 py::array_t<cd> hankel_real(arr<double> rho, arr<double> kr, arr<cd> W) {
@@ -1504,6 +1633,7 @@ PYBIND11_MODULE(_core, m) {
     m.def("hankel_real", &hankel_real, "sum_k J0(rho kr_k) W[s, k] for real kr");
     m.def("bessel_real_sum", &bessel_real_sum, "sum_k J_n(rho kr_k) W[s, k] for real kr, n = 0, 1, 2");
     m.def("radial_table_sum", &radial_table_sum, "sum_q D(|P[t, q] - V[v]|) W[t, q] of a radial table D");
+    m.def("slot_coupling", &slot_coupling, "an opening's TM / TE pair moments against a layer's strips (slots.py)");
     m.def("scale_c64", &scale_c64, "Z <- D Z D in place, and its complex64 copy");
     m.def("fan_q", &fan_q, "G_q moments between every triangle and the fan triangles");
     m.def("project", &project_t<cd>, "T^T Z T (quad cells, line functions), complex128, Z overwritten");

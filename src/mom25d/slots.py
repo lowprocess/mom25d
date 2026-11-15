@@ -250,9 +250,11 @@ def self_block(slots, table, w, near_fac=5.0, cache=None):
         for M, v in zip(out, offplane_moments(table.cAi, table.cqi, m)):
             M[pp, qq] += v
     A0, Axo, Ayo, _, _, Arr, Q0 = out
-    SA = table.cA * combine(r, c['Mrr'], c['Mr'][..., 0], c['Mr'][..., 1], c['M0'])
-    Y = 1j * w * (SA + combine(r, sym(Arr), Axo, Ayo, sym(A0))) + \
-        (table.cq * qform(r.D, c['M0'], r.D) + qform(r.D, sym(Q0), r.D)) / (1j * w)
+    if 'SA1' not in c:                                       # the 1/R parts' combination, once (scaled each time)
+        c['SA1'] = combine(r, c['Mrr'], c['Mr'][..., 0], c['Mr'][..., 1], c['M0'])
+        c['SQ1'] = qform(r.D, c['M0'], r.D)
+    Y = 1j * w * (table.cA * c['SA1'] + combine(r, sym(Arr), Axo, Ayo, sym(A0))) + \
+        (table.cq * c['SQ1'] + qform(r.D, sym(Q0), r.D)) / (1j * w)
     Y = 0.5 * (Y + Y.T)
     o = c['order']
     return Y[np.ix_(o, o)]
@@ -301,6 +303,67 @@ def _te_moments(T, ro, ru):
     return (txx, txy, tyy), (rox, roy), (wsx, wsy), ro[0] * wsx + ro[1] * wsy
 
 
+CHUNK = 4_000_000       # strip triangles x opening triangles a pass of coupling's moments (11 complex each: 0.7 GB)
+
+
+def _moments(sim, idx, s, dz, P, U):
+    """(M1, M2, M3, T0, Ro, Ws, RW) of the strip triangles idx against the opening s's triangles (module doc,
+    _te_moments): the compiled core's slot_coupling where it is built, else the same in NumPy."""
+    from .fast import _core
+    r, rs = sim.rwg, s.rwg
+    if _core is not None and hasattr(_core, 'slot_coupling'):
+        m = _core.slot_coupling(np.ascontiguousarray(r.nodes[r.tris[idx]], float), r.area[idx], sim.tri_size[idx],
+                                np.ascontiguousarray(rs.nodes[rs.tris], float), rs.area, s.size, float(dz),
+                                np.ascontiguousarray(P.v, complex), np.ascontiguousarray(U.v, complex),
+                                float(P._dr), float(NEAR), int(SUB_MAX))
+        return m[0], m[1], m[2], (m[3], m[4], m[5]), (m[6], m[7]), (m[8], m[9]), m[10]
+    Vs = rs.nodes[rs.tris]
+    ct, cu = r.cent[idx], rs.cent
+    dx, dy = ct[:, 0, None] - cu[None, :, 0], ct[:, 1, None] - cu[None, :, 1]
+    wgt = r.area[idx][:, None] * rs.area[None, :]
+    ru = (cu[None, :, 0] + 0 * dx, cu[None, :, 1] + 0 * dy)
+    ro = (ct[:, 0, None] + 0 * dx, ct[:, 1, None] + 0 * dy)
+    (M1, M2, M3), T = _tm_te_moments(dx, dy, wgt, ru, P, U)
+    T0, Ro, Ws, RW = _te_moments(T, ro, ru)
+    size = np.maximum(sim.tri_size[idx][:, None], s.size[None, :])
+    pi_, qi_ = np.nonzero(dx ** 2 + dy ** 2 + dz ** 2 < (NEAR * (size + 0 * dx)) ** 2)
+    if len(pi_):
+        # each near pair's rule from its own distance: subdivided to the scale of the closer of its distance and
+        # the height (the kernel's), grouped by (strip level, opening level)
+        dd = np.sqrt(dx[pi_, qi_] ** 2 + dy[pi_, qi_] ** 2)
+        st_, su_ = sim.tri_size[idx][pi_], s.size[qi_]
+        deff = np.maximum(dd - 0.5 * (st_ + su_), dz)
+        lev = lambda sz: np.clip(np.ceil(np.log2(np.maximum(sz, 1e-12) / np.maximum(0.5 * deff, 1e-12))),
+                                 0, SUB_MAX).astype(int)
+        Lt_, Lu_ = lev(st_), lev(su_)
+        for Lt, Lu in sorted(set(zip(Lt_.tolist(), Lu_.tolist()))):
+            g = np.flatnonzero((Lt_ == Lt) & (Lu_ == Lu))
+            gp, gq = pi_[g], qi_[g]
+            bt, wt = _sub_points(Lt)
+            bu, wu = _sub_points(Lu)
+            Pt = np.einsum('qk,pkc->pqc', bt, r.nodes[r.tris[idx[gp]]])
+            Pu = np.einsum('qk,pkc->pqc', bu, Vs[gq])
+            Wt = r.area[idx[gp]][:, None] * wt[None, :]
+            Wu = rs.area[gq][:, None] * wu[None, :]
+            chunk = max(1, 2_000_000 // (Pt.shape[1] * Pu.shape[1]))
+            for c0 in range(0, len(gp), chunk):
+                sl = slice(c0, c0 + chunk)
+                a, b = Pt[sl][:, :, None, :], Pu[sl][:, None, :, :]
+                ddx, ddy = a[..., 0] - b[..., 0], a[..., 1] - b[..., 1]
+                ww = Wt[sl][:, :, None] * Wu[sl][:, None, :]
+                rub = (b[..., 0] + 0 * ddx, b[..., 1] + 0 * ddy)
+                roa = (a[..., 0] + 0 * ddx, a[..., 1] + 0 * ddy)
+                (m1, m2, m3), t = _tm_te_moments(ddx, ddy, ww, rub, P, U)
+                t0, ro_, ws_, rw_ = _te_moments(t, roa, rub)
+                ii, jj = gp[sl], gq[sl]
+                for M, v in ((M1, m1), (M2, m2), (M3, m3), (RW, rw_)):
+                    M[ii, jj] = v.sum((1, 2))
+                for Ms, vs_ in ((T0, t0), (Ro, ro_), (Ws, ws_)):
+                    for M, v in zip(Ms, vs_):
+                        M[ii, jj] = v.sum((1, 2))
+    return M1, M2, M3, T0, Ro, Ws, RW
+
+
 def _plane_potential(rho):
     """P on the plane itself: -(1/2 pi) int J1(kr rho) dkr = -1 / (2 pi rho)."""
     return -1.0 / (2 * np.pi * np.maximum(rho, 1e-12))
@@ -322,71 +385,31 @@ def coupling(sim, slots, kern, B, C, col0):
         for k in sim.layers:
             if (s.k, k) not in kern.P:
                 continue
-            idx = sim.tri_idx[k]
-            if not len(idx):
+            idx_all = sim.tri_idx[k]
+            if not len(idx_all):
                 continue
             dz = abs(st.z[k] - st.z[s.k])
             P, U = kern.P[(s.k, k)], kern.U[(s.k, k)]
-            ct, cu = r.cent[idx], rs.cent
-            dx, dy = ct[:, 0, None] - cu[None, :, 0], ct[:, 1, None] - cu[None, :, 1]
-            wgt = r.area[idx][:, None] * rs.area[None, :]
-            ru = (cu[None, :, 0] + 0 * dx, cu[None, :, 1] + 0 * dy)
-            ro = (ct[:, 0, None] + 0 * dx, ct[:, 1, None] + 0 * dy)
-            (M1, M2, M3), T = _tm_te_moments(dx, dy, wgt, ru, P, U)
-            T0, Ro, Ws, RW = _te_moments(T, ro, ru)
-            # near pairs: both triangles subdivided to the height's scale
-            size = np.maximum(sim.tri_size[idx][:, None], s.size[None, :])
-            pi_, qi_ = np.nonzero(dx ** 2 + dy ** 2 + dz ** 2 < (NEAR * (size + 0 * dx)) ** 2)
-            if len(pi_):
-                # each near pair's rule from its own distance: subdivided to the scale of the closer of its distance
-                # and the height (the kernel's), grouped by (strip level, opening level)
-                dd = np.sqrt(dx[pi_, qi_] ** 2 + dy[pi_, qi_] ** 2)
-                st_, su_ = sim.tri_size[idx][pi_], s.size[qi_]
-                deff = np.maximum(dd - 0.5 * (st_ + su_), dz)
-                lev = lambda sz: np.clip(np.ceil(np.log2(np.maximum(sz, 1e-12) / np.maximum(0.5 * deff, 1e-12))),
-                                         0, SUB_MAX).astype(int)
-                Lt_, Lu_ = lev(st_), lev(su_)
-                for Lt, Lu in sorted(set(zip(Lt_.tolist(), Lu_.tolist()))):
-                    g = np.flatnonzero((Lt_ == Lt) & (Lu_ == Lu))
-                    gp, gq = pi_[g], qi_[g]
-                    bt, wt = _sub_points(Lt)
-                    bu, wu = _sub_points(Lu)
-                    Pt = np.einsum('qk,pkc->pqc', bt, r.nodes[r.tris[idx[gp]]])       # (np, nt, 2)
-                    Pu = np.einsum('qk,pkc->pqc', bu, Vs[gq])                         # (np, nu, 2)
-                    Wt = r.area[idx[gp]][:, None] * wt[None, :]
-                    Wu = s.rwg.area[gq][:, None] * wu[None, :]
-                    chunk = max(1, 2_000_000 // (Pt.shape[1] * Pu.shape[1]))
-                    for c0 in range(0, len(gp), chunk):
-                        sl = slice(c0, c0 + chunk)
-                        a, b = Pt[sl][:, :, None, :], Pu[sl][:, None, :, :]
-                        ddx, ddy = a[..., 0] - b[..., 0], a[..., 1] - b[..., 1]
-                        ww = Wt[sl][:, :, None] * Wu[sl][:, None, :]
-                        rub = (b[..., 0] + 0 * ddx, b[..., 1] + 0 * ddy)
-                        roa = (a[..., 0] + 0 * ddx, a[..., 1] + 0 * ddy)
-                        (m1, m2, m3), t = _tm_te_moments(ddx, ddy, ww, rub, P, U)
-                        t0, ro_, ws_, rw_ = _te_moments(t, roa, rub)
-                        ii, jj = gp[sl], gq[sl]
-                        for M, v in ((M1, m1), (M2, m2), (M3, m3), (RW, rw_)):
-                            M[ii, jj] = v.sum((1, 2))
-                        for Ms, vs_ in ((T0, t0), (Ro, ro_), (Ws, ws_)):
-                            for M, v in zip(Ms, vs_):
-                                M[ii, jj] = v.sum((1, 2))
-            # TM: the potential over each strip triangle, tested with the divergence (and the fans' charge)
-            psi = vs(M1, M2, M3)                                           # (len(idx), n)
-            Dk = r.D[idx]
-            B[:, cols] -= np.asarray(Dk.T @ psi)
-            if len(F) and Nc:
-                here = [(pos_F[int(t)], j) for j, t in enumerate(idx) if int(t) in pos_F]
-                if here:
-                    fi, li = np.array(here).T
-                    C[:Nc, cols] -= np.asarray(sim.dF[fi, :Nc].T @ psi[li])
-            # TE: the field on the edges themselves: -<f, T E>, f = Aal r - (Bx, By), E = Aal' w' + (By', -Bx')
-            (txx, txy, tyy), (rox, roy), (wsx, wsy) = T0, Ro, Ws
-            Aal_k, Bx_k, By_k = r.Aal[idx], r.Bx[idx], r.By[idx]
-            te = Aal_k.T @ (RW @ Aal_s + rox @ By_s - roy @ Bx_s)
-            te = te - Bx_k.T @ (wsx @ Aal_s) - By_k.T @ (wsy @ Aal_s)
-            te = te - Bx_k.T @ (txx @ By_s - txy @ Bx_s) - By_k.T @ (txy @ By_s - tyy @ Bx_s)
-            B[:, cols] -= np.asarray(te)
+            per = max(1, CHUNK // max(len(rs.tris), 1))           # strip triangles a pass (11 moments each)
+            for c0 in range(0, len(idx_all), per):
+                idx = idx_all[c0:c0 + per]
+                M1, M2, M3, T0, Ro, Ws, RW = _moments(sim, idx, s, dz, P, U)
+                # TM: the potential over each strip triangle, tested with the divergence (and the fans' charge)
+                psi = vs(M1, M2, M3)                                           # (len(idx), n)
+                Dk = r.D[idx]
+                B[:, cols] -= np.asarray(Dk.T @ psi)
+                if len(F) and Nc:
+                    here = [(pos_F[int(t)], j) for j, t in enumerate(idx) if int(t) in pos_F]
+                    if here:
+                        fi, li = np.array(here).T
+                        C[:Nc, cols] -= np.asarray(sim.dF[fi, :Nc].T @ psi[li])
+                # TE: the field on the edges themselves: -<f, T E>, f = Aal r - (Bx, By), E = Aal' w' + (By', -Bx')
+                (txx, txy, tyy), (rox, roy), (wsx, wsy) = T0, Ro, Ws
+                Aal_k, Bx_k, By_k = r.Aal[idx], r.Bx[idx], r.By[idx]
+                te = Aal_k.T @ (RW @ Aal_s + rox @ By_s - roy @ Bx_s)
+                te = te - Bx_k.T @ (wsx @ Aal_s) - By_k.T @ (wsy @ Aal_s)
+                te = te - Bx_k.T @ (txx @ By_s - txy @ Bx_s) - By_k.T @ (txy @ By_s - tyy @ Bx_s)
+                B[:, cols] -= np.asarray(te)
         # the chains' remainder (their part of int E_z dz that is not the potential's), by span
         if Nc:
             spans = {}
