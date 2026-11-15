@@ -489,6 +489,10 @@ class Mixed(MoM25D):
                 f"{info['seconds']:.0f} s")
         return Result(S, names, zref, info['seconds'], info=info, comment=f"mixed: mom25d + lines ({run.name})")
 
+    def reusable(self, run):
+        """An earlier run's S may stand for this one's solve (kicad2ems 2.12) unless it asks for current dumps."""
+        return not run.s.mom_dump
+
     def outputs(self, run, prep, res):
         """The current dumps (--mom-dump) of the joined solution: <out>/mixed/exc_<port>/."""
         h = getattr(self, '_held', None)

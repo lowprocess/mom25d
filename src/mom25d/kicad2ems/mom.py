@@ -665,6 +665,11 @@ class MoM25D(Solver):
         run.log(f"mom25d: {info['solves']} EM solves, {info['seconds']:.0f} s")
         return Result(S, names, zref, info['seconds'], info=info, comment=f"mom25d 2.5D MoM ({run.name})")
 
+    def reusable(self, run):
+        """An earlier run's S may stand for this one's solve (kicad2ems 2.12) unless this run asks for what only
+        a solve leaves: the far field (antenna mode) or current dumps."""
+        return not getattr(run, 'antenna', False) and not run.s.mom_dump
+
     def outputs(self, run, prep, res):
         held = getattr(self, '_held', {}).get('res')
         if held is not None:                                        # beside the preview's: the mesh it solved on
