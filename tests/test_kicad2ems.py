@@ -287,7 +287,9 @@ def test_mixed_cuts_a_coupled_pair_as_two_modal_lines(monkeypatch):
     board = NS(to_dict=lambda: data, ports=[NS(name=p['name']) for p in data['ports']])
     log, hold = [], {}
     S, names, zref, info = mixed.solve_mixed(board, freq, log=log.append, hold=hold, max_solves=24)
-    assert info['cuts'] == 1 and info['pairs'] == 1 and info['cut_mm'] > 25 and info['unknowns'] < 0.65 * ref.unknowns
+    # (the unknowns: under two thirds of mom25d's at dmax everywhere; with the cells grown to the wavelength's size
+    # along straight runs, 2026-11-15, mom25d's own long lines cost little and the cut saves next to nothing)
+    assert info['cuts'] == 1 and info['pairs'] == 1 and info['cut_mm'] > 25 and info['unknowns'] <= ref.unknowns
     assert any('a pair w=0.380 mm, 0.300 mm apart' in line for line in log)
     assert [j['mode'] for j in hold['joins']] == ['d', 'c'] and len(hold['stretches']) == 2
     assert [share for _, share in hold['stretches'][1]['of']] == [-1.0, 0.5]        # I- = Ic / 2 - Id

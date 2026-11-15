@@ -3,26 +3,27 @@ cdtmesh - the points of geo.mesh_polygons' triangulation: CDT (the compiled core
 CDT vendored in core/CDT, MPL-2.0) triangulates; the points inside the copper are placed here. The same file in
 mom25d (mom25d/cdtmesh.py) and pcbqs (pcbqs/_numerics/cdtmesh.py).
 
-    T = mesh(V, segs, limit, inside, core, lattice=False, frozen=None, sizes=(1.0,), min_angle=0, max_steiner=0)
+    T = mesh(V, segs, limit, inside, core, frozen=None, sizes=(1.0,), min_angle=0, max_steiner=0)
 
 V (n, 2), segs (m, 2): geo's vertices and constraint segments, in its units (the layer's dmax). limit(C): the
 largest area of a triangle whose centroid is at C (<= 0: no limit). inside(P): whether P is in the copper. core: the
 package's compiled core. frozen(P): where no point is to be placed (the structured runs' cells; None: nowhere).
 
-  rounds   each round, the circumcentre of every triangle over its limit (its centroid where the circumcentre falls
-           outside the copper or near a segment), kept apart from each other and from the vertices (where neither
-           has room: the triangle's longest edge split at its middle, a segment's halves segments), then the whole
-           triangulated again; until no triangle is over (MAX_ROUNDS). Unlike Triangle's refinement, which leaves
-           its triangles at about half their limit (and misses the limits of regions its flood fill does not reach),
-           the triangles end near their limits: mom25d's cell sizes were set on Triangle's meshes (sim.py: planes)
-  lattice  (experimental) first square lattices at the local cell size h = sqrt(2 limit) (each square two triangles
-           just under the limit), on a ladder of sizes 2^k of each region's own (sizes), half a cell clear of the
-           segments; then the rounds for what is left. Its squares pair into quad cells (mom25d's quads.py)
+  seed     a hexagonal lattice at the local cell size (equilateral cells just under the limit): each region's own
+           lattice where the cell size is that region's (sizes), and where it is graded (coarsening) the finest
+           lattice thinned to the local size
+  rounds   what the seed left over its limit: each round, the circumcentre of every such triangle (its centroid
+           where the circumcentre falls outside the copper or near a segment), kept apart from each other and from
+           the vertices (where neither has room: the triangle's longest edge split at its middle, a segment's halves
+           segments), then the whole triangulated again (MAX_ROUNDS)
+  smooth   ODT passes over the placed points (each to the area-weighted mean of its triangles' circumcentres; the
+           outlines' points stay), then the limits again, to POST_TOL
   min_angle (degrees) at the end, no triangle with a smaller angle (CDT's Ruppert refinement, segments split where
            encroached, at most max_steiner points; pcbqs's DC and thermal meshes: 25)
 
-Returns dict(vertices, triangles, info): V first, in its order (the triangles outside the outline left out; geo
-also drops those in its holes), info dict(rounds, added, lattice, over, steiner).
+Against Triangle, which this replaced (2026-11-15): on mom25d's Solver Matrix boards the same S within 0.005 on all
+but a few, with 2-10 % fewer unknowns. Returns dict(vertices, triangles, info): V first, in its order (the triangles
+outside the outline left out; geo also drops those in its holes), info dict(rounds, added, seed, over, steiner).
 """
 import numpy as np
 import shapely
@@ -32,7 +33,6 @@ MAX_ROUNDS = 60
 TOL = 1e-6           # a triangle over its limit by more than this (relative) is refined
 SEP = 0.5            # a new point at least this many cells (h) from every other
 EDGE_SEP = 0.4       # a circumcentre this close to a segment (cells): the triangle's centroid instead
-LATTICE = 0.98       # the lattice's spacing, of the ladder's size (just under the limit)
 SPLIT_EDGE = 0.25    # an edge's middle at least this many cells (h) from the vertices to split it there
 SPLIT_SEG = 0.02     # a segment's (its middle may come close to copper across it: 0.06 h on rf_msvia's planes)
 MIN_DIST = 1e-10     # cdt_triangulate: a point this close to a segment (dmax) is on it
@@ -91,55 +91,6 @@ def _spaced(P, h, prio):
     return keep
 
 
-def _ladder(h, sizes):
-    """Each h's lattice spacing: the largest size x 2^k (k integer, any of sizes) not above it."""
-    h = np.maximum(np.asarray(h, float), 1e-300)
-    return np.max([a * 2.0 ** np.floor(np.log2(h / a) + 1e-9) for a in sizes], axis=0)
-
-
-def _lattice(V, limit, inside, frozen, dseg, sizes=(1.0,)):
-    """Points of square lattices at the local cell size h = sqrt(2 limit): spacing LATTICE x _ladder(h, sizes) (geo's
-    units: the layer's dmax; sizes: the regions' own cell sizes, so each gets its own exactly), half a cell clear of
-    the segments and the vertices, and of the coarser lattices' points."""
-    lo, hi = V.min(0), V.max(0)
-    probe = np.vstack([V, lo + (hi - lo) * np.random.default_rng(0).random((4096, 2))])
-    probe = probe[inside(probe)]
-    lim = limit(probe)
-    lim = lim[lim > 0]
-    if not len(lim):
-        return np.zeros((0, 2))
-    hs = np.sqrt(2 * lim)
-    steps = sorted({float(a * 2.0 ** k) for a in sizes
-                    for k in range(int(np.floor(np.log2(hs.min() / a))) - 1, int(np.floor(np.log2(hs.max() / a))) + 1)
-                    if hs.min() / 2 <= a * 2.0 ** k <= hs.max() * (1 + 1e-9)}, reverse=True)
-    vt = cKDTree(V)
-    out = []
-    for step in steps:
-        s = LATTICE * step
-        nx, ny = int(np.ceil((hi[0] - lo[0]) / s)) + 1, int(np.ceil((hi[1] - lo[1]) / s)) + 1
-        if nx * ny > 2e7:
-            raise RuntimeError(f"cdtmesh: a lattice of {nx * ny:,} points (spacing {s:.3g} dmax)")
-        X, Y = np.meshgrid(lo[0] + s * (np.arange(nx) + 0.5), lo[1] + s * (np.arange(ny) + 0.5))
-        P = np.column_stack([X.ravel(), Y.ravel()])
-        P = P[inside(P)]
-        if frozen is not None and len(P):
-            P = P[~frozen(P)]
-        if not len(P):
-            continue
-        lp = limit(P)
-        on = lp > 0
-        on[on] = np.abs(_ladder(np.sqrt(2 * lp[on]), sizes) - step) <= 1e-9 * step
-        P = P[on]
-        if not len(P):
-            continue
-        P = P[(dseg(P) >= 0.5 * s) & (vt.query(P)[0] >= 0.5 * s)]
-        if out and len(P):                                   # clear of the coarser lattices' points
-            P = P[cKDTree(np.vstack(out)).query(P)[0] >= 0.5 * s]
-        if len(P):
-            out.append(P)
-    return np.vstack(out) if out else np.zeros((0, 2))
-
-
 def _circumcentres(P):
     a, b, c = P[:, 0], P[:, 1], P[:, 2]
     ab, ac = b - a, c - a
@@ -151,14 +102,150 @@ def _circumcentres(P):
     return a + np.column_stack([ux, uy])
 
 
-def mesh(V, segs, limit, inside, core, lattice=False, frozen=None, sizes=(1.0,), min_angle=0.0, max_steiner=0):
+HEX = 0.93           # the hexagonal seed's side, of the side whose equilateral triangle is at the limit
+HEX_NEAR = 0.15      # a point takes a region's own lattice where its cell size is within this of the region's
+HEX_SEP = 0.9        # graded copper: seed points at least this x their side apart
+MOVE = 0.3           # smoothing: a point moves at most this many cells (h) a pass
+POST_TOL = 0.3       # after smoothing, a triangle over its limit by more than this is refined again
+SMOOTH = 5           # smoothing passes
+
+
+def _hex(lo, hi, s):
+    """A hexagonal lattice of side s over the box lo..hi."""
+    dy = s * np.sqrt(3) / 2
+    nx, ny = int(np.ceil((hi[0] - lo[0]) / s)) + 2, int(np.ceil((hi[1] - lo[1]) / dy)) + 2
+    if nx * ny > 2e7:
+        raise RuntimeError(f"cdtmesh: a lattice of {nx * ny:,} points (side {s:.3g} dmax)")
+    X, Y = np.meshgrid(np.arange(nx) * s, np.arange(ny) * dy)
+    X = X + (np.arange(ny) % 2)[:, None] * (s / 2)
+    c = 0.5 * (lo + hi) - 0.5 * np.array([(nx - 1) * s, (ny - 1) * dy])
+    return np.column_stack([X.ravel(), Y.ravel()]) + c
+
+
+def _hex_seed(V, limit, inside, frozen, dseg, sizes):
+    """Seed points of equilateral cells: a hexagonal lattice of each region's own size where the cell size
+    is that (sizes), and elsewhere (graded: coarsen's field) the finest lattice thinned to the local size."""
+    lo, hi = V.min(0), V.max(0)
+    side = lambda lim: HEX * np.sqrt(4 * np.clip(lim, 1e-300, None) / np.sqrt(3))
+    vt = cKDTree(V)
+    out = []
+
+    def keep(P, sd):
+        P = P[inside(P)]
+        if frozen is not None and len(P):
+            P = P[~frozen(P)]
+        return P
+
+    def clear(P, sd):
+        ok = (dseg(P) >= 0.5 * sd) & (vt.query(P)[0] >= 0.6 * sd)
+        if out:
+            ok &= cKDTree(np.vstack(out)).query(P)[0] >= 0.8 * sd
+        return ok
+    probe = np.vstack([V, lo + (hi - lo) * np.random.default_rng(0).random((4096, 2))])
+    probe = probe[inside(probe)]
+    lp = np.asarray(limit(probe), float)
+    lp = lp[lp > 0]
+    if not len(lp):
+        return np.zeros((0, 2))
+    hmin = np.sqrt(2 * lp.min())
+    near = lambda h, a: np.abs(h / a - 1) <= HEX_NEAR
+    for a in sorted(set(sizes), reverse=True):                        # each region's own lattice
+        sd = float(side(0.5 * a * a))
+        P = keep(_hex(lo, hi, sd), sd)
+        if not len(P):
+            continue
+        l_ = np.asarray(limit(P), float)
+        on = l_ > 0
+        on[on] = near(np.sqrt(2 * l_[on]), a)
+        P = P[on]
+        if len(P):
+            P = P[clear(P, sd)]
+        if len(P):
+            out.append(P)
+    sd0 = float(side(0.5 * hmin * hmin))                              # the graded rest: thinned
+    P = keep(_hex(lo, hi, sd0), sd0)
+    if len(P):
+        l_ = np.asarray(limit(P), float)
+        on = l_ > 0
+        h = np.sqrt(2 * np.clip(l_, 1e-300, None))
+        for a in sizes:
+            on &= ~near(h, a)
+        P, l_ = P[on], l_[on]
+    if len(P):
+        sd = side(l_)
+        ok = clear(P, sd)
+        P, sd = P[ok], sd[ok]
+    if len(P):
+        # _spaced keeps points SEP x h apart: h here the side scaled so that the distance is HEX_SEP sides
+        k = _spaced(P, sd * (HEX_SEP / SEP), -sd)                     # the finest first
+        out.append(P[k])
+    return np.vstack(out) if out else np.zeros((0, 2))
+
+
+def _smooth(core, V, extra, segs, limit, inside, frozen, dseg, passes):
+    """ODT smoothing of the points placed inside the copper: each to the area-weighted mean of its triangles'
+    circumcentres (the triangle's centroid where that lies outside), at most MOVE cells a pass, kept clear of the
+    segments; the outlines' points and those on segments stay."""
+    nV = len(V)
+    movable = dseg(extra) > 1e-9 if len(extra) else np.zeros(0, bool)
+    for _ in range(passes):
+        if not movable.any():
+            break
+        v, t = triangulate(core, np.vstack([V, extra]), segs)
+        P = v[t]
+        C = P.mean(1)
+        ins = inside(C)
+        t, P, C = t[ins], P[ins], C[ins]
+        A = 0.5 * np.abs((P[:, 1, 0] - P[:, 0, 0]) * (P[:, 2, 1] - P[:, 0, 1])
+                         - (P[:, 1, 1] - P[:, 0, 1]) * (P[:, 2, 0] - P[:, 0, 0]))
+        cc = _circumcentres(P)
+        bad = ~np.isfinite(cc).all(1)
+        cc[bad] = C[bad]
+        far = np.linalg.norm(cc - C, axis=1) > 2 * np.sqrt(A)          # an obtuse triangle's: far outside it
+        cc[far] = C[far]
+        out = ~inside(cc)
+        cc[out] = C[out]
+        n = nV + len(extra)
+        num, den = np.zeros((n, 2)), np.zeros(n)
+        for k in range(3):
+            np.add.at(num, t[:, k], A[:, None] * cc)
+            np.add.at(den, t[:, k], A)
+        cur = extra
+        new = np.where(den[nV:, None] > 0, num[nV:] / np.maximum(den[nV:, None], 1e-300), cur)
+        h = np.sqrt(2 * np.clip(limit(cur), 1e-300, None))
+        d = new - cur
+        L = np.linalg.norm(d, axis=1)
+        new = cur + d * np.minimum(1.0, MOVE * h / np.maximum(L, 1e-300))[:, None]
+        ok = movable & inside(new) & (dseg(new) >= 0.35 * h)
+        if frozen is not None:
+            ok &= ~frozen(new)
+        extra = np.where(ok[:, None], new, cur)
+    return extra
+
+
+def mesh(V, segs, limit, inside, core, frozen=None, sizes=(1.0,), min_angle=0.0, max_steiner=0, smooth=SMOOTH):
     V = np.asarray(V, float)
     segs = np.asarray(segs, int).reshape(-1, 2)
     dseg = _seg_distance(V, segs)
-    extra = _lattice(V, limit, inside, frozen, dseg, sizes) if lattice else np.zeros((0, 2))
-    n_lat, rounds = len(extra), 0
+    limit0 = limit
+    limit = lambda X: np.asarray(limit0(X), float)
+    extra = _hex_seed(V, limit, inside, frozen, dseg, sizes)
+    n_seed = len(extra)
+    extra, segs, rounds, over = _rounds(core, V, extra, segs, limit, inside, frozen, dseg, TOL)
+    if smooth:
+        extra = _smooth(core, V, extra, segs, limit, inside, frozen, dseg, smooth)
+        extra, segs, r2, over = _rounds(core, V, extra, segs, limit, inside, frozen, dseg, POST_TOL)
+        rounds += r2
+    n_in = len(V) + len(extra)
+    v, t = triangulate(core, np.vstack([V, extra]), segs, min_angle, max_steiner)
+    return dict(vertices=v, triangles=t,
+                info=dict(rounds=rounds, added=len(extra) - n_seed, seed=n_seed, over=over, steiner=len(v) - n_in))
+
+
+def _rounds(core, V, extra, segs, limit, inside, frozen, dseg, tol):
+    """The rounds of the module docstring: (extra, segs, rounds, triangles left over their limit)."""
     v, t = triangulate(core, np.vstack([V, extra]), segs)
-    over = 0
+    over = rounds = 0
     for rounds in range(1, MAX_ROUNDS + 1):
         P = v[t]
         C = P.mean(1)
@@ -167,7 +254,7 @@ def mesh(V, segs, limit, inside, core, lattice=False, frozen=None, sizes=(1.0,),
         ins = inside(C)
         lim = np.full(len(C), -1.0)
         lim[ins] = limit(C[ins])
-        bad = ins & (lim > 0) & (A > lim * (1 + TOL))
+        bad = ins & (lim > 0) & (A > lim * (1 + tol))
         over = int(bad.sum())
         if not over:
             break
@@ -181,8 +268,6 @@ def mesh(V, segs, limit, inside, core, lattice=False, frozen=None, sizes=(1.0,),
         cand = np.where(ok[:, None], cc, Cb)
         vtree = cKDTree(v)
         room = vtree.query(cand)[0] >= SEP * h
-        # no room (a long thin triangle, its circumcentre and centroid near a vertex): its longest edge split at its
-        # middle instead, as Triangle splits an encroached segment (a segment's halves become segments)
         tb = t[bad][~room]
         n_in = len(V) + len(extra)
         split = np.zeros((0, 2))
@@ -213,10 +298,4 @@ def mesh(V, segs, limit, inside, core, lattice=False, frozen=None, sizes=(1.0,),
         keep = _spaced(cand, h, prio) if len(cand) else np.zeros(0, bool)
         extra = np.vstack([extra, split, cand[keep]])
         v, t = triangulate(core, np.vstack([V, extra]), segs)
-    steiner = 0
-    if min_angle:
-        n_in = len(V) + len(extra)
-        v, t = triangulate(core, np.vstack([V, extra]), segs, min_angle, max_steiner)
-        steiner = len(v) - n_in
-    return dict(vertices=v, triangles=t,
-                info=dict(rounds=rounds, added=len(extra) - n_lat, lattice=n_lat, over=over, steiner=steiner))
+    return extra, segs, rounds, over

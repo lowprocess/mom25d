@@ -297,6 +297,10 @@ def solve_mixed(m, freq, dmax=0.3, sigma=None, rough=None, finish=None, max_solv
     model.ports = ports
     planes = {k: 3 * dm for k, gs in model.shapes.items() if sum(g.area for g in gs) > 0.5 * model.outline_area}
     zone, lines = mom_kw.pop('zone', None), mom_kw.pop('lines', None)
+    cells = mom_kw.pop('cells', 30.0)                   # the cells grown to the wavelength's size, as mom25d's
+    if cells and cells > 0:
+        from mom25d.api import wavelength_coarsen
+        mom_kw['coarsen'] = wavelength_coarsen(model, fmax, dm, cells, mom_kw.get('coarsen'), log)
     sim = model.simulation(dmax=dm, dmax_layer=planes, fmin=fmin, fmax=fmax, solver='auto', verbose=False,
                            wave_down_to=fmin, metal=metal, **mom_kw,
                            **(dict(zone=zone, dmax_out=ZONE_OUT * dm) if zone else {}),
@@ -474,7 +478,7 @@ class Mixed(MoM25D):
             cut_min=s.mixed_cut, log=run.log,
             port=s.mom_port, hold=self._held,
             quads={'off': False, 'on': True}.get(s.mom_quads, s.mom_quads), quad_tol=s.mom_quad_tol,
-            coarsen=s.mom_coarsen or None, model_kw=_model_kw(s),
+            coarsen=s.mom_coarsen or None, cells=getattr(s, 'mom_cells', 30.0), model_kw=_model_kw(s),
             zone='auto' if s.mom_zone == 'on' else None, lines=s.mom_lines,
             signal_vias=s.mom_signal_vias, stitching_vias=s.mom_stitching_vias,
             progress=lambda k, n, f: (run.status('mixed', dict(fraction=k / n, solves=k, f_ghz=f / 1e9)), stop.check()))

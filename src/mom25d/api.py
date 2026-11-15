@@ -43,13 +43,15 @@ class Result:
 
 
 LINE_STEP = 2.0    # lines=: the line functions' columns, x dmax (1-3 x gave the same S on the test boards)
+CELLS = 30.0       # cells per wavelength the mesh grows to away from the features (0: dmax everywhere)
 ZONE_OUT = 5.0     # zone=: cells up to this x dmax outside the zone around the signal copper
 
 
 def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=False, mesher='auto', metal=None,
                 ground=None, max_solves=60, afs_tol=5e-3, log=print, progress=None, on_step=None,
                 core='auto', quads=False, zone=None, signal_vias='round', stitching_vias='auto', lines=None,
-                keep_at=(), quad_tol=35.0, coarsen=None, planes='pec', stitching_pads='drop', wideband=None):
+                keep_at=(), quad_tol=35.0, coarsen=None, planes='pec', stitching_pads='drop', wideband=None,
+                cells=CELLS):
     """S-parameters of a board (a <name>_board.json path, or its content) on `freq` (Hz).
 
     dmax (m): largest cell along the copper; layers whose metal covers more than half the board (planes) get
@@ -78,7 +80,7 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
                                  mesher=mesher, metal=metal, ground=ground, log=log, core=core,
                                  quads=quads, zone=zone, signal_vias=signal_vias, stitching_vias=stitching_vias,
                                  lines=lines, quad_tol=quad_tol, coarsen=coarsen, planes=planes,
-                                 stitching_pads=stitching_pads, wideband=wideband, title=name)
+                                 stitching_pads=stitching_pads, wideband=wideband, title=name, cells=cells)
         f, S, info = solve_band(sim, fmin, fmax, points=len(freq), zref=model.port_z0, max_solves=max_solves,
                                 afs_tol=afs_tol, log=log, progress=progress, on_step=on_step, keep_at=keep_at,
                                 freq=freq)
@@ -101,7 +103,8 @@ def solve_board(board, freq, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=F
 def build_board(board, fmin, fmax, dmax=0.3e-3, plane_factor=3.0, port='auto', pairs=False, mesher='auto',
                 metal=None, ground=None, log=print, core='auto', quads=False, zone=None,
                 signal_vias='round', stitching_vias='auto', lines=None, quad_tol=35.0, coarsen=None, planes='pec',
-                stitching_pads='drop', wideband=None, title=None, mesh_only=False, characterize=True):
+                stitching_pads='drop', wideband=None, title=None, mesh_only=False, characterize=True,
+                cells=CELLS):
     """(BoardModel, Simulation) of a board as solve_board builds them, with its options (solve_board's). mesh_only:
     stop once the mesh and its unknowns are known (a preview of the mesh solve_board would solve on; the quad
     cells are paired only after that, so a mesh_only simulation has none)."""
@@ -117,6 +120,8 @@ def build_board(board, fmin, fmax, dmax=0.3e-3, plane_factor=3.0, port='auto', p
         metal = copy.copy(metal)
         metal.on = {model.iface.get(k, k) if isinstance(k, str) else k: v for k, v in metal.on.items()}
         metal.on = {k: v for k, v in metal.on.items() if not isinstance(k, str)}    # layers not modelled: none
+    if cells and cells > 0:
+        coarsen = wavelength_coarsen(model, fmax, dmax, cells, coarsen, log)
     layer_dmax = {k: plane_factor * dmax for k, gs in model.shapes.items()
                   if sum(g.area for g in gs) > 0.5 * model.outline_area}
     sim = model.simulation(dmax=dmax, dmax_layer=layer_dmax, fmin=fmin, fmax=fmax, solver='auto', verbose=False,
@@ -127,3 +132,24 @@ def build_board(board, fmin, fmax, dmax=0.3e-3, plane_factor=3.0, port='auto', p
                            **(dict(line_basis=lines, line_step=LINE_STEP) if lines and lines != 'off' else {}),
                            **(dict(zone=zone, dmax_out=ZONE_OUT * dmax) if zone else {}))
     return model, sim
+
+
+def wavelength_coarsen(model, fmax, dmax, cells, coarsen=None, log=None):
+    """The coarsening that takes the cells to the wavelength's size: dmax stays at the features (corners, line ends,
+    vias, ports; the edge rings as they are) and the cells grow away from them to lambda / cells in the densest
+    dielectric at fmax, at most 4 x the narrowest conductor (longer cells cannot follow its current). As planar MoM
+    tools size their cells (30 per wavelength: the current along a line within about 1 %). Never under `coarsen`.
+    On 16 Solver Matrix boards against openEMS: 38 % of dmax's unknowns, a quarter of the time, the median RMS
+    0.059 against 0.057 (2026-11-15); the same size everywhere, not graded, lost 0.04 on resonators and via boards."""
+    from .sim import Simulation
+    planes = {k for k, gs in model.shapes.items() if sum(g.area for g in gs) > 0.5 * model.outline_area}
+    er = max(l.er for l in model.stack.layers)
+    lam = 299792458.0 / (fmax * er ** 0.5)
+    ws = [Simulation._guess_wref(g, []) for k, gs in model.shapes.items() if k not in planes for g in gs
+          if not g.is_empty]
+    size = min([lam / cells] + ([4 * min(ws)] if ws else []))
+    x = max(coarsen or 1.0, size / dmax)
+    if log is not None and x > (coarsen or 1.0):
+        log(f"  cells grow from {dmax * 1e3:g} mm at the features to {x * dmax * 1e3:.3g} mm (a wavelength / {cells:g} at "
+            f"{fmax / 1e9:g} GHz, er {er:g}" + (", 4 x the narrowest conductor" if size < lam / cells else "") + ")")
+    return x if x > 1.0 else None

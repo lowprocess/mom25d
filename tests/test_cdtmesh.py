@@ -56,7 +56,7 @@ def test_no_slivers_outside_a_straight_outline():
 @pytest.mark.parametrize('coarsen', [None, 2.0])
 def test_mesh_polygons_meets_the_limits(coarsen):
     """A plane with a hole and a slot: the copper covered exactly, every triangle inside it and within its area
-    limit (without coarsening: 0.5 dmax^2), the count near what the limit asks for."""
+    limit (without coarsening: 0.5 dmax^2, to the smoothing's slack), the count near what the limit asks for."""
     g = box(0, 0, 12e-3, 8e-3).difference(Point(4e-3, 4e-3).buffer(1e-3)).difference(box(7e-3, 2e-3, 7.4e-3, 6e-3))
     dmax = 0.5e-3
     nodes, tris, _ = geo.mesh_polygons(g, dmax, 0.5e-3, 4, coarsen=coarsen)
@@ -66,7 +66,7 @@ def test_mesh_polygons_meets_the_limits(coarsen):
     c = nodes[tris].mean(1)
     assert shapely.contains_xy(g.buffer(1e-9), c[:, 0], c[:, 1]).all()
     if coarsen is None:
-        assert a.max() <= 0.5 * dmax ** 2 * (1 + 1e-6)
+        assert a.max() <= 0.5 * dmax ** 2 * (1 + cdtmesh.POST_TOL + 1e-6)      # (the smoothing's slack)
         assert g.area / (0.5 * dmax ** 2) < len(tris) < 4 * g.area / (0.5 * dmax ** 2)   # (the edge rings: more)
 
 
@@ -83,8 +83,8 @@ def test_the_mesher_needs_the_core_not_the_kernels(monkeypatch):
         geo.mesh_polygons(box(0, 0, 4e-3, 2e-3), 0.5e-3, 0.5e-3, 2)
 
 
-def test_lattice_squares_pair_up():
-    """(experimental) cdtmesh's lattices: a wide rectangle's middle is squares, each two right triangles."""
+def test_the_interior_is_equilateral_cells():
+    """A wide rectangle: its middle is the hexagonal seed's equilateral triangles, and the smoothing keeps them."""
     W, H, dm = 40.0, 20.0, 1.0
     xs, ys = np.linspace(0, W, 41), np.linspace(0, H, 21)
     ring = np.vstack([np.column_stack([xs, 0 * xs]), np.column_stack([W + 0 * ys[1:], ys[1:]]),
@@ -92,7 +92,8 @@ def test_lattice_squares_pair_up():
     n = len(ring)
     segs = np.array([(k, (k + 1) % n) for k in range(n)])
     T = cdtmesh.mesh(ring, segs, lambda C: np.full(len(C), 0.5 * dm ** 2),
-                     lambda P: (P[:, 0] > 0) & (P[:, 0] < W) & (P[:, 1] > 0) & (P[:, 1] < H), fast._built, lattice=True)
+                     lambda P: (P[:, 0] > 0) & (P[:, 0] < W) & (P[:, 1] > 0) & (P[:, 1] < H), fast._built)
     v, t = T['vertices'], T['triangles']
-    assert abs(_areas(v, t).sum() - W * H) < 1e-9
-    assert (np.abs(90.0 - (180.0 - 2 * _min_angles(v, t))) < 1e-6).mean() > 0.6     # right isosceles: 45, 45, 90
+    a = _areas(v, t)
+    assert abs(a.sum() - W * H) < 1e-9 and T['info']['seed'] > 0.8 * (len(v) - n)
+    assert (_min_angles(v, t) > 55).mean() > 0.6 and a.max() <= 0.5 * dm ** 2 * (1 + cdtmesh.POST_TOL)

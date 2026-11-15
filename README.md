@@ -89,7 +89,7 @@ f, S, info = solve_band(sim, 1e9, 6e9, points=101, zref=m.port_z0)
 | `base.py` | RWG basis functions, the 1/R moment integrals, the port wave fits |
 | `via.py` | via kernels |
 | `frill.py` | a via through a hole in a PEC plane inside the stack: the hole's field as a few unknowns, axisymmetric and of the first azimuthal order (`planes='holes'`) |
-| `geo.py`, `cdtmesh.py` | the mesher (offset rings along the copper edges; CDT in the core triangulates) |
+| `geo.py`, `cdtmesh.py` | the mesher (offset rings along the copper edges; a hexagonal seed inside, smoothed; CDT in the core triangulates) |
 | `line.py`, `quads.py` | line basis functions on straight runs; quad cells |
 | `fast.py` | the matrix fill and the solvers |
 | `looptree.py` | the loop/tree basis the direct solver takes at low frequency (pcbqs's) |

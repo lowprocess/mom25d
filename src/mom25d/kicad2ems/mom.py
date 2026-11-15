@@ -118,7 +118,7 @@ def reused(runlog):
 def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, rough=None, finish=None, log=print, progress=None,
           hold=None, on_step=None, core='auto', quads=False, zone=None,
           signal_vias='round', stitching_vias='auto', lines=None, keep_at=(), stack='ground', quad_tol=35.0,
-          coarsen=None, planes='pec', stitching_pads='drop', wideband=None):
+          coarsen=None, planes='pec', stitching_pads='drop', wideband=None, cells=30.0):
     """S-parameters of the board m on `freq` (Hz) from mom25d, as kicad2ems reports them: (S (nf, n, n) in
     m.user_ports order with differential pairs as (d, c) modes, names, reference impedances, info dict).
     dmax in mm (planes 3x, refined near the copper of other layers). sigma (S/m): conductor loss, as --sigma
@@ -130,7 +130,7 @@ def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, rough=None,
     tand, or None)."""
     from mom25d.api import solve_board
     from kicad2ems.api.solver import mixed_mode
-    pairs, kw = _board_kw(m, dmax, port, quads=quads, quad_tol=quad_tol, coarsen=coarsen, zone=zone,
+    pairs, kw = _board_kw(m, dmax, port, quads=quads, quad_tol=quad_tol, coarsen=coarsen, zone=zone, cells=cells,
                           signal_vias=signal_vias, stitching_vias=stitching_vias, lines=lines, stack=stack,
                           planes=planes, stitching_pads=stitching_pads, wideband=wideband)
     if wideband:
@@ -184,11 +184,11 @@ def solve(m, freq, dmax=0.3, port='auto', max_solves=60, sigma=None, rough=None,
 
 def _board_kw(m, dmax, port, quads=False, quad_tol=35.0, coarsen=None, zone=None, signal_vias='round',
               stitching_vias='auto', lines=None, stack='ground', planes='pec', stitching_pads='drop',
-              wideband=None):
+              wideband=None, cells=30.0):
     """(pairs, mom25d.api's board and mesh options) of solve()'s settings: what the run meshes, and the preview."""
     kind = 'via' if port == 'lumped' else port
     pairs = any(len(legs) == 2 for _, legs in m.user_ports) and kind != 'via'
-    return pairs, dict(dmax=dmax * 1e-3, port=kind, quads=quads, quad_tol=quad_tol, coarsen=coarsen, zone=zone,
+    return pairs, dict(dmax=dmax * 1e-3, port=kind, quads=quads, quad_tol=quad_tol, coarsen=coarsen, zone=zone, cells=cells,
                        planes=planes, stitching_pads=stitching_pads, wideband=wideband, signal_vias=signal_vias,
                        stitching_vias=stitching_vias, lines=lines,
                        **(dict(ground='none') if stack == 'whole' else {}))
@@ -268,7 +268,7 @@ def _mesh_kw(s, m):
     --mom-quad-tol, --mom-coarsen, --mom-zone, the vias, --mom-lines, --mom-stack (resolved: _stack) and the
     BoardModel's."""
     return dict(quads={'off': False, 'on': True}.get(s.mom_quads, s.mom_quads), quad_tol=s.mom_quad_tol,
-                coarsen=s.mom_coarsen or None, zone='auto' if s.mom_zone == 'on' else None,
+                coarsen=s.mom_coarsen or None, cells=getattr(s, 'mom_cells', 30.0), zone='auto' if s.mom_zone == 'on' else None,
                 signal_vias=s.mom_signal_vias, stitching_vias=s.mom_stitching_vias, lines=s.mom_lines,
                 stack=_stack(s, m), **_model_kw(s))
 
@@ -408,6 +408,10 @@ class MoM25D(Solver):
         Option('mom_quad_tol', 35.0, "the most a quad cell's corner may differ from 90 degrees (default {default}; "
                "60 merges nearly every triangle, with S up to 0.03 off on a resonant filter)", float,
                name='quad_tol', gui='MoM quad tolerance (degrees)', group=G, cli=dict(metavar='DEG')),
+        Option('mom_cells', 30.0, "cells per wavelength the mesh grows to away from corners, line ends, vias and ports, "
+               "where it keeps --mom-dmax (the edge rings kept; at most 4 x the narrowest trace; default {default}; "
+               "0: --mom-dmax everywhere; docs/mom.md#cells)", float, name='cells', gui='MoM cells per wavelength',
+               group=G, cli=dict(metavar='N')),
         Option('mom_coarsen', 0.0, "experimental: cells grow away from corners, vias and ports, up to this times "
                "--mom-dmax along straight runs and inside wide copper (the edge rings kept; docs/mom.md#coarsen): "
                "0 (default: off), e.g. 2", float, name='coarsen', gui='MoM coarsening (experimental)', group=G,
