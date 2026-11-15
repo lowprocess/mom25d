@@ -110,8 +110,9 @@ The formulation is a mixed-potential integral equation with RWG basis functions.
 come from a spectral transmission-line network. The singular terms are integrated analytically.
 
 The tests check it against exact solutions and textbook formulas: layered Green's functions to about 1e-5,
-stripline impedance to 0.6 % (Cohn's), coupled striplines' even and odd modes to 2.5 %. Couplers in dB and plane
-cavity resonances have no test yet. The board
+stripline impedance to 0.6 % (Cohn's), coupled striplines' even and odd modes to 2.5 %, a plane cavity's resonance
+to 0.7 % of the cavity model (Hammerstad's fringing), and the 10 dB coupler to 0.1 dB of openEMS (S21, S31), with
+stored S-parameters of two boards beside them (`tests/test_validation.py`). The board
 files they read (`tests/boards`) are kicad2ems's example boards. `tools/` holds the GPU self-check and the studies
 behind kicad2ems's mom25d page (mesher, zone, quad cells, the HODLR solver).
 
