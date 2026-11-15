@@ -525,6 +525,20 @@ class FastOperator:
         self._near_kept()
         return _near_csr(ri, ci, vv, self.sim.Ne, self)
 
+    NEAR_BYTES = 400.0          # a near triangle pair's peak memory in the sparse correction: its nine triplets from
+                                # the core (24 B each), their CSR structure's sort (20 B each) and the CSR (20 B each)
+
+    def _near_fits(self):
+        """MemoryError, saying so, where the sparse near-field correction cannot fit: memory_plan counts the solver's
+        own matrices, not it, and on a fine mesh of several layers it is the larger (antenna_aperture's whole stack,
+        78k unknowns: 37 M near pairs, ~15 GB, which a 16 GB cap killed without a word)."""
+        from .sim import available_memory
+        need, avail = self.NEAR_BYTES * len(self.nP), available_memory()
+        if need > 0.85 * avail:
+            raise MemoryError(f"the near-field correction of {self.sim.Ne:,} unknowns needs ~{need / 1e9:.1f} GB "
+                              f"({len(self.nP):,} near triangle pairs), {avail / 1e9:.1f} GB available: larger cells "
+                              f"(a coarser dmax, or coarsen) on the widest copper")
+
     def _near_kept(self):
         """After a pass of the core's near_core: its analytic parts are in q['stat']."""
         if 'stat' in self.q:
@@ -587,6 +601,7 @@ class FastOperator:
             self._core_tables()
             if mode == 'direct':
                 return
+        self._near_fits()
         with sim.log.timer('near-field correction'):
             dZ = self._near_exact() if self.core is not None else self._near_matrix()
         self._vias(f)
