@@ -72,4 +72,7 @@ if not a.skip_sim:
         lu = {s: v for s, v in sim.log.totals().items() if s.startswith('LU')}
         print(f"simulation gpu={g:5s}: N={sim.Ne + sim.Nv}, {dt:.1f} s, " + ", ".join(f"{k} {v:.2f} s" for k, v in lu.items()))
     d = np.abs(S['off'] - S[a.backend]).max()
-    print(f"max |S_gpu - S_cpu| = {d:.1e}  " + ("OK" if d < 1e-6 else "MISMATCH"))
+    # the mixed-precision solve stops at a 1e-6 residual: S within a few times that, whichever GPU factored it
+    # (an RX 7800 XT: 1.3e-7; a GTX 980 Ti: 1.2e-6; Mesa's llvmpipe: 5.0e-7)
+    print(f"max |S_gpu - S_cpu| = {d:.1e}  " + ("OK" if d < 1e-5 else "MISMATCH"))
+    sys.exit(0 if d < 1e-5 else 1)                              # (CI runs it on lavapipe)

@@ -3,7 +3,8 @@
 A 2.5D method-of-moments solver for circuit boards: copper as zero-thickness sheets on the interfaces of a
 layered dielectric over an infinite ground plane, vias as vertical wires, lumped parts as series elements.
 It takes a board file and gives its S-parameters, on the CPU (NumPy, or a compiled C++ / OpenMP core) with an
-optional GPU LU (Vulkan through slangpy on any GPU, or CuPy on NVIDIA CUDA or AMD ROCm).
+optional GPU LU (Vulkan through slangpy on any GPU with a Vulkan driver, run on AMD and NVIDIA cards and on
+Mesa's llvmpipe in CI; or CuPy on NVIDIA CUDA or AMD ROCm).
 
 <p align="center">
   <img src="https://github.com/lowprocess/kicad2ems/raw/main/docs/img/readme/stub_current.gif" width="60%"

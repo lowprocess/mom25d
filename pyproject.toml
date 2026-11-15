@@ -22,7 +22,7 @@ dependencies = [
     "triangle>=20230923",          # the surface mesher
     "matplotlib>=3.7",             # farfield.current_on_grid: the triangle each point is in (current dumps)
     "threadpoolctl>=3.1",          # the LU's BLAS threads on the fast cores (fast.cap_blas_threads)
-    "emsdev @ https://github.com/lowprocess/emsdev/archive/refs/tags/v0.3.0.zip", # the GPU and memory probes (shared with gfdtd)
+    "emsdev @ https://github.com/lowprocess/emsdev/archive/refs/tags/v0.3.1.zip", # the GPU and memory probes (shared with gfdtd)
 ]
 
 [project.optional-dependencies]
