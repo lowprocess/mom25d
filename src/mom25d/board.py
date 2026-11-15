@@ -202,6 +202,15 @@ def pec_planes(data, ground):
     return (under[-1] if under else ground), (over[0] if over else None)
 
 
+def _gap_box(p):
+    """A part port's box (mm): its gap along its axis, its width across (where the part's sheet would be)."""
+    a, b = int(p['axis']), 1 - int(p['axis'])
+    lo, hi = np.zeros(2), np.zeros(2)
+    lo[a], hi[a] = sorted(p['gap'])
+    lo[b], hi[b] = p['c'][b] - p['w'] / 2, p['c'][b] + p['w'] / 2
+    return box(*lo, *hi)
+
+
 def lone_pads(data, layers):
     """stitching_pads='drop': {layer: [polygon index]} of the pads of ground vias with nothing else on their layer
     (`layers`): a ground net, under PAD_AREA, a ground via through it, touching no other copper there, no port or
@@ -217,9 +226,10 @@ def lone_pads(data, layers):
         g = [shape(p['polygon']) for p in ps]
         # what terminates on a pad keeps it: a port, or a part (its gap, the box from s to e: its pads touch it;
         # demo_bandpass's shunt parts land on ground pads with a via, which once were dropped as lone: |dS| 1.98)
-        at = [Point(*p['c'][:2]) for p in data.get('ports', []) if p['layer'] == lay] + \
+        at = [_gap_box(p) if p.get('internal') and p.get('gap') else Point(*p['c'][:2])     # (a part's port: its
+              for p in data.get('ports', []) if p['layer'] == lay] + \
              [box(min(q['s'][0], q['e'][0]), min(q['s'][1], q['e'][1]), max(q['s'][0], q['e'][0]),
-                  max(q['s'][1], q['e'][1])) for q in data.get('parts', []) if q['layer'] == lay]
+                  max(q['s'][1], q['e'][1])) for q in data.get('parts', []) if q['layer'] == lay]     # gap, as a part's)
         z = cu_z[lay]
         through = [Point(v['x'], v['y']) for v in data.get('vias', [])
                    if v.get('net') in gnets and v['z0'] - 1e-9 <= z <= v['z1'] + 1e-9]
@@ -412,6 +422,18 @@ class BoardModel(PlanarModel):
         # ports (PlanarModel.port_specs)
         self.port_specs, self.port_z0, legs = [], {}, {}
         for p in data.get('ports', []):
+            if p.get('kind', 'z') != 'z' and p.get('internal'):           # a part's port (kicad2ems R-E5): a delta
+                k = self.iface.get(p['layer'])                              # gap across the part's strip
+                if k is None:
+                    raise ValueError(f"{p['name']}: part port on {p['layer']}, not a metal interface")
+                a, b = int(p['axis']), 1 - int(p['axis'])
+                g = _gap_box(p).bounds
+                s, e = np.array(g[:2]) * MM, np.array(g[2:]) * MM
+                self.shapes[k] = [unary_union(self.shapes.get(k, []) + [box(*s, *e)]).buffer(0)]     # the strip
+                self.port_specs.append(dict(name=p['name'], c=np.asarray(p['c'], float) * MM, d=np.eye(2)[a], k=k,
+                                            w=(e[b] - s[b]), width=(e[b] - s[b]), z0=float(p['z0']), kind='gap'))
+                self.port_z0[p['name']] = float(p['z0'])
+                continue
             if p.get('kind', 'z') != 'z':
                 raise ValueError(f"{p['name']}: a gap port (a dipole or slot feed) has no planar equivalent")
             k = self.iface.get(p['layer'])

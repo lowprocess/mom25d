@@ -377,7 +377,8 @@ class MoM25D(Solver):
     name, aliases, label = 'mom25d', ('mom',), 'mom25d (MoM)'
     consumes, previewed, rank, order = 'board', False, 1, 20     # order: after openEMS in kicad2ems's lists
     basic = ('mom_dmax',)           # what a run is set up with, of its options (kicad2ems 2.9: Solver.basic)
-    capabilities = dict(ports='yes: lumped, or de-embedded wave ports on a long enough feed', gap_ports='no',
+    capabilities = dict(ports='yes: lumped, or de-embedded wave ports on a long enough feed',
+                        gap_ports="part ports only (a delta gap across the part's strip; no dipole or slot feeds)",
                         diff_pairs='yes', parts='yes: one series element across the gap',
                         vias='yes: over the layers with metal at the via',
                         outline='ignored: laterally infinite dielectric', planes='yes: meshed (slow on plane-heavy boards)',
@@ -490,7 +491,7 @@ class MoM25D(Solver):
 
     def assess(self, run):
         m, out = run.m, []
-        gaps = [p.name for p in m.ports if p.kind == 'gap']
+        gaps = [p.name for p in m.ports if p.kind == 'gap' and not p.internal]     # (a part's port: a delta gap)
         if gaps:
             out.append(f"gap port(s) {', '.join(gaps)}: no planar equivalent")
         if _stack(run.s, m) != 'whole' and _solid_ground(m) is None:

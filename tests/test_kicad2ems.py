@@ -403,3 +403,31 @@ def test_mesh_convergence_of_two_levels():
     assert not mesh_convergence(T, S)['converged'] and mesh_convergence(T, S)['deg'] == pytest.approx(5)
     T[:, 1, 1] = 1e-4                                               # below -40 dB: not compared
     assert mesh_convergence(T, S)['db'] == pytest.approx(0.05)
+
+
+def test_part_ports_are_delta_gaps_closing_to_the_parts(tmp_path, run_cli, no_csxcad):
+    """kicad2ems R-E5: a part port is a delta gap across the part's strip (the strip and its pads kept: a shunt
+    part's ground pad with its vias is not a lone stitching pad), and closed by the parts' values it is the board
+    with its parts."""
+    pytest.importorskip('triangle')
+    from kicad2ems.config import build_settings
+    from kicad2ems.pipeline import board_from_settings
+    from kicad2ems.touchstone import read_touchstone
+    from mom25d.board import BoardModel
+    toml = os.path.join(ROOT, 'examples', 'demo_lowpass.toml')
+    models = {}
+    for pp in ((), ('all',)):
+        s = build_settings({'part_ports': list(pp)} if pp else {}, toml)
+        models[pp] = BoardModel(board_from_settings(s, log=lambda *a: None).to_dict(), log=lambda *a: None)
+    plain, ports = models[()], models[('all',)]
+    area = lambda bm: sum(g.area for v in bm.shapes.values() for g in v)
+    assert area(ports) == pytest.approx(area(plain)) and len(ports.vias) == len(plain.vias) > 0
+    assert [sp['kind'] for sp in ports.port_specs][2:] == ['gap'] * 3 and not ports.lumped
+    S = {}
+    for pp in ('none', 'all'):
+        extra = ['--part-ports', 'all'] if pp == 'all' else []
+        code, so, err = run_cli(toml, '--solvers', 'mom25d', '--mom-port', 'lumped', '--excite', 'P1,P2', '--points', '41',
+                                '--no-report', '--no-reuse', '--out', tmp_path / pp, *extra)
+        assert code == 0, so + err
+        S[pp] = np.asarray(read_touchstone(str(tmp_path / pp / 'demo_lowpass_mom25d.s2p'))[1])
+    assert np.abs(S['all'] - S['none']).max() < 2e-3
