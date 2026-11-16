@@ -1,11 +1,11 @@
-// cdt_mesh.hpp - the meshers' constrained Delaunay triangulation (cdtmesh.py, geo.mesh_polygons): CDT
-// (artem-ogre/CDT 2.0.1, vendored in core/CDT, MPL-2.0). The same file in mom25d's and pcbqs's cores.
+// cdt_mesh.hpp - the meshers' constrained Delaunay triangulation (cdtmesh.py, geo.mesh_polygons): mesh2d.hpp, the
+// meshers' own triangulator. The same file in mom25d's and pcbqs's cores.
 //
 //   cdt_triangulate(V, E, min_dist, min_angle, max_steiner) -> (vertices, triangles)
 //
 // V (n, 2) points, E (m, 2) segments between them (the constraints). The input points keep their indices; points
 // added (where crossing segments are split, or by the refinement) come after them. Triangles counter-clockwise.
-// The triangles outside the outline (reached from the convex hull without crossing a segment) are left out, as
+// The triangles outside the outline (reached from the bounding triangle without crossing a segment) are left out, as
 // Triangle's -p does: kept, the hull's slivers along a straight outline (points a hair off its line) have their
 // centroids on the copper's edge (pcbqs's wpthb PDN: a zero-area triangle). With min_angle (degrees) the rest is
 // refined until no triangle has a smaller angle (Ruppert; segments split where encroached; at most max_steiner points
@@ -13,7 +13,7 @@
 // segment is on it.
 // Duplicate points are an error (the caller merges them).
 #pragma once
-#include "CDT/CDT.h"
+#include "mesh2d.hpp"
 
 static py::tuple cdt_triangulate(arr<double> V, arr<int> E, double min_dist, double min_angle, long long max_steiner) {
     if (V.ndim() != 2 || V.shape(1) != 2) throw std::invalid_argument("cdt_triangulate: V must be (n, 2)");
@@ -21,41 +21,35 @@ static py::tuple cdt_triangulate(arr<double> V, arr<int> E, double min_dist, dou
     const size_t n = (size_t)V.shape(0), m = (size_t)E.shape(0);
     const double *v = V.data();
     const int *e = E.data();
-    std::vector<CDT::V2d<double>> pts(n);
-    for (size_t i = 0; i < n; ++i) pts[i] = CDT::V2d<double>(v[2 * i], v[2 * i + 1]);
-    std::vector<CDT::Edge> edges;
-    edges.reserve(m);
     for (size_t k = 0; k < m; ++k) {
         const int a = e[2 * k], b = e[2 * k + 1];
         if (a < 0 || b < 0 || (size_t)a >= n || (size_t)b >= n)
             throw std::invalid_argument("cdt_triangulate: segment index out of range");
-        if (a != b) edges.emplace_back(CDT::VertInd(a), CDT::VertInd(b));
     }
     std::vector<double> ov;
     std::vector<int> ot;
-    {
+    if (n >= 3) {
         py::gil_scoped_release nogil;
-        CDT::Triangulation<double> cdt(CDT::VertexInsertionOrder::Auto, CDT::IntersectingConstraintEdges::TryResolve,
-                                       min_dist);
-        cdt.insertVertices(pts);
-        cdt.insertEdges(edges);
+        mesh2d::CDT cdt(v, n, min_dist);
+        for (size_t k = 0; k < m; ++k)
+            if (e[2 * k] != e[2 * k + 1]) cdt.insert_segment(e[2 * k] + 3, e[2 * k + 1] + 3);
+        cdt.mark_outer();
         if (min_angle > 0) {
-            CDT::TriIndUSet outer = cdt.collectOuterTriangles();
+            double x0 = v[0], x1 = v[0], y0 = v[1], y1 = v[1];
+            for (size_t i = 0; i < n; ++i)
+                x0 = std::min(x0, v[2 * i]), x1 = std::max(x1, v[2 * i]), y0 = std::min(y0, v[2 * i + 1]),
+                y1 = std::max(y1, v[2 * i + 1]);
             const long long budget = max_steiner > 0 ? max_steiner : (long long)(10 * n + 1000000);
-            cdt.refineTriangles(CDT::VertInd((unsigned long long)budget), CDT::RefinementCriterion::SmallestAngle,
-                                CDT::degToRad(min_angle), &outer);
-            cdt.finalizeTriangulation(outer);
-        } else {
-            cdt.eraseOuterTriangles();
+            cdt.refine(min_angle * 3.14159265358979323846 / 180.0, budget, 1e-9 * std::max(x1 - x0, y1 - y0));
         }
-        ov.resize(2 * cdt.vertices.size());
-        for (size_t i = 0; i < cdt.vertices.size(); ++i) {
-            ov[2 * i] = cdt.vertices[i].x;
-            ov[2 * i + 1] = cdt.vertices[i].y;
-        }
-        ot.resize(3 * cdt.triangles.size());
-        for (size_t t = 0; t < cdt.triangles.size(); ++t)
-            for (int k = 0; k < 3; ++k) ot[3 * t + k] = (int)cdt.triangles[t].vertices[k];
+        const size_t nv = cdt.size() - 3;
+        ov.resize(2 * nv);
+        for (size_t i = 0; i < nv; ++i) ov[2 * i] = cdt.X[i + 3], ov[2 * i + 1] = cdt.Y[i + 3];
+        for (const auto &t : cdt.T)
+            if (!t.outer)
+                for (int k = 0; k < 3; ++k) ot.push_back(t.v[k] - 3);
+    } else {
+        ov.assign(v, v + 2 * n);
     }
     py::array_t<double> outv({(py::ssize_t)(ov.size() / 2), (py::ssize_t)2});
     std::copy(ov.begin(), ov.end(), outv.mutable_data());

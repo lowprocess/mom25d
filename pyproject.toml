@@ -48,7 +48,7 @@ version = {attr = "mom25d.__version__"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-mom25d = ["core/*.cpp", "core/*.hpp", "core/CDT/*", "*.so", "*.pyd"]
+mom25d = ["core/*.cpp", "core/*.hpp", "*.so", "*.pyd"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

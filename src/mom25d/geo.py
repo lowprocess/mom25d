@@ -288,12 +288,116 @@ def gap_zones(geom, gmax, step, tol=1e-9):
 
 
 # ---- Mesher -----------------------------------------------------------------
+def _via_rings(vias, geom, linework, top, h, dmax, fine_u=None, dmax_fine=None):
+    """mesh_polygons(via_rings=): the rings about the vias [(x, y, r, n, ngon)] (LineStrings). Each via's n-gon is
+    repeated further out, its vertices opposite the last ring's, each ring 1 + 2 sin(pi / n) times the last's radius
+    (cells about as deep as they are wide), while the ring's side is under `top` x the spacing there. A ring is kept
+    only where it, with half its gap to the last, lies in the copper clear of the other lines and the other vias'
+    rings; a via's rings stop at the first that is not."""
+    P = np.array([v[:2] for v in vias], float)
+    hv = np.full(len(P), float(dmax)) if h is None else np.asarray(h(P), float)
+    if fine_u is not None and dmax_fine:
+        hv = np.where(shapely.contains_xy(fine_u, P[:, 0], P[:, 1]), dmax_fine, hv)
+    others = shapely.union_all([q for q in linework if not q.is_empty])
+    radius = np.array([v[2] for v in vias], float)
+    live = np.ones(len(vias), bool)
+    out, kept = [], []                                                 # kept: the areas of the rings taken
+    while live.any():
+        idx = np.flatnonzero(live)
+        G, g, R1 = [], [], []
+        for i in idx:
+            x, y, _, n, is_ngon = vias[i]
+            R = radius[i] * (1 + 2 * np.sin(np.pi / n))
+            if 2 * R * np.sin(np.pi / n) > top * hv[i]:
+                G.append(None); g.append(0.0); R1.append(R)
+                continue
+            ring = ngon(x, y, R, n, closed=True) if is_ngon else np.asarray(Point(x, y).buffer(R, quad_segs=2).exterior.coords)
+            G.append(LineString(ring)); g.append(R - radius[i]); R1.append(R)
+        sel = np.array([q is not None for q in G])
+        live[idx[~sel]] = False
+        if not sel.any():
+            break
+        idx, g, R1 = idx[sel], np.array(g)[sel], np.array(R1)[sel]
+        G = [q for q in G if q is not None]
+        areas = shapely.buffer(np.array([Polygon(q.coords) for q in G], dtype=object), 0.5 * g)
+        fits = shapely.within(areas, geom) & (shapely.distance(G, others) >= 0.5 * g)   # (its own n-gon: cleared)
+        if kept:
+            ktree = shapely.STRtree(np.array([a for _, a in kept], dtype=object))
+            ka, kb = ktree.query(areas, predicate='intersects')
+            owner = np.array([o for o, _ in kept])
+            for i, j in zip(ka, kb):
+                if owner[j] != idx[i]:
+                    fits[i] = False
+        f = np.flatnonzero(fits)
+        tree = shapely.STRtree(areas[f])
+        a, b = tree.query(areas[f], predicate='intersects')
+        taken = np.zeros(len(f), bool)
+        for k in range(len(f)):                                        # of two that touch, the first
+            if not taken[b[(a == k) & (b != k)]].any():
+                taken[k] = True
+        ok = np.zeros(len(idx), bool)
+        ok[f[taken]] = True
+        for k in np.flatnonzero(ok):
+            out.append(G[k])
+            kept.append((idx[k], areas[k]))
+            radius[idx[k]] = R1[k]
+        live[idx[~ok]] = False
+    return out
+
+
+def _depth(pc, outline, tol):
+    """The distance of the line pc from the outline if it is the same along it (an edge ring's piece, or the outline's
+    own: 0), else None."""
+    d = shapely.distance(outline, shapely.line_interpolate_point(pc, [0.0, 0.25, 0.5, 0.75, 1.0], normalized=True))
+    return float(d[1:4].mean()) if np.ptp(d[1:4]) <= 1e-6 * max(d.max(), pc.length) + tol else None
+
+
+def _aligned(pc, depth, stations, dmax, h=None, near=0.35, gap=1.3):
+    """The points of an edge ring's piece pc (depth in from the outline) where the outline's points (stations) fall
+    on it moved in along the outline's normal: those whose nearest point on pc is depth away (none round a corner
+    of it). The piece's own vertices stay (its ends, its corners); a projection within near x the spacing of one of
+    them, or of the last one kept, is dropped; a gap over gap x the spacing is filled at the spacing (h(points), or
+    dmax) as spaced pieces are."""
+    P = np.asarray(pc.coords)[:, :2]
+    seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
+    s_v = np.concatenate([[0.0], np.cumsum(seg)])                      # the vertices' arc length
+    L = s_v[-1]
+    hof = (lambda X: np.full(len(X), dmax)) if h is None else h
+    S = np.zeros(0)
+    if len(stations):
+        lo, hi = P.min(0) - 1.1 * depth, P.max(0) + 1.1 * depth
+        cand = stations[np.all((stations >= lo) & (stations <= hi), axis=1)]
+        if len(cand):
+            pts = shapely.points(cand)
+            u = shapely.line_locate_point(pc, pts)
+            Q = shapely.get_coordinates(shapely.line_interpolate_point(pc, u))
+            dist = np.linalg.norm(Q - cand, axis=1)
+            ok = (np.abs(dist - depth) <= 1e-3 * depth) & (u > 0) & (u < L)
+            S = np.sort(u[ok])
+    at = lambda s_: np.column_stack([np.interp(s_, s_v, P[:, 0]), np.interp(s_, s_v, P[:, 1])])
+    hv = hof(at(S)) if len(S) else np.zeros(0)
+    keep, last = [], -np.inf
+    for s_, hs in zip(S, hv):                                         # clear of the vertices and of each other
+        j = np.searchsorted(s_v, s_)
+        dv = min(s_ - s_v[j - 1] if j > 0 else np.inf, s_v[j] - s_ if j < len(s_v) else np.inf)
+        if dv >= near * hs and s_ - last >= near * hs:
+            keep.append(s_)
+            last = s_
+    s_all = np.unique(np.concatenate([s_v, keep]))
+    out = [s_all[:1]]
+    for a, b in zip(s_all[:-1], s_all[1:]):                           # the gaps: at the spacing
+        hm = float(hof(at(np.array([0.5 * (a + b)])))[0])
+        k = int(np.ceil((b - a) / hm - 1e-9)) if b - a > gap * hm else 1
+        out.append(a + (b - a) * np.arange(1, k + 1) / k)
+    return at(np.concatenate(out))
+
+
 def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), amax=None,
                   max_offset_frac=0.45, tol=1e-9, fine=None, dmax_fine=None, edge_zone=None, split_chains=False,
                   coarsen=None, grow=0.5, structured=False, struct_w_max=20e-3, gap_rings=None, area_scale=1.0,
-                  coarsen_fine=True):
+                  coarsen_fine=True, align=False, via_rings=0.0):
     """
-    geom   : shapely (Multi)Polygon of one metal layer (triangulated by CDT in the compiled core: cdtmesh.py)
+    geom   : shapely (Multi)Polygon of one metal layer (triangulated in the compiled core, mesh2d: cdtmesh.py)
     dmax   : max edge length along conductors / in open regions
     w_ref  : reference strip width for the edge grading (narrowest trace on the layer)
     lines  : [(p0, p1), ...] constraint segments (port gap and cut lines), clipped to geom
@@ -320,12 +424,28 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
              across it (g/4 under the first ring at w_ref's grading). Coupled lines: on the 10 dB coupler (0.14 mm
              gap, 1.28 mm strips) S31 -10.64 dB, against -10.24 to -10.29 from refined FDTD, until the edge cells
              came down to the gap's scale; isolated traces and planes keep their cost
+    align  : the edge rings' points at the outline's, moved in along its normal (_aligned): the strips between the
+             outline and the rings are rows of rectangles, two triangles each (quad cells pair them: quads.py), where
+             each ring spaced on its own (align=False, the default) left them skewed, the stations out of step at
+             every corner, port line and change of spacing. Where a ring has no outline point opposite (round a corner)
+             it is spaced as before. Simulation turns it on with quads (align='auto'): on 4 boards against a mesh of
+             half the size, 0.3-1 % fewer unknowns after the quads (launch: 58 % of the triangles paired for 53 %), S as
+             before (0.0005); without quads 0.5-1 % more unknowns for nothing
+    via_rings : rings about each via's n-gon, the n-gon repeated further out, each ring's vertices opposite the
+             last's and its radius 1 + 2 sin(pi / n) times it (_via_rings), while a ring's side is under via_rings x
+             the local spacing: the via in rings of n trapezoids (quad cells pair them: an n-gon annulus's angles are
+             the same at any ratio) that grow out to the cells around, where the n-gon alone fanned out to them in
+             slivers. Only where they clear the copper's edge, the other lines and the other vias' rings. 0 (the
+             default): none. 0.8: on mom25d's demo board (a via fence) quads pair 53 % of the triangles for 43 %, but
+             it costs 21 % more unknowns (16 % more after the quads) and S moved no closer to a finer mesh's; pcbqs's
+             via spreading into a plate 2.1 % off a fine pad's for 2.8 % at dmax 0.5 mm, the same at 0.25
     Returns nodes (N,2), tris (M,3) counter-clockwise, and the list of via vertex ids.
     """
     if geom.is_empty:
         return np.zeros((0, 2)), np.zeros((0, 3), int), []
     linework = _rings(geom)
     offsets = w_ref * graded(np.arange(1, ncross) / ncross, grade)      # inward rings: the tensor mesher's grading
+    ring_d = list(offsets[offsets < 0.5 * w_ref - 1e-12])               # the rings' depths (align)
     for d in offsets[offsets < 0.5 * w_ref - 1e-12]:
         linework += [r if edge_zone is None else r.intersection(edge_zone)
                      for r in _rings(geom.buffer(-d, join_style='mitre', mitre_limit=2.0))]
@@ -336,6 +456,7 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
                 zone = zone.intersection(edge_zone)
             for d in sorted({fr * g for fr in gap_rings}):
                 if d < 0.75 * first:
+                    ring_d.append(d)
                     linework += [r.intersection(zone)
                                  for r in _rings(geom.buffer(-d, join_style='mitre', mitre_limit=2.0))]
     linework += [LineString([p0, p1]).intersection(geom) for p0, p1 in lines]
@@ -363,7 +484,7 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
         st_lines, run_polys, snapped, on_run = _run_grid(geom, dgrid, lines, vias, offsets[offsets < 0.5 * w_ref - 1e-12],
                                                  struct_w_max, hrun, within=within)
         linework += [LineString([p0, p1]).intersection(geom) for p0, p1 in st_lines]
-    vpts = []
+    vpts, via_out = [], []
     for i, via in enumerate(vias):
         x, y, r = via[:3]
         vpts.append((x, y))
@@ -373,11 +494,18 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
             ring = ngon(x, y, r, int(via[3]), closed=True) if len(via) > 3 else \
                 Point(x, y).buffer(r, quad_segs=2).exterior.coords
             linework.append(LineString(ring).intersection(geom))
+            if via_rings and i not in on_run:
+                via_out.append((x, y, r, int(via[3]) if len(via) > 3 else 8, len(via) > 3))
+    if via_out:
+        linework += _via_rings(via_out, geom, linework, via_rings, (lambda P: hfield(P, dmax)) if hfield is not None
+                               else None, dmax, fine_u, dmax_fine)
     runs_u = shapely.unary_union(run_polys).buffer(tol) if run_polys else None
     # snap-rounding noding: T-junctions (port lines ending on edges) must split the edge exactly
     noded = shapely.unary_union([g for g in linework if not g.is_empty], grid_size=tol)
     pieces = list(getattr(noded, 'geoms', [noded]))
     chains = []
+    outline = shapely.union_all(linework[:len(_rings(geom))]) if align and ring_d else None
+    deferred, stations = [], []                     # the rings' pieces (align: after the outline), the outline's points
 
     def spaced(q, d_):
         if hfield is None or (not coarsen_fine and fine_parts and d_ == dmax_fine):
@@ -396,7 +524,19 @@ def mesh_polygons(geom, dmax, w_ref, ncross=6, grade=1.0, lines=(), vias=(), ama
             continue
         inside = fine_u is not None and (fine_u.contains(pc) if split_chains else fine_u.contains(pc.centroid))
         dm = dmax_fine if inside else dmax
+        depth = _depth(pc, outline, tol) if outline is not None else None
+        if depth is not None and depth > 10 * tol and min(abs(depth - d) for d in ring_d) < 1e-6 * dmax + 10 * tol:
+            deferred.append((pc, dm, depth))
+            continue
         chains.append(spaced(pc, dm))
+        if depth is not None and depth <= 10 * tol:
+            stations.append(chains[-1])
+    if deferred:
+        st = np.vstack(stations) if stations else np.zeros((0, 2))
+        for pc, dm, depth in deferred:
+            h_ = None if hfield is None or (not coarsen_fine and fine_parts and dm == dmax_fine) else \
+                (lambda P, d_=dm: hfield(P, d_))
+            chains.append(_aligned(pc, depth, st, dm, h_))
     allp = np.vstack(chains + [np.array(vpts).reshape(-1, 2)]) if vpts else np.vstack(chains)
     # merge near-coincident vertices (noding round-off would otherwise create sliver triangles): each cluster of
     # vertices closer than `snap` becomes its lowest-numbered one
@@ -446,7 +586,7 @@ def _core():
 
 def _cdt(V, segs, geom, tol, dmax, org, amax, hfield, fine_parts, fine_u, dmax_fine, runs_u, area_scale=1.0,
          coarsen_fine=True):
-    """mesh_polygons' triangulation (cdtmesh: CDT and the points inside), the area limits: amax, afine in the fine
+    """mesh_polygons' triangulation (cdtmesh: the core's mesh2d and the points inside), the area limits: amax, afine in the fine
     regions, with coarsen the field's 0.5 h^2 (none in the structured runs' cells; the fine regions kept at afine
     unless coarsen_fine); all of them x area_scale."""
     from .cdtmesh import mesh as cdt_mesh

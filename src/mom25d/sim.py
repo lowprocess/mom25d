@@ -334,13 +334,16 @@ class Simulation:
                  mesh_only=False, core='auto', quads=False, quad_tol=35.0, zone=None, dmax_out=None,
                  signal_vias='round', stitching_vias='auto', signal=None, via_barrel=True, line_basis=None,
                  line_w_max=2.0e-3, line_step=2.0, coarsen=None, grow=0.5, structured='auto', gap_rings=(1/4, 1/8, 1/16),
-                 frills=(), slots=(), dmax_slot=None):
+                 frills=(), slots=(), dmax_slot=None, align='auto', via_rings=0.0):
         # frills (frill.Frill): the holes of the stack's internal PEC planes (stack.pec) that a via runs through
         # slots (slots.Slot): openings of the stack's PEC planes, each meshed, its field the unknowns (slot planes)
         # mesh_only: stop once the mesh and the unknowns (Ne, Nv) are known (a cost estimate; nothing to solve with)
         # coarsen (experimental): cells grow from dmax at the features (corners, vias, ports) to coarsen x dmax away
         # from them, by grow x the distance (geo.mesh_polygons): straight runs and plane interiors in larger cells.
         # structured: straight runs of trace as a grid of rectangles (geo.mesh_polygons); 'auto': with quads
+        # align: the edge rings' points opposite the outline's, the edge strips rectangles (geo.mesh_polygons); 'auto':
+        # with quads, which pair them (on 4 boards 0.3-1 % fewer unknowns after the quads, S as before; without quads
+        # 0.5-1 % more unknowns for nothing). via_rings: rings of trapezoids about the vias (geo.mesh_polygons; 0: none)
         self.st, self.title, self.metal, self.solver, self.log = stack, title, metal, solver, RunLog(verbose)
         self.gpu = gpu                      # 'auto' | 'vulkan' | 'cupy' | 'off' (mixed direct solver LU)
         self.precision = precision          # 'auto' | 'double' | 'mixed' (direct: complex64 Z + refinement)
@@ -494,7 +497,9 @@ class Simulation:
                     nd, tr, vids = mesh_polygons(geoms[k], dm_mesh, wr, ncross, grade, lines=seg, vias=vpts,
                                                  fine=fine, dmax_fine=dm_fine, coarsen=coarsen, grow=grow,
                                                  coarsen_fine=not (dm > 1.2 * dmax),
-                                                 structured=struct, gap_rings=gap_rings, **zkw)
+                                                 structured=struct, gap_rings=gap_rings,
+                                                 align=bool(quads) if align == 'auto' else bool(align),
+                                                 via_rings=via_rings, **zkw)
                 for (i, v), vid in zip(vias_here, vids):
                     if not (vid >= 0):
                         raise ValueError(f"via {v.name}: not on the M{k} mesh")

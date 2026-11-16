@@ -1,7 +1,7 @@
 """
-cdtmesh - the points of geo.mesh_polygons' triangulation: CDT (the compiled core's cdt_triangulate, core/cdt_mesh.hpp,
-CDT vendored in core/CDT, MPL-2.0) triangulates; the points inside the copper are placed here. The same file in
-mom25d (mom25d/cdtmesh.py) and pcbqs (pcbqs/_numerics/cdtmesh.py).
+cdtmesh - the points of geo.mesh_polygons' triangulation: the compiled core's cdt_triangulate (core/cdt_mesh.hpp over
+core/mesh2d.hpp, the meshers' own constrained Delaunay triangulator, no library) triangulates; the points inside the
+copper are placed here. The same file in mom25d (mom25d/cdtmesh.py) and pcbqs (pcbqs/_numerics/cdtmesh.py).
 
     T = mesh(V, segs, limit, inside, core, frozen=None, sizes=(1.0,), min_angle=0, max_steiner=0)
 
@@ -18,11 +18,12 @@ package's compiled core. frozen(P): where no point is to be placed (the structur
            segments), then the whole triangulated again (MAX_ROUNDS)
   smooth   ODT passes over the placed points (each to the area-weighted mean of its triangles' circumcentres; the
            outlines' points stay), then the limits again, to POST_TOL
-  min_angle (degrees) at the end, no triangle with a smaller angle (CDT's Ruppert refinement, segments split where
-           encroached, at most max_steiner points; pcbqs's DC and thermal meshes: 25)
+  min_angle (degrees) at the end, no triangle with a smaller angle (mesh2d's Ruppert refinement, segments split
+           where encroached, at most max_steiner points; pcbqs's DC and thermal meshes: 25)
 
 Against Triangle, which this replaced (2026-11-15): on mom25d's Solver Matrix boards the same S within 0.005 on all
-but a few, with 2-10 % fewer unknowns. Returns dict(vertices, triangles, info): V first, in its order (the triangles
+but a few, with 2-10 % fewer unknowns. mesh2d replaced the vendored CDT library under it the same day: the same
+triangle counts on mom25d's test boards, S within 0.002. Returns dict(vertices, triangles, info): V first, in its order (the triangles
 outside the outline left out; geo also drops those in its holes), info dict(rounds, added, seed, over, steiner).
 """
 import numpy as np
